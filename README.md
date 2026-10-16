@@ -114,6 +114,55 @@ US/JPは `marketplace` で完全分離し、全テーブルにRow Level Security
 
 所定フォルダ外のファイルを取り込む場合は`--marketplace US|JP`が必須です。フォルダと`--marketplace`が矛盾する場合は停止します。集計値は候補選定用で、最大獲得率は月間全体の獲得率ではなく、セッション数の合算はユニーク訪問数ではありません。
 
+## 出典管理と再取得間隔（`acquisition`、段階2）
+
+セラー・ブランド・キーワードなどの「出典」ごとに、取得先の市場・発見経路・取得間隔(初期30日)・実行中の状態を管理します。実コレクタ（ブラウザ操作）・統合ツールにはまだ接続していません（段階3以降）。
+
+**市場の意味**: `--market` は**取得先ページの市場**（その出典を取得するAmazonのサイト）です。起点レポートの市場・業務方向（輸出=US起点、輸入=JP起点）とは別で、起点は `--origin-import-id` で明示します。同じ出典を別の起点・別の業務方向から発見しても、出典は1つで取得は共有され、発見経路だけが追加されます。
+
+| 出典の種別 | キー |
+|---|---|
+| `SELLER` | セラーID |
+| `KEYWORD` | キーワード＋（任意）カテゴリ別名 |
+| `BRAND_NAME` | ブランド名（名前による検索） |
+| `BRAND_STORE` | ストアURL/識別子（ブランド名とは別の出典。異なるストアを名前だけで統合しない） |
+
+表記の自動統合は全角半角・大文字小文字・空白だけです。日英表記や複合表記などの別名統合は、人が承認する別名表（未実装）でのみ行います。
+
+主なコマンド（`python -m acquisition.cli <コマンド>`）:
+
+```powershell
+# 出典と発見経路の登録（起点はレポートのimport_idとASINで明示）
+register-source --market JP --type SELLER --key A29NE8W0SWJRBU --origin-import-id 1 --origin-asin B0076AZHC8
+# 取得計画: 使うレポートは明示（US=1, JP=2 などはコードに固定されません）。同じ市場の2つのレポート（異なる期間）は混ぜられません
+acquire-plan --market JP --origin-import 1 --origin-import 2 [--merged] [--csv 出力.csv]
+show-source --market JP --source-id 3          # 判定の理由・旧証拠・期限切れの実行
+hold-source / exclude-source / release-hold / set-interval  --market JP --source-id N --reason "..."
+abort-run --market JP --run-id N --reason "..."   # 新方式の実行を人が中断として確定
+reap-expired --market JP                          # 期限切れの実行を回収
+```
+
+`acquire-plan` は、除外・保留・実行中・取得間隔(旧証拠を含む)・失敗の冷却を判定してから順位付けします。実行可能な**未取得**の出典を先に、各群の中は**代表起点**（注文点数→セッション数→最大獲得率が最良の1件。複数の起点は合算しない）で並べます。既定は輸出（US起点）・輸入（JP起点）の**方向別**表示で、`--merged` で統合できます。実行不可の出典は順位を付けず、理由付きで別に表示します。claim（実行開始）時にも同じ判定を再実行します。
+
+取得結果の扱い: 成功・確認済みの0件・上限打切り（取得範囲が限定された結果として記録）は30日の間隔に数えます。一部成功・失敗・中断は数えません。失敗後は60分の冷却、失敗が3回連続すると自動保留（根拠を表示。`release-hold` で明示解除）。**Ctrl+C・`abort-run`・lease失効は失敗として数えません。**
+
+### 旧履歴の取込（根拠付きdry-run → 選択 → 適用 → 人の確定）
+```powershell
+legacy-dry-run                      # DBは変更しません。事実/推定/未確認を分けたCSVを exports\acquisition\ に出力
+# CSVの apply 列に Y を付けた行だけが対象になります
+legacy-apply --plan <CSV> --reason "..." [--classify none|fact|all] [--confirm-recorded-market]
+legacy-unclassified [--all]         # 種別が自動で決まらなかった旧証拠の確認用一覧（元表記・記録された種別・参照元・日時。種別は推測しない）
+legacy-list [--unclassified] [--state UNKNOWN]
+legacy-classify --group <UUID> --type SELLER --key A... --reason "..."   # 未分類の種別を人が決める
+legacy-confirm  --market JP --group <UUID> --reason "..."                # 取得先市場の確定
+legacy-dismiss / legacy-reopen  --group <UUID> --reason "..."
+```
+- 取得先市場が不明な証拠は、証拠時刻から取得間隔（初期30日）の間、**両市場で `REVIEW_LEGACY`**（自動選択しない）になります。期限後も証拠は削除せず履歴として残ります。
+- `MAX(acquired_at)` は参考証拠で、出典の取得成功日時とは断定しません。確定した旧証拠は「旧証拠(参考)」として、新方式の成功とは区別して表示されます。
+- 旧コレクタの実行はURLのドメインから取得先市場が分かりますが、旧コレクタは正常0件と失敗を区別できないため、`--confirm-recorded-market` を明示しない限り確定しません。
+- 判断（分類・確定・却下・再開）は追記され、理由・実行者・日時が履歴として残ります。旧 `RUNNING` の実行（id 33・38）は変更も回収もしません。
+- `done/`（キーワード側）は一覧のみで、証拠にしません。
+
 ## 事前準備
 
 - 環境変数（`os.environ`）で `SEEDASIN_APP_DATABASE_URL` 等を設定します（`.env`の自動読込は無し。`.env`を使う場合もGit管理外）。ローカル開発用の固定パスワードは `alembic/versions/0001_create_roles.py`・`docker-compose.yml` にありますが、**本番では必ず上書き**してください（`docs/DEVIATIONS.md` 参照）。

@@ -46,10 +46,11 @@ SeedASIN: Amazon.com / Amazon.co.jp 両marketplaceでのアービトラージ（
 - 全テーブルで`ENABLE ROW LEVEL SECURITY`を有効化し、`app.current_marketplace`セッション変数と一致する行のみアクセス可能とする。
 - DB接続確立直後に必ず`SET app.current_marketplace = 'US'`（または`'JP'`）を発行すること（`SessionFactory.get_session(marketplace)`で一元管理）。物理コネクションの新規/再利用を問わず、呼び出し元に渡す前に毎回無条件でSETすること（プーリング時のmarketplace漏洩防止）。
 - RLS違反（`app.current_marketplace`未設定でのアクセス）はエラーコード`MP-11-01`でシステムエラーとして即時停止する（`current_setting`はmissing_ok省略で使用し、未設定時にPostgreSQLエラーで中断させる）。
+- 出典管理（alembic 0016、docs/DEVIATIONS.md #57）の`acquisition_*`テーブルと`collector_run`は、`marketplace`が**取得先ページの市場**（起点レポートの市場・業務方向ではない）。取得先市場が未確定の旧証拠だけは、各市場のclaimがRLSを迂回せず判定できるよう、US・JP両方の区画に複製して置く。
 - **例外**: marketplaceに依存しない情報を持つテーブル（例: `storefront_blocked_seller`）はRLS適用対象外としてよい。`db/table_names.py`の`NO_RLS_TABLES`で個別に明示し、`ALL_TABLES`には含めないこと（ユーザー承認済み、2026-09-09。docs/DEVIATIONS.md #30参照）。
 
 ### 3. 追記専用テーブルへのUPDATE/DELETE禁止
-- 対象: `asin_discovery_event`, `import_error_log`, `kpi_snapshot`, `tool_output_asin`, `weekly_listing_snapshot`, `collector_asin`（Phase 3新設分含む）, `business_report_row`, `business_report_import_event`（ビジネスレポート取込、alembic 0014。docs/DEVIATIONS.md #56参照）
+- 対象: `asin_discovery_event`, `import_error_log`, `kpi_snapshot`, `tool_output_asin`, `weekly_listing_snapshot`, `collector_asin`（Phase 3新設分含む）, `business_report_row`, `business_report_import_event`（ビジネスレポート取込、alembic 0014。docs/DEVIATIONS.md #56参照）, `acquisition_path`, `acquisition_source_event`, `acquisition_legacy_evidence`（出典管理、alembic 0016。docs/DEVIATIONS.md #57参照）
 - これらのテーブルはDBロール権限として`REVOKE UPDATE, DELETE ... FROM app_role`を必ず設定する。
 - リポジトリ層は`BaseRepository.upsert()`（UPSERT対象）と`BaseRepository.append_only_insert()`（追記専用）を明確に分離すること。
 - **例外**: `tool_output_asin`のみ、入力ミス訂正用の削除コマンド（`seller_ledger.cli delete-seller`/`delete-tool-run`、必ずy/n確認を挟む）に限り、`admin_role`へ`SELECT, DELETE`を限定的に付与している（`app_role`は引き続きDELETE不可のまま。ユーザー承認済み、2026-09-11。docs/DEVIATIONS.md #38参照）。

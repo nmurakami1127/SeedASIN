@@ -6,7 +6,7 @@ SellerRecommenderService、およびseller_recommendation_configのシードデ�
 from __future__ import annotations
 
 import uuid
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 import pytest
 from sqlalchemy import text
@@ -18,6 +18,15 @@ from seller_performance.attribution import AttributionService
 from seller_performance.seller_recommender import SellerRecommenderService
 
 pytestmark = pytest.mark.integration
+
+
+def _today() -> date:
+    """テストの基準日。対象ロジックの業務日付と揃えるため、ローカル日付(date.today())ではなく
+    **UTC日付**を使う。seller_recommenderは`requested_at::date`・`current_date`をDBのセッション
+    タイムゾーン(UTC)で評価するため、ローカルがJSTで日付がUTCより進んでいる時間帯（JST 0〜9時台）に
+    date.today()を使うと1日ずれて失敗していた（docs/DEVIATIONS.md #55）。製品コードの業務日付の
+    定義（DBのタイムゾーン基準）は変更していない。"""
+    return datetime.now(timezone.utc).date()
 
 
 def _seed_seller_and_tool_run(conn, seller_id: str, tool_run_id: str, days_ago: int = 30) -> None:
@@ -88,7 +97,7 @@ class TestAttributionService:
         with app_role_factory.get_session("US") as conn, conn.begin():
             _seed_seller_and_tool_run(conn, seller_id, tool_run_id)
             _insert_tool_output(conn, tool_run_id, asin, "2026-08-01 10:00:00")
-            _insert_weekly_listing(conn, asin, "USNEW1", date.today())
+            _insert_weekly_listing(conn, asin, "USNEW1", _today())
 
         service = AttributionService()
         with app_role_factory.get_session("US") as conn:
@@ -120,7 +129,7 @@ class TestAttributionService:
             _seed_seller_and_tool_run(conn, late_seller, late_run)
             _insert_tool_output(conn, late_run, asin, "2026-08-10 10:00:00")
             _insert_tool_output(conn, early_run, asin, "2026-08-01 10:00:00")  # より古い
-            _insert_weekly_listing(conn, asin, "USNEW1", date.today())
+            _insert_weekly_listing(conn, asin, "USNEW1", _today())
 
         service = AttributionService()
         with app_role_factory.get_session("US") as conn:
@@ -156,7 +165,7 @@ class TestAttributionService:
         with app_role_factory.get_session("US") as conn, conn.begin():
             _seed_seller_and_tool_run(conn, seller_id, tool_run_id)
             _insert_tool_output(conn, tool_run_id, asin, "2026-08-01 10:00:00")
-            _insert_weekly_listing(conn, asin, "USNEW1", date.today())
+            _insert_weekly_listing(conn, asin, "USNEW1", _today())
 
         service = AttributionService()
         with app_role_factory.get_session("US") as conn:
@@ -172,7 +181,7 @@ class TestSellerRecommenderService:
         tool_run_id = f"run-{uuid.uuid4().hex[:8]}"
         asin1 = f"B{uuid.uuid4().hex[:9].upper()}"
         asin2 = f"B{uuid.uuid4().hex[:9].upper()}"
-        today = date.today()
+        today = _today()
 
         with app_role_factory.get_session("US") as conn, conn.begin():
             _seed_seller_and_tool_run(conn, seller_id, tool_run_id)
@@ -203,7 +212,7 @@ class TestSellerRecommenderService:
         with app_role_factory.get_session("US") as conn, conn.begin():
             _seed_seller_and_tool_run(conn, seller_id, tool_run_id)
             _insert_tool_output(conn, tool_run_id, asin, "2026-08-01 10:00:00")
-            _insert_weekly_listing(conn, asin, "USNEW1", date.today())
+            _insert_weekly_listing(conn, asin, "USNEW1", _today())
 
         with app_role_factory.get_session("US") as conn:
             AttributionService().attribute(conn, "US")
@@ -250,7 +259,7 @@ class TestSellerRecommenderService:
         tool_run_id = f"run-{uuid.uuid4().hex[:8]}"
         asin1 = f"B{uuid.uuid4().hex[:9].upper()}"
         asin2 = f"B{uuid.uuid4().hex[:9].upper()}"
-        today = date.today()
+        today = _today()
 
         with app_role_factory.get_session("US") as conn, conn.begin():
             _seed_seller_and_tool_run(conn, seller_id, tool_run_id)
@@ -284,7 +293,7 @@ class TestSellerRecommenderService:
         tool_run_id = f"run-{uuid.uuid4().hex[:8]}"
         asin1 = f"B{uuid.uuid4().hex[:9].upper()}"
         asin2 = f"B{uuid.uuid4().hex[:9].upper()}"
-        today = date.today()
+        today = _today()
 
         with app_role_factory.get_session("US") as conn, conn.begin():
             _seed_seller_and_tool_run(conn, seller_id, tool_run_id)
@@ -318,7 +327,7 @@ class TestSellerRecommenderService:
         tool_run_id = f"run-{uuid.uuid4().hex[:8]}"
         asin1 = f"B{uuid.uuid4().hex[:9].upper()}"
         asin2 = f"B{uuid.uuid4().hex[:9].upper()}"
-        today = date.today()
+        today = _today()
 
         with app_role_factory.get_session("US") as conn, conn.begin():
             _seed_seller_and_tool_run(conn, seller_id, tool_run_id, days_ago=40)
@@ -347,7 +356,7 @@ class TestSellerRecommenderService:
         tool_run_id = f"run-{uuid.uuid4().hex[:8]}"
         asin1 = f"B{uuid.uuid4().hex[:9].upper()}"
         asin2 = f"B{uuid.uuid4().hex[:9].upper()}"
-        today = date.today()
+        today = _today()
 
         with app_role_factory.get_session("US") as conn, conn.begin():
             _seed_seller_and_tool_run(conn, seller_id, tool_run_id, days_ago=40)
@@ -380,7 +389,7 @@ class TestSellerRecommenderService:
         tool_run_id = f"run-{uuid.uuid4().hex[:8]}"
         asin1 = f"B{uuid.uuid4().hex[:9].upper()}"
         asin2 = f"B{uuid.uuid4().hex[:9].upper()}"
-        today = date.today()
+        today = _today()
         block_date = today - timedelta(days=20)
 
         with app_role_factory.get_session("US") as conn, conn.begin():
@@ -415,7 +424,7 @@ class TestSellerRecommenderService:
         with app_role_factory.get_session("US") as conn, conn.begin():
             _seed_seller_and_tool_run(conn, seller_id, tool_run_id)
             _insert_tool_output(conn, tool_run_id, asin, "2026-08-01 10:00:00")
-            _insert_weekly_listing(conn, asin, "USNEW1", date.today())
+            _insert_weekly_listing(conn, asin, "USNEW1", _today())
 
         with app_role_factory.get_session("US") as conn:
             AttributionService().attribute(conn, "US")
@@ -439,7 +448,7 @@ class TestSellerRecommenderService:
         tool_run_id = f"run-{uuid.uuid4().hex[:8]}"
         asin1 = f"B{uuid.uuid4().hex[:9].upper()}"
         asin2 = f"B{uuid.uuid4().hex[:9].upper()}"
-        today = date.today()
+        today = _today()
 
         with app_role_factory.get_session("US") as conn, conn.begin():
             _seed_seller_and_tool_run(conn, seller_id, tool_run_id, days_ago=40)
@@ -491,7 +500,7 @@ class TestSellerRecommenderService:
         tool_run_id = f"run-{uuid.uuid4().hex[:8]}"
         asin1 = f"B{uuid.uuid4().hex[:9].upper()}"
         asin2 = f"B{uuid.uuid4().hex[:9].upper()}"
-        today = date.today()
+        today = _today()
 
         with app_role_factory.get_session("US") as conn, conn.begin():
             _seed_seller_and_tool_run(conn, seller_id, tool_run_id)
@@ -567,7 +576,7 @@ class TestSellerRecommenderService:
         hold_recorded_date/hold_reasonが表示されること。last_requested_dateは
         引き続きNoneのまま（tool_execution_link基準のみのため）。"""
         seller_id = f"S{uuid.uuid4().hex[:10]}"
-        today = date.today()
+        today = _today()
         hold_date = today - timedelta(days=30)
         with app_role_factory.get_session("US") as conn, conn.begin():
             SellerService().register(conn, "US", seller_id)
@@ -613,7 +622,7 @@ class TestSellerRecommenderService:
         tool_run_id = f"run-{uuid.uuid4().hex[:8]}"
         asin1 = f"B{uuid.uuid4().hex[:9].upper()}"
         asin2 = f"B{uuid.uuid4().hex[:9].upper()}"
-        today = date.today()
+        today = _today()
 
         with app_role_factory.get_session("US") as conn, conn.begin():
             _seed_seller_and_tool_run(conn, seller_id, tool_run_id, days_ago=5)  # 直近すぎる
@@ -637,7 +646,7 @@ class TestSellerRecommenderService:
         tool_run_id = f"run-{uuid.uuid4().hex[:8]}"
         asin1 = f"B{uuid.uuid4().hex[:9].upper()}"
         asin2 = f"B{uuid.uuid4().hex[:9].upper()}"
-        today = date.today()
+        today = _today()
 
         with app_role_factory.get_session("US") as conn, conn.begin():
             _seed_seller_and_tool_run(conn, seller_id, tool_run_id, days_ago=15)  # ちょうど境界
@@ -666,7 +675,7 @@ class TestSellerRecommenderService:
         asin1 = f"B{uuid.uuid4().hex[:9].upper()}"
         asin2 = f"B{uuid.uuid4().hex[:9].upper()}"
         asin3 = f"B{uuid.uuid4().hex[:9].upper()}"
-        today = date.today()
+        today = _today()
 
         with app_role_factory.get_session("US") as conn, conn.begin():
             _seed_seller_and_tool_run(conn, seller_id, run1, days_ago=60)
@@ -700,7 +709,7 @@ class TestSellerRecommenderService:
         asin_old1 = f"B{uuid.uuid4().hex[:9].upper()}"
         asin_old2 = f"B{uuid.uuid4().hex[:9].upper()}"
         asin_recent = f"B{uuid.uuid4().hex[:9].upper()}"
-        today = date.today()
+        today = _today()
 
         with app_role_factory.get_session("US") as conn, conn.begin():
             _seed_seller_and_tool_run(conn, seller_id, old_run, days_ago=60)
@@ -737,7 +746,7 @@ class TestSellerRecommenderService:
         asin_old2 = f"B{uuid.uuid4().hex[:9].upper()}"
         asin_recent1 = f"B{uuid.uuid4().hex[:9].upper()}"
         asin_recent2 = f"B{uuid.uuid4().hex[:9].upper()}"
-        today = date.today()
+        today = _today()
 
         with app_role_factory.get_session("US") as conn, conn.begin():
             _seed_seller_and_tool_run(conn, seller_id, old_run, days_ago=60)
@@ -786,7 +795,7 @@ class TestSellerRecommenderService:
         tool_run_id = f"run-{uuid.uuid4().hex[:8]}"
         asin1 = f"B{uuid.uuid4().hex[:9].upper()}"
         asin2 = f"B{uuid.uuid4().hex[:9].upper()}"
-        today = date.today()
+        today = _today()
 
         with app_role_factory.get_session("US") as conn, conn.begin():
             _seed_seller_and_tool_run(conn, seller_id, tool_run_id, days_ago=30)
@@ -817,7 +826,7 @@ class TestSellerRecommenderService:
         asin_old1 = f"B{uuid.uuid4().hex[:9].upper()}"
         asin_old2 = f"B{uuid.uuid4().hex[:9].upper()}"
         asin_recent = f"B{uuid.uuid4().hex[:9].upper()}"
-        today = date.today()
+        today = _today()
 
         with app_role_factory.get_session("US") as conn, conn.begin():
             _seed_seller_and_tool_run(conn, seller_id, old_run, days_ago=120)
@@ -854,7 +863,7 @@ class TestSellerRecommenderService:
         asin2 = f"B{uuid.uuid4().hex[:9].upper()}"
         asin3 = f"B{uuid.uuid4().hex[:9].upper()}"
         asin4 = f"B{uuid.uuid4().hex[:9].upper()}"
-        today = date.today()
+        today = _today()
 
         with app_role_factory.get_session("US") as conn, conn.begin():
             _seed_seller_and_tool_run(conn, older_seller, older_run, days_ago=60)  # より古い最終取得日
@@ -888,7 +897,7 @@ class TestSellerRecommenderService:
         recent_run = f"run-{uuid.uuid4().hex[:8]}"
         asin1 = f"B{uuid.uuid4().hex[:9].upper()}"
         asin2 = f"B{uuid.uuid4().hex[:9].upper()}"
-        today = date.today()
+        today = _today()
 
         with app_role_factory.get_session("US") as conn, conn.begin():
             _seed_seller_and_tool_run(conn, seller_id, old_run, days_ago=60)

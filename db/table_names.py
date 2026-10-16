@@ -116,6 +116,16 @@ INCREMENTAL_RLS_TABLES = (
     "business_report_import_event",
 )
 
+# 同様に増分マイグレーション（alembic/versions/0016）だけで完結させる出典管理の5テーブル
+# （docs/DEVIATIONS.md #57）。ALL_TABLESには含めない。テスト・文書専用。
+ACQUISITION_RLS_TABLES = (
+    "acquisition_interval_config",
+    "acquisition_source",
+    "acquisition_path",
+    "acquisition_source_event",
+    "acquisition_legacy_evidence",
+)
+
 ALL_TABLES = NORMAL_CRUD_TABLES + APPEND_ONLY_APP_TABLES + KPI_REPORT_ONLY_TABLES + DEPRECATED_TABLES
 
 assert len(NORMAL_CRUD_TABLES) == 17

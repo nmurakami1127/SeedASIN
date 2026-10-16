@@ -918,3 +918,34 @@ PERMANENTLY_EXCLUDEDは引き続き完全除外のまま変更しない。
 **ACTIVEレポートの無効化（2026-10-16追加、ユーザー依頼）**: `deactivate-report --import-id N --reason "..."`。ACTIVEのみ・理由必須。状態はSUPERSEDEDに変え、`business_report_import_event`に`DEACTIVATED`イベント（理由=note、実行者、日時）を記録する（差替えによる旧版化の`SUPERSEDED`イベントとは種別で区別）。元行・取込履歴は削除せず、過去のレポートは自動で有効化しない（その市場・期間に有効版が無い状態を許す）。無効化後は`--import-id`指定でも通常の`candidates`対象外（`--allow-non-active`のみ）。確認待ちの間はDB接続・ロックを保持せず、実行時にアドバイザリロック（有効化と同一キー）＋行ロックで状態を再確認する。復元は既存の有効化操作で行い、`--mode first`がSUPERSEDEDにも使えるよう緩めた（有効版が無い期間のみ。別の版が有効なら`--mode replace`を明示）。`show-history`を追加（イベント履歴の表示）。
 - **マイグレーション方針**: 0014を書き換えず追加の`0015_add_deactivated_event_type.py`にした。理由: 本リポジトリの方針（#13/#25）は、適用され得る環境があるマイグレーションは書き換えず増分で足すこと。0014は実データDBには未適用と聞いているが、未コミット・個人の開発用DBへの適用有無を確認できない。0015は、0014適用済み・未適用のどちらの環境にも同じ手順で成立し（空DBは0014→0015、0014適用済みは0015のみ）、変更も`ck_brie_type`の付け替えと`ck_brie_deactivated_reason`（無効化イベントはnote必須）の追加だけで小さい。downgradeはDEACTIVATEDをSUPERSEDEDへ読み替えて履歴を残す。
 - RLS・権限は変更なし（`app_role`は`status`・`activated_at`のみ列限定UPDATE、eventは追記専用）。
+
+
+## 57. `acquisition`新設（段階2）: 出典管理と再取得間隔（Phase 4, 2026-10-17）
+
+ユーザー承認済みの設計（調査→設計修正→実装）。実コレクタ・ブラウザ・統合ツールへの接続は対象外（段階3以降）。
+
+**スキーマ（`alembic/versions/0016`）**: 新設5テーブル（`acquisition_interval_config`・`acquisition_source`・`acquisition_path`(追記専用)・`acquisition_source_event`(追記専用)・`acquisition_legacy_evidence`(追記専用)）と`collector_run`の列追加。段階1と同じく共有metadata/`ALL_TABLES`に入れず、生SQLで完結（`db/table_names.ACQUISITION_RLS_TABLES`はテスト・文書専用）。
+- `marketplace`は**取得先ページの市場**（既存`collector_run.marketplace`と同じ意味）。起点レポートの市場・業務方向は`acquisition_path`の`origin_marketplace`・`direction`・`origin_import_id`で別に持つ。
+- 出典キーは`key_primary`＋`key_qualifier`(NOT NULL, 既定'')の構造化キー。一意性はSHA-256の`key_hash`（長いキーワードでもインデックスサイズ制限に当たらない）。元の値も保持し、登録時にhash一致でも元の値が違えば`KeyCollisionError`。種別は`SELLER/BRAND_NAME/BRAND_STORE/KEYWORD`（ブランド名とストアは別種別。表記の自動統合は全角半角・大小文字・空白のみ）。
+- 起点の指標（注文点数・セッション・最大獲得率）は経路の登録時に`import_id`指定のレポートからコピー（区画をまたぐ読み取りを順位付けから排除）。planは使うimportを明示指定させ、同じ市場の2つのimportは拒否、指定外のimportの経路は順位に使わない。
+- 失敗の連続判定: `FAILED/PARTIAL/UNVERIFIED_EMPTY`のみ数える。ユーザー中断(Ctrl+C)・`abort-run`・lease失効は数えない。3回で自動保留（根拠表示、`release-hold`で明示解除し以降の失敗は数え直し）。冷却60分。初期値は`acquisition_interval_config`（市場×種別、設定変更可。lease 5分/CAPTCHA 30分は仮設定で段階3で見直す）。
+- 30日境界は`as_of >= 基準時刻 + n×24時間`（テスト: 30日直前・ちょうど・経過後）。
+
+**lease・競合**: 全操作が`collector_run`行の`FOR UPDATE`を先に取り、DB時刻(`clock_timestamp()`)でleaseの有効性・トークン・状態を判定する。heartbeat/ASIN追記/終了は失効後は`LeaseLost`（復活させない）、回収も同じ行ロックで直列化。新方式の行(`source_id`有り)は終了後UPDATEを保護トリガーが拒否、`source_id`/`marketplace`は全行で不変。**旧経路の行(`source_id IS NULL`)と既存コレクタ・既存テストには影響しない**（旧RUNNINGのid 33・38は変更も回収もしない）。
+- claim・保留/除外/解除・間隔変更・自動保留・旧証拠の分類/確定/却下は、(取得先市場, 種別, key_hash)の**識別ロック**に参加。ロック順序: 識別ロック→出典行→run行。
+- **保証範囲**: 既存`storefront_blocked_seller`の更新経路（`seller_ledger.storefront_blocked`等）はこのロックに参加しない。claimは判定クエリ実行時点でコミット済みの内容を反映するが、claim処理中に並行してコミットされた更新は反映されない可能性がある（競合の完全防止は保証しない）。
+
+**旧証拠**: 観測と人の判断を同一テーブルに行種別で追記（`row_type`）。状態は最新の判断を畳み込んだ結果で、履歴は上書きされない。取得先市場が未確定の観測はUS・JP両区画に複製し、各区画のclaimが自区画だけを読んで`REVIEW_LEGACY`を判定（RLS迂回・参照専用ロール不要）。種別が未分類の証拠はどの出典も保留しない（一覧で分かる）。
+- `legacy-confirm`の競合防止: 証拠グループ単位のセッション・アドバイザリロックを保持して区画ごとの短いトランザクションで追記（確定先→他方）。途中で失敗しても他方はUNKNOWNのまま（保留が外れる方向に誤らない）、同じコマンドの再実行で補完、別市場への確定はreopenまで拒否。1トランザクション内で区画を切り替えない理由は、1接続=1市場というRLSの前提を保つため。
+- dry-run(`legacy-dry-run`)はDBに書かない（`SET TRANSACTION READ ONLY`）。事実/推定/未確認を success・market・type の3軸で出し、適用は利用者が選んだ行だけ。旧コレクタはURLのドメインで取得先市場は事実だが、成功は推定のため`--confirm-recorded-market`の明示なしには確定しない。`MAX(acquired_at)`は参考証拠で取得成功日時とは断定せず、確定後も新方式の成功とは区別して表示。セラー側`status.csv`は移行候補、`done/`は一覧のみ。
+
+**未実装・後続**: 実コレクタへの接続（ブラウザ、段階3）、統合ツール投入・`tool_execution_link`への取得先市場の記録（段階4）、人が承認する別名表、`seller_recommender`との統合。
+
+**最終レビューでの追加・訂正（2026-10-17）**:
+- 旧証拠の件数の照合: dry-runの観測1,885件 = 統合ツール実行1,764（tel全行。取込あり1,720／取込なし44）+ 旧collector_run 76（件数あり58／未確認18）+ status.csv 45（推定33／未確認12）。除外・重複排除・解析不能による取りこぼしは無い（1行=1観測、グループIDの重複0）。前回報告の「取込あり1,709」はDB時刻2026-10-16 20:02 UTC時点の値で、その後に11実行（US 8・JP 3、imported_at 21:39〜22:05 UTC）の出力が取り込まれて1,720になった（データの変化）。報告書の「1,677」「約117」は集計の誤記で、正しくは1,720と74。
+- `legacy-confirm`等の市場横断ロック（`LegacyService._group_lock`）: 取得した同じ接続で解放し、解放を確認できない接続はプールへ戻さず破棄する（セッション・アドバイザリロックはプール返却時のrollbackでは解放されないため）。ロック取得の途中で例外になった接続も破棄。確定は区画ごとの追記時にも「別市場で確定済みなら拒否」を二重に確認する。`apply`の分類・確定も同じ群ロックで直列化。
+- 旧証拠の畳み込みはevidence_id（一意の連番）だけで順序を決める（recorded_atは同時刻になり得るため根拠にしない。入力順にも依存しない）。
+- 取得成功日時が不明/参考の旧証拠は、確定後も「最終成功」には出さず、「旧証拠(確定)」「基準=旧証拠(参考)」として別に表示する。
+- 0016のdowngradeは既存のcollector_run・collector_asinを1行も削除しない。失われるのはacquisition_*の全データとcollector_runの新規列の値、INTERRUPTEDの区別（FAILEDへ読み替え）。
+- `legacy-unclassified`を追加（種別が自動で決まらなかった旧証拠の確認用一覧。値ごとの要約と明細。種別は推測せず、decided_*列は空欄）。
+- 既存テスト（`tests/integration/test_seller_performance.py`）の基準日をローカル日付からUTC日付に変更（製品コードの業務日付＝DBのセッションタイムゾーン基準は変更していない。業務日付をJST基準に変える場合は製品の仕様変更として別途判断が必要）。
