@@ -20,6 +20,15 @@ exports/
 _reference/
 collected_asins_*.csv
 
+# ---- ビジネスレポートの実データ（売上情報を含む。.gitkeepのみ管理）----
+# 市場は置き場のフォルダで決まる（US=輸出 / JP=輸入）。サブフォルダ内のCSVも除外される。
+data/business_reports/US/*
+data/business_reports/JP/*
+!data/business_reports/US/.gitkeep
+!data/business_reports/JP/.gitkeep
+# 所定外の場所（docs/等）に置かれた実レポートの誤コミット防止
+**/*BusinessReport*.csv
+
 # ---- 保存したAmazonページ（テストから未参照。セッション関連の値を含み得る）----
 tests/fixtures/Amazon.co.jp.html
 tests/fixtures/Amazon.co.jp_files/

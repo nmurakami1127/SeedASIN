@@ -49,7 +49,7 @@ SeedASIN: Amazon.com / Amazon.co.jp 両marketplaceでのアービトラージ（
 - **例外**: marketplaceに依存しない情報を持つテーブル（例: `storefront_blocked_seller`）はRLS適用対象外としてよい。`db/table_names.py`の`NO_RLS_TABLES`で個別に明示し、`ALL_TABLES`には含めないこと（ユーザー承認済み、2026-09-09。docs/DEVIATIONS.md #30参照）。
 
 ### 3. 追記専用テーブルへのUPDATE/DELETE禁止
-- 対象: `asin_discovery_event`, `import_error_log`, `kpi_snapshot`, `tool_output_asin`, `weekly_listing_snapshot`, `collector_asin`（Phase 3新設分含む）
+- 対象: `asin_discovery_event`, `import_error_log`, `kpi_snapshot`, `tool_output_asin`, `weekly_listing_snapshot`, `collector_asin`（Phase 3新設分含む）, `business_report_row`, `business_report_import_event`（ビジネスレポート取込、alembic 0014。docs/DEVIATIONS.md #56参照）
 - これらのテーブルはDBロール権限として`REVOKE UPDATE, DELETE ... FROM app_role`を必ず設定する。
 - リポジトリ層は`BaseRepository.upsert()`（UPSERT対象）と`BaseRepository.append_only_insert()`（追記専用）を明確に分離すること。
 - **例外**: `tool_output_asin`のみ、入力ミス訂正用の削除コマンド（`seller_ledger.cli delete-seller`/`delete-tool-run`、必ずy/n確認を挟む）に限り、`admin_role`へ`SELECT, DELETE`を限定的に付与している（`app_role`は引き続きDELETE不可のまま。ユーザー承認済み、2026-09-11。docs/DEVIATIONS.md #38参照）。

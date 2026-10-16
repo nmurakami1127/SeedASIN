@@ -896,3 +896,25 @@ PERMANENTLY_EXCLUDEDは引き続き完全除外のまま変更しない。
 
 **既知の無関係な事象（本対応では対処せず）**: 今回のテスト実行時（JST 2026-10-08 01:37、UTC 2026-10-07 16:37）、`tests/integration/test_seller_performance.py`の既存2件（`test_last_requested_date_and_hold_recorded_date_are_shown_as_separate_columns`・`test_reports_total_listed_last_requested_date_and_recent_fetch_days`）が1日ずれで失敗した。原因はPythonの`date.today()`（ローカルJST基準）とPostgreSQLの`now()`（コンテナがUTC基準）の食い違い——ローカル時刻がJSTの深夜0時〜9時台（UTCではまだ前日）の間だけ再現する、本対応以前からの既存テストの潜在的な時刻依存バグであり、本ターンで変更したファイル（`seller_performance/export_all.py`・関連テスト）とは無関係（該当テストファイルは今回編集していない）。UTCが日付を追い越せば自然に解消する。修正は依頼範囲外のため見送り、事象のみ記録する。
 
+
+## 56. `origin_selection`新設（段階1）: ビジネスレポート取込・候補順位付け（Phase 4, 2026-10-16）
+
+ユーザー依頼（調査・設計→承認→実装）。起点ASIN選定のため、手動ダウンロードしたビジネスレポートCSV（US=輸出／JP=輸入）を取り込み、注文された商品点数を最優先に候補を順位付けする。出典管理・30日間隔・ASIN取得連携・統合ツール投入は後続段階で、今回の対象外。
+
+**市場判定（確定）**: ファイル名・タイトル列・通貨・列構成からは判定せず、置き場フォルダの**解決済みパス**で決める（`data/business_reports/US|JP`、`origin_selection/paths.py`）。所定フォルダ外は`--marketplace`必須（`market_basis='EXPLICIT'`）、フォルダと矛盾する指定は停止。統合ツールログのメモ判定（`tool_intake/log_ingest.py`）は変更していない。対象期間は利用者指定値（`period_basis='USER_SPECIFIED'`のCHECKで固定）。
+
+**DB（`alembic/versions/0014`）**: `business_report_import`・`business_report_row`（追記専用）・`business_report_import_event`（追記専用）、ビュー`v_business_report_asin`／`v_business_report_candidate`（`security_invoker`、import_id単位でのみ集計）。`import_run_history.ck_import_type`に`BUSINESS_REPORT`を追加。
+- 空DB／既存DBの両立: 3表は共有`metadata`にも`ALL_TABLES`にも入れず、0014の生SQL（IF NOT EXISTS／DROP POLICY IF EXISTS）だけでRLS・GRANTまで完結（#25と同じ。0003/0004が実行時にタプルを読むため）。`db/table_names.INCREMENTAL_RLS_TABLES`はテスト・文書専用。
+- 有効版は`(marketplace, period_start, period_end) WHERE status='ACTIVE'`の部分一意インデックスで常に1つ。取込同一性は`(marketplace, period_start, period_end, file_sha256)`（ハッシュ単独では判定しない）。
+- 行エラーが1件でもあるレポートは有効化不可（アプリ層の拒否＋`ck_bri_active_no_errors`）。取込は常にSTAGED。有効化は`--mode first|replace`の明示が必須で、確認待ちの間はDB接続・ロックを保持せず、開始時に状態を再確認（アドバイザリロック＋`FOR UPDATE`）。
+- `app_role`は`business_report_import`の`status`・`activated_at`のみUPDATE可（列限定）。DELETEはどの表も不可、`admin_role`への付与なし。
+
+**参照専用経路**: 別市場の同一ハッシュ警告・`--import-id`からの市場解決には`kpi_report_role`（SELECTのみ）を使い、`app_role`のRLSは回避しない。参照専用接続が未設定なら警告を省略し、市場解決は市場別`app_role`セッション（US→JP）にフォールバックする。以降の更新・読み取りは必ず市場別`app_role`セッションで行う。
+
+**CLAUDE.md**: 3節の追記専用リストに`business_report_row`・`business_report_import_event`を追加した（承認済み）。
+
+**CLI通し確認（2026-10-16、使い捨てtest-db・架空CSV）**: list-inbox→import-report→verify-report→activate-report→candidates→list-reportsをUS/JPで確認。`SEEDASIN_KPI_REPORT_DATABASE_URL`は任意——未設定・接続不可でも`--import-id`からの市場解決は市場別app_roleセッションへのフォールバックで動作し、省略されるのは別市場の同一ファイル警告のみ（警告文には接続詳細を出さず例外の種類だけ表示）。
+
+**ACTIVEレポートの無効化（2026-10-16追加、ユーザー依頼）**: `deactivate-report --import-id N --reason "..."`。ACTIVEのみ・理由必須。状態はSUPERSEDEDに変え、`business_report_import_event`に`DEACTIVATED`イベント（理由=note、実行者、日時）を記録する（差替えによる旧版化の`SUPERSEDED`イベントとは種別で区別）。元行・取込履歴は削除せず、過去のレポートは自動で有効化しない（その市場・期間に有効版が無い状態を許す）。無効化後は`--import-id`指定でも通常の`candidates`対象外（`--allow-non-active`のみ）。確認待ちの間はDB接続・ロックを保持せず、実行時にアドバイザリロック（有効化と同一キー）＋行ロックで状態を再確認する。復元は既存の有効化操作で行い、`--mode first`がSUPERSEDEDにも使えるよう緩めた（有効版が無い期間のみ。別の版が有効なら`--mode replace`を明示）。`show-history`を追加（イベント履歴の表示）。
+- **マイグレーション方針**: 0014を書き換えず追加の`0015_add_deactivated_event_type.py`にした。理由: 本リポジトリの方針（#13/#25）は、適用され得る環境があるマイグレーションは書き換えず増分で足すこと。0014は実データDBには未適用と聞いているが、未コミット・個人の開発用DBへの適用有無を確認できない。0015は、0014適用済み・未適用のどちらの環境にも同じ手順で成立し（空DBは0014→0015、0014適用済みは0015のみ）、変更も`ck_brie_type`の付け替えと`ck_brie_deactivated_reason`（無効化イベントはnote必須）の追加だけで小さい。downgradeはDEACTIVATEDをSUPERSEDEDへ読み替えて履歴を残す。
+- RLS・権限は変更なし（`app_role`は`status`・`activated_at`のみ列限定UPDATE、eventは追記専用）。

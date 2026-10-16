@@ -13,6 +13,17 @@ from pathlib import Path
 _DATETIME_FORMATS = ("%Y-%m-%d %H:%M:%S", "%Y/%m/%d %H:%M:%S", "%Y-%m-%d", "%Y/%m/%d")
 
 
+def decode_auto_with_encoding(raw: bytes) -> tuple[str, str]:
+    """decode_auto()と同じ判定順で、(デコード結果, 採用したエンコーディング名)を返す。
+    business_report_import.encoding_detectedに採用結果を記録するための補助。"""
+    for encoding in ("utf-8-sig", "cp932"):
+        try:
+            return raw.decode(encoding), encoding
+        except UnicodeDecodeError:
+            continue
+    return raw.decode("utf-8"), "utf-8"
+
+
 def decode_auto(raw: bytes) -> str:
     """utf-8-sig → cp932 → utf-8 の順で試し、最初に成功したデコード結果を返す。
 

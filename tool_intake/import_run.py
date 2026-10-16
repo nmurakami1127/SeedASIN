@@ -82,6 +82,24 @@ class ImportRunRecorder:
                 },
             )
 
+    def mark_failed(self) -> None:
+        """取込全体が致命的エラーで中断した場合に、実行履歴をFAILEDにする（行単位の
+        エラーはrecord_error()で記録済みの件数のまま残す）。"""
+        with self._conn.begin():
+            self._conn.execute(
+                text(
+                    "UPDATE import_run_history SET status='FAILED', "
+                    "total_rows=:total, success_rows=:success, error_rows=:errors "
+                    "WHERE import_run_id=:run_id"
+                ),
+                {
+                    "total": self._total,
+                    "success": self._success,
+                    "errors": self._errors,
+                    "run_id": self.import_run_id,
+                },
+            )
+
     def finish(self) -> ImportSummary:
         with self._conn.begin():
             self._conn.execute(

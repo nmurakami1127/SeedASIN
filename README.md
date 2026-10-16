@@ -44,6 +44,76 @@ US/JPは `marketplace` で完全分離し、全テーブルにRow Level Security
 - `asin_collector` の出力CSV（`collected_asins_<collector_run_id>.csv`）は**ヘッダーなし・1行1ASIN**です。
 - `data/<US|JP>/inbound|outbound/...` は取込・出力用の置き場で、中のCSVはGit管理外です（`.gitkeep`のみ管理）。
 
+## ビジネスレポートの取込（`origin_selection`）
+
+起点ASINの候補選定のため、Seller Centralから手動でダウンロードしたビジネスレポートCSVを取り込み、注文された商品点数の多い順に候補を出します。
+
+**市場は、ファイル名や中身ではなく、置いたフォルダで決まります**（統合ツールログのメモによる「輸出＝US／輸入＝JP」判定とは別の入力で、そちらは変更していません）。
+
+| 置き場 | 取り込まれる市場 |
+|---|---|
+| `data\business_reports\US\` | US・輸出 |
+| `data\business_reports\JP\` | JP・輸入 |
+
+- 実データ（CSV）はGit管理から除外されています（各フォルダの`.gitkeep`のみ管理）。`data\US\inbound\...`など既存の`data\<US|JP>\`配下とは別の階層です。
+- Excelで開いて保存し直さないでください（ASINの先頭の0が消えます。桁数不正の行はエラーになります）。
+- 対象期間（開始日・終了日）は**利用者が指定する値**で、CSVの内容からは検証されません。
+
+手順:
+
+1. 市場に対応するフォルダへCSVを置きます。`docs\`にある既存の実CSVは自動では移動・削除されません。利用者が確認のうえ、例えば次のように配置してください（コピー後に元を消すかは利用者が決めます）。
+   ```powershell
+   Copy-Item docs\US-BusinessReport-16-10-26.csv data\business_reports\US\
+   Copy-Item docs\JP-BusinessReport-16-10-26.csv data\business_reports\JP\
+   ```
+2. 置いたファイルと取込履歴を確認します（読み取りのみ。履歴は市場ごと・期間ごとに表示され、「取込不要」の判定はしません）。
+   ```powershell
+   python -m origin_selection.cli list-inbox
+   ```
+3. 取り込みます（市場の指定は不要。常にSTAGEDで止まり、自動では有効になりません）。
+   ```powershell
+   python -m origin_selection.cli import-report --file data\business_reports\US\US-BusinessReport-16-10-26.csv --period-start 2026-09-01 --period-end 2026-09-30
+   ```
+4. 件数を確認し、問題なければ有効化します。初回は`--mode first`、同じ市場・期間の既存有効版を差し替えるときは`--mode replace`（旧版は履歴として残り、`SUPERSEDED`から復元できます）。**行エラーが1件でもあるレポートは有効化できません**（`show-errors`で内容を確認し、修正したファイルを取り込み直すか`reject-report`で不採用にします）。
+   ```powershell
+   python -m origin_selection.cli verify-report --import-id 1
+   python -m origin_selection.cli activate-report --import-id 1 --mode first
+   ```
+5. 候補を出力します（1つのレポートだけが対象。期間の異なる複数のレポートは合算されません）。出力先は`exports\origin_candidates\`です。
+   ```powershell
+   python -m origin_selection.cli candidates --import-id 1
+   ```
+
+前提となる環境変数:
+
+| 環境変数 | 要否 | 用途 |
+|---|---|---|
+| `SEEDASIN_APP_DATABASE_URL` | **必須** | すべてのコマンド（取込・有効化・候補・一覧）。更新・読み取りは市場別のapp_roleセッションで行い、RLSは回避しません |
+| `SEEDASIN_KPI_REPORT_DATABASE_URL` | 任意 | 参照専用（SELECTのみ）。**別市場に同じファイルが取込済みかの警告**と、`--import-id`から市場を引く問い合わせの短縮にだけ使います。未設定、または接続できない場合でも、`--import-id`を使う`verify-report`／`activate-report`／`candidates`などは市場別のapp_roleセッションで市場を解決するため、機能は変わりません（別市場の警告だけが省略され、画面に「省略しました」と表示されます） |
+
+期間・市場・ファイルを誤って取り込んだ・有効化した場合（現在の実装に即した手順です）:
+
+- **有効化の前に気づいた場合（`STAGED`）**: `reject-report --import-id N --reason ...`で不採用にし、正しい期間で取り込み直します（同じファイルでも期間が違えば別の取込として扱われます）。`reject-report`は`STAGED`にしか使えません。
+- **誤って有効化してしまった場合（`ACTIVE`）**: `deactivate-report`で候補選定から外します。`reject-report`は使えません。
+  1. 誤った有効版を無効化します（**理由が必須**。確認画面に市場・期間・ファイル・集計概要が表示されます）。
+     ```powershell
+     python -m origin_selection.cli deactivate-report --import-id 1 --reason "期間の指定誤り（10月ではなく9月）"
+     ```
+     状態は`SUPERSEDED`になり、元の行・取込履歴は削除されません。無効化したレポートは、`--import-id`で指定しても通常の`candidates`出力の対象にはなりません。**過去のレポートが自動で有効になることはなく**、その市場・期間には有効版が無い状態になります。理由・実行者・日時は`show-history --import-id 1`で確認できます（差替えによる旧版化とはイベント種別が異なります）。
+  2. 正しい市場・期間で取り込み直します（市場はフォルダで決まるので、市場を誤った場合は正しいフォルダにファイルを置いてから取り込みます）。
+     ```powershell
+     python -m origin_selection.cli import-report --file data\business_reports\US\<名前>.csv --period-start 2026-09-01 --period-end 2026-09-30
+     ```
+  3. 確認します（`verify-report --import-id N`、`list-inbox`）。
+  4. 有効化します（その市場・期間に有効版が無ければ`--mode first`）。
+     ```powershell
+     python -m origin_selection.cli activate-report --import-id N --mode first
+     ```
+  - 誤操作で無効化した場合の復元: その市場・期間に有効版が無ければ`activate-report --import-id 1 --mode first`で戻せます（すでに別の版が有効なら、差替えとして`--mode replace`を明示します）。
+- 有効化・無効化の前に、確認画面の「市場」「期間」「ファイル」を必ず確認してください（`list-inbox`・`verify-report`でも確認できます）。
+
+所定フォルダ外のファイルを取り込む場合は`--marketplace US|JP`が必須です。フォルダと`--marketplace`が矛盾する場合は停止します。集計値は候補選定用で、最大獲得率は月間全体の獲得率ではなく、セッション数の合算はユニーク訪問数ではありません。
+
 ## 事前準備
 
 - 環境変数（`os.environ`）で `SEEDASIN_APP_DATABASE_URL` 等を設定します（`.env`の自動読込は無し。`.env`を使う場合もGit管理外）。ローカル開発用の固定パスワードは `alembic/versions/0001_create_roles.py`・`docker-compose.yml` にありますが、**本番では必ず上書き**してください（`docs/DEVIATIONS.md` 参照）。

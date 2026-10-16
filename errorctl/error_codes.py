@@ -16,6 +16,7 @@ class ErrorCode(StrEnum):
     IM_03_01 = "IM-03-01"  # M3/B1: 既知ASIN取込CSV行の必須項目欠落（×、当該行スキップ）
     IM_07_01 = "IM-07-01"  # M7/B2: 既知Seller取込CSV行の必須項目欠落（×、当該行スキップ）
     IM_TOOL_01 = "IM-TOOL-01"  # tool_intake: 統合ツール出力CSV行の必須項目欠落・解析失敗（×、当該行スキップ）
+    IM_REPORT_01 = "IM-REPORT-01"  # origin_selection: ビジネスレポートCSV行の必須項目欠落・解析失敗（×、当該行を除外して取込は継続）
     IM_WEEKLY_01 = "IM-WEEKLY-01"  # tool_intake: 週次出品完了リストCSV行の必須項目欠落・解析失敗（×、当該行スキップ）
     JD_08_01 = "JD-08-01"  # M8: Seller明細のseller_id重複登録（同一seller_check_id内）（×）
     MP_11_01 = "MP-11-01"  # M11: RLS違反（app.current_marketplace未設定でのアクセス）（×、システムエラーとして即時停止）

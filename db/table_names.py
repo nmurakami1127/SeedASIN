@@ -104,6 +104,18 @@ BIGSERIAL_SEQUENCES = {
 # 再現。docs/DEVIATIONS.md参照）。そのためBIGSERIAL_SEQUENCESのようなGRANT対象辞書は
 # 不要で、0004にもIDENTITY列向けのGRANT/REVOKEは存在しない。
 
+# 増分マイグレーション（alembic/versions/0014）だけで作成・RLS・GRANTを完結させるテーブル
+# （ビジネスレポート取込、docs/DEVIATIONS.md #56）。**ALL_TABLESには含めない**——0002は
+# db/models.pyのmetadata、0003/0004はALL_TABLES等を実行時に読むため、ここへ入れると
+# 空DBの初回構築で存在しないテーブルへのRLS/GRANTが走って失敗する（#25の落とし穴）。
+# このタプルはテスト・文書専用で、0003/0004/0014のいずれも読まない（0014は同じ名前を
+# リテラルで持つ。tests/integration/test_migration_0014.pyが実DBとの一致を検査する）。
+INCREMENTAL_RLS_TABLES = (
+    "business_report_import",
+    "business_report_row",
+    "business_report_import_event",
+)
+
 ALL_TABLES = NORMAL_CRUD_TABLES + APPEND_ONLY_APP_TABLES + KPI_REPORT_ONLY_TABLES + DEPRECATED_TABLES
 
 assert len(NORMAL_CRUD_TABLES) == 17
