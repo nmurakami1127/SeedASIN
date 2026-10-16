@@ -66,7 +66,8 @@ SeedASIN: Amazon.com / Amazon.co.jp 両marketplaceでのアービトラージ（
 ### 7. ブラウザ自動操作（`asin_collector`）の技術要件
 - `asin_collector`はK8s CronJobでの無人実行対象にしない。CAPTCHA対応が人の介在を前提とする以上、人が手元で起動する対話式CLIツールとして実装する（`headless=False`、既存の`collect_asins_from_search.py`と同じ運用パターン）。
 - お届け先地域（郵便番号: 米国向け`97005`、日本向け`289-1223`）はプログラムでUI操作して設定しない。既存運用と同様、Playwrightの永続プロファイル（`launch_persistent_context`の`user_data_dir`）に人が事前に手動で設定しておき、プログラムはそれを引き継ぐだけとする。起動時に現在の配送先表示を軽くチェックし、想定と異なれば警告を出す程度に留める（自動操作を作り込むと、CAPTCHA同様Amazon側のUI変更で壊れやすい割に、既に確立している人手の運用を置き換える理由が無いため。2026-09-03、ユーザー承認済み。旧記載からの変更点はdocs/DEVIATIONS.md参照）。
-- CAPTCHA発生時は人の手動対応を待つ設計とする（`collector_run.status='CAPTCHA_WAIT'`でDB上からも見える化し、解決後`RUNNING`へ戻す。既存の`collect_asins_from_search.py`のCAPTCHA対応パターンを踏襲）
+- CAPTCHA発生時は人の手動対応を待つ設計とする（`collector_run.status='CAPTCHA_WAIT'`でDB上からも見える化し、解決後`RUNNING`へ戻す。既存の`collect_asins_from_search.py`のCAPTCHA対応パターンを踏襲）。**例外**: `asin_collector.check_recommendations`（セラー単位でストアフロント検索ページを多数巡回するツール）のみ、CAPTCHA検知時に人の対話待ちをせず、即座にそのセラーを「判定不能」として記録し次のセラーへ進む。このツールは1回の実行でrecommendの出力（known_seller_masterへの候補拡大後は1 marketplaceあたり数百件規模）を順に処理するため、1件ごとにブロッキングする設計は現実的でないと判断した（ユーザー確認済み、2026-10-07。docs/DEVIATIONS.md #53参照）。
+- `storefront_blocked_seller`に人が手動で記録した保留理由（`COMPETITOR_SAME_SERVICE`・`RETRY_LATER`）を自動判定で上書きしてよいのは、より確定的な「今後も取得しない」（`PERMANENTLY_EXCLUDED`）という判断に進む場合のみとし、その際も記録日（`first_noted_at`）は変更しない（ユーザー確認済み、2026-10-07。docs/DEVIATIONS.md #54参照）。
 - 対象は一般公開ページ（ログイン不要）のみ。Seller Central等の認証必須画面への自動アクセスは絶対に行わない
 
 ## ディレクトリ構成・命名規則

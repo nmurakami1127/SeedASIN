@@ -1,0 +1,57 @@
+[project]
+name = "seedasin"
+version = "0.1.0"
+description = "SeedASIN: Seller非依存の新規起点ASIN探索システム（Amazon.com / Amazon.co.jp対応）"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "httpx>=0.27",
+    "selectolax>=0.3",
+    "sqlalchemy>=2.0",
+    "psycopg[binary]>=3.1",
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.29",
+    "pydantic>=2.6",
+    "alembic>=1.13",
+    "playwright>=1.45",
+    "openpyxl>=3.1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = [
+    "batch*",
+    "admin*",
+    "api*",
+    "search*",
+    "extract*",
+    "known_asin*",
+    "eligibility*",
+    "seed*",
+    "seller_master*",
+    "seller_feedback*",
+    "seller_usage*",
+    "kpi*",
+    "repository*",
+    "db*",
+    "config*",
+    "applog*",
+    "errorctl*",
+]
+exclude = ["tests*", "alembic*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+markers = [
+    "integration: requires a real, disposable PostgreSQL 16 instance (SEEDASIN_TEST_SUPERUSER_DATABASE_URL)",
+]

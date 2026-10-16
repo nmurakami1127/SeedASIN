@@ -1,0 +1,45 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+.venv/
+venv/
+.env
+data/*/inbound/*/*.csv
+data/*/inbound/*/processed/
+data/*/inbound/*/error/
+data/*/outbound/*/*.csv
+.vscode/
+.idea/
+
+# ---- ブラウザプロファイル（Cookie・セッションを含む）----
+playwright_profiles/
+
+# ---- 実データ・出力（取得ASIN、実績データ、分析用エクスポート）----
+exports/
+_reference/
+collected_asins_*.csv
+
+# ---- 保存したAmazonページ（テストから未参照。セッション関連の値を含み得る）----
+tests/fixtures/Amazon.co.jp.html
+tests/fixtures/Amazon.co.jp_files/
+
+# ---- 統合ツールログ画面の保存HTML、スクリーンショット、実行ログ ----
+*.log
+*.png
+*.jpg
+*.jpeg
+
+# ---- 秘密情報・DBダンプ ----
+.env.*
+!.env.example
+*.pem
+*.key
+*.dump
+
+# ---- AI Worker版（対象外）----
+amazon_asin_worker/
+amazon_asin_worker.zip
+collect_asins_worker.py
+setup_ai_worker.sh
+run_ai_worker.sh

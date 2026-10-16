@@ -1,0 +1,43 @@
+services:
+  db:
+    # ローカル開発用（実際にCLI等で登録・収集したデータを貯めていく想定のDB）。
+    # 結合テストは絶対にこのサービスに向けないこと。テストはtest-db（下記）を使う。
+    image: postgres:16
+    environment:
+      POSTGRES_DB: seedasin
+      POSTGRES_USER: seedasin
+      POSTGRES_PASSWORD: seedasin_local_dev
+    ports:
+      - "5432:5432"
+    volumes:
+      - seedasin_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U seedasin -d seedasin"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  test-db:
+    # 結合テスト専用の使い捨てDB。tests/integration/conftest.pyのalembic downgrade base
+    # （全テーブル削除）が実行される対象は常にこちら。dbサービス（ローカル開発用、実データが
+    # 溜まっていく）とはポート・DB名・ボリュームを完全に分離し、dbサービスへの誤爆を防ぐ
+    # （docs/DEVIATIONS.md #23参照。過去にこの分離が無かったため、結合テスト実行のたびに
+    # ローカル開発用DBの実データが消えていた）。
+    image: postgres:16
+    environment:
+      POSTGRES_DB: seedasin_test
+      POSTGRES_USER: seedasin
+      POSTGRES_PASSWORD: seedasin_local_dev
+    ports:
+      - "5433:5432"
+    volumes:
+      - seedasin_test_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U seedasin -d seedasin_test"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  seedasin_pgdata:
+  seedasin_test_pgdata:

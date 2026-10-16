@@ -627,3 +627,272 @@ tool_execution_link対象件数: 1351件
 **テスト**: 単体4件新規（`tests/unit/test_seller_recommender.py`新設、`format_recommendation_line()`の全項目表示・符号付き前回比・比較不可時のダッシュ表示・Decimal型が渡っても壊れないことを直接検証——このDecimalケースが上記の実バグを再現する回帰テスト）、結合6件新規（`tests/integration/test_seller_performance.py`: 新規4項目の値検証、前回比の同日合算検証、前回比が1日しかない場合None、`recent_fetch_days`が`--lookback-days`を広げても固定90日のままであること、並び順検証）、結合2件新規（`tests/integration/test_cli.py`: CLI経由での新項目表示、**DBを実際に経由して前回比が非Noneになる経路**——これが無ければ上記の実バグは今後も再発する）。単体145件・結合186件、全てgreen。
 
 **実データでの動作確認**: 修正後、ローカル開発用DBに対して`recommend --marketplace=JP`（263件）・`recommend --marketplace=US`（88件）を実行し、いずれも最後まで正常終了・新項目が正しく表示され、最終取得日の昇順に並んでいることを確認した。対話式メニュー5からも同じ表示（`format_recommendation_line()`共通利用）になることを確認した。DBへの書き込みは発生しない読み取り専用コマンドのため、後片付けは不要だった。
+
+## 44. `tool_intake.cli sync-pending`新設、`seller_performance.cli history`の日付基準を依頼日→取込日へ変更（「未取込」「0件」の区別）（Phase 3, 2026-09-16）
+
+ユーザー依頼: (1) `tool_execution_link`にはあるが`tool_output_asin`が未取込のtool_run_idをまとめて検出し、`processed_file_lookup`で自動検出できるものは取込を実行する新規コマンド`sync-pending`。(2) `seller_performance.cli history`の各行の日付を依頼日ではなく取込日に変更し、「取込ASIN数」列を追加、「未取込」（一度も取込を試みていない）と「0件」（取込済みだが該当ASINが無かった）を区別する。
+
+**実装前にAskUserQuestionで確認した2点**（具体例をpreviewに入れた1問目は機能したが、2問目は選択肢テキストを読んだ上でユーザーが意図を汲んで独自の回答を選んだ——#43の教訓通り、抽象的な選択肢だけでは伝わりにくいことの再確認）:
+
+1. `tool_output_asin`に複数行ある場合の「取込日」の代表値: **MIN(imported_at)**（最初にそのtool_run_idのASINが記録された日）を採用。同一ファイルの再取込で後から行が追加されても、「最初に未取込でなくなった日」を示す。
+2. `sync-pending`の対象範囲: 過去に取込を試みて「0件」だったtool_run_idは、**次回以降は対象から除外する**（ユーザー回答: 「0件のファイルがあったら次回以降除外。一度もファイルを取り込んでいなければ含める。」）。真に「未取込」（`tool_output_asin`が0行、かつ取込を試みた記録も無い）のものだけを対象にする。
+
+**「0件」と「未取込」の判定方法（スキーマ変更なし）**: `tool_output_asin`に該当tool_run_idの行が1件も無い場合、`import_run_history`（`import_type='TOOL_OUTPUT'`、`status='COMPLETED'`）に、統合ツールの命名規則「{tool_run_id}_...」のprefixに一致する`source_file_name`を持つレコードがあるかをLIKE検索で判定する（`LIKE (tool_run_id || '\_%') ESCAPE '\'`でtool_run_id中の`_`をエスケープ）。この命名規則は`processed_file_lookup.find_tool_output_files`が既に前提にしているものに加え、`tool_intake/log_ingest.py`が読む統合ツールのログ画面（`log-csv`列）の実データ（`tests/unit/test_log_ingest.py`のフィクスチャ、例: `7137846_latraviata.imports.jp@gmail.com_2026-09-06 14:15:55.csv`）でも同じprefix規則であることを確認できたため、`import_run_history`への列追加（例: `tool_run_id`列）は不要と判断した。
+
+**実装**:
+- `tool_intake/pending_sync.py`（新設）: `PendingSyncService.find_pending()`が上記のSQL（`tool_output_asin`に行が無く、かつ`import_run_history`に完了記録も無いもの）を実行し、`sync()`が各tool_run_idについて`processed_file_lookup.find_tool_output_files()`で自動検出→1件見つかれば`IntegrationToolImportService.import_file()`で取込、0件・複数件なら「未検出」のまま残す（複数件を自動選択しないのは`tool_intake.cli import-tool-output`の`--file`省略時と同じ方針）。1件の取込失敗（例外）は`errored`に記録して次のtool_run_idの処理を継続する（CLAUDE.md 6節）。
+- `tool_intake/cli.py`に`sync-pending --marketplace=<US/JP>`を追加。対話式メニュー`cli.py`にはメニュー10「未取込ファイルをまとめて確認・取り込む」として追加し、同じ`PendingSyncService`を共通利用する。
+- `seller_performance/seller_history.py`: `HistoryEntry`に`asin_count`・`import_date`（`date | None`）を追加（既存の`requested_date`・`listed_count`はdays_since_last_run/recent_average/recent_trendがそのまま使うため維持）。`get_history()`のSQLをCTE構成（`toa_stats`/`attempted`/`listed`）に変更し、`tool_output_asin`側と`import_run_history`側を別々に集計してから`tool_execution_link`にLEFT JOINすることで、複数JOINによるファンアウト（件数の重複カウント）を避けた（`seller_recommender.py`の既存CTEパターンを踏襲）。`format_history()`の各行表示を「取込日 取込ASIN数 出品成果」に変更し、`import_date is None`のときのみ「未取込」「-」と表示する（`asin_count=0`かつ`import_date`が実際の日付を持つ「0件」とは表示が異なる）。
+
+**テスト**: 単体5件新規（`tests/unit/test_pending_sync.py`新設: 自動取込・未検出（0件/複数件）・エラー時の継続・`format()`の3区分表示）、単体3件更新+2件新規（`tests/unit/test_seller_history.py`: `_entry()`ヘルパーにasin_count/import_date引数を追加、format_historyの新しい行表示・「未取込」表示・「0件」と「未取込」の区別を検証する新規2件）、単体2件新規（`tests/unit/test_cli_parsers.py`: `sync-pending`のパース・必須引数）。結合6件新規（`tests/integration/test_pending_sync.py`新設: `find_pending()`のSQL検証——未取込/取込済み/0件（除外）/prefix不一致・status不一致（除外しない）/marketplace分離）、結合3件新規（`tests/integration/test_seller_history.py`: MIN(imported_at)の代表値検証、`import_run_history`経由の「0件」判定、prefix不一致・status不一致時は「未取込」のまま）、結合2件新規（`tests/integration/test_cli.py`: `sync-pending`のCLI経由での自動取込・未検出）、結合2件新規（`tests/integration/test_cli_menu.py`: メニュー10の自動取込・未検出）。既存の`seller_performance.cli history`/対話式メニュー1の結合テストのうち、`tool_output_asin`を挿入していないシナリオ（取込前の状態）は表示が「日付 0件」→「未取込 - 0件」に変わるため、該当箇所を更新した。単体154件・結合199件、全てgreen。
+
+**テスト実行時に発見・修正した点**: `sync-pending`のCLI/メニュー結合テストは、同一テストモジュール内の他のテストが残した「未取込」の`tool_execution_link`行（DBはモジュール単位でしかリセットしない）も`find_pending()`の対象に含まれてしまうため、`find_tool_output_files`のモックを対象tool_run_id以外には空リストを返すよう修正した（他のテストの副作用で件数アサーションが不安定にならないようにするため）。また`tests/integration/test_seller_history.py`の`_insert_tool_output()`はデフォルトで`imported_at`をDBの`now()`任せにしていたため、既存の`test_lists_runs_oldest_first_with_listed_counts`に`import_date`のアサーションを追加した際、実行日（テスト実行時の日付）と食い違って落ちた。`_insert_tool_output()`に`imported_at`を明示指定できる引数を追加し、この種のテストでは明示的な日時を渡すよう修正した。
+
+**実データでの動作確認は未実施**: 本エントリの変更は開発機のディスポーザブルなtest-db（`docker compose up -d test-db`）に対する結合テストのみで検証しており、ローカル開発用DB（`db`サービス）の実データに対する動作確認は行っていない（`sync-pending`はファイル自動検出のためC:\\work\\input\\processed配下の実ファイルに依存し、無条件に実行すると実データへ書き込みが発生するため）。実運用前に、ローカル開発用DBに対して少数の「未取込」tool_run_idを対象に`sync-pending`を試し、想定通りの挙動になることを確認すること。
+
+## 45. `seller_performance.cli history`の日付基準を「取込日」（imported_at）から「取得日」（requested_at）へ再変更——Excel移行データでの不自然な日付表示を修正（Phase 3, 2026-09-17）
+
+ユーザー指摘: #44で`history`の日付表示を依頼日（`tool_execution_link.requested_at`）から取込日（`tool_output_asin.imported_at`）へ変更したが、Excelから移行したセラー実績データ（`scripts/import_legacy_tool_output.py`、#32参照）では、`imported_at`は「移行作業（バッチ）を実際に実行した日」になってしまい、本来の依頼日とは無関係な不自然な日付が表示されていた。一方`recommend`側のsummary（`seller_recommender.py`の`last_requested_date`、#43参照）は元々`requested_at`基準のままだったため、同じデータを見る`history`と`recommend`で日付の基準が食い違ってしまっていた。
+
+**対応**: `history`の日付表示を`tel.requested_at`基準へ戻す。列名は「取込日」から**「取得日」**へ変更した（`recommend`側の「最終取得日」ラベルと表記を揃えるため。「依頼日」も検討したが、既存の集計行「直近の取得日からの経過日数」・`recommend`の「最終取得日」が既に`requested_at`を「取得日」と呼んでいたため、そちらに合わせるのが同じコマンド内・コマンド間の一貫性の観点で自然と判断した）。
+
+**「取込ASIN数」列（未取込「-」/0件/N件の区別）は#44の仕様のまま変更していない**——`tel.requested_at`はtool_execution_linkのNOT NULL列のため常に値が存在し「未取込」にはなり得ない一方、取込ASIN数（`tool_output_asin`基準）は依然として「まだ0行」「試みたが0行」を区別する必要があるため、日付とASIN数という2つの独立した軸は今後もこのまま残す。
+
+**実装**: `seller_performance/seller_history.py`の`_GET_HISTORY_SQL`から`MIN(imported_at)::date`/`MIN(irh.executed_at)::date`という「代表日」の算出を削除し、`HistoryEntry.import_date: date | None`を`import_attempted: bool`（`tool_output_asin`に行がある、または`import_run_history`に完了記録があるかの単純な真偽値）に置き換えた。`format_history()`の各行は常に`tel.requested_at::date`（`requested_date`）を表示し、`import_attempted`が真のときのみ`asin_count`を、偽なら「-」を表示する。0件と取込ASIN数を判定する`import_run_history`のprefix/status一致ロジック自体（#44）は変更していない。
+
+**教訓**: 同じ元データ（`tool_execution_link`）を複数のコマンド（`history`・`recommend`）で表示する場合、日付など基本的な軸の意味づけをコマンドごとに独自変更すると、Excel移行データのような「実際の記録日と業務上の意味が乖離しているデータ」で症状が顕在化するまで気づきにくい。今後`history`側で日付関連の表示を変える際は、`recommend`側の対応する項目（現状は`last_requested_date`＝`requested_at`基準）との整合を都度確認すること。
+
+**テスト**: `tests/unit/test_seller_history.py`の`_entry()`/`_pending_entry()`ヘルパーを`import_date`引数から`import_attempted`引数へ変更し、`format_history()`の行表示アサーションを「取得日」ヘッダー・常時日付表示＋`import_attempted`による「-」/`N件`分岐に更新（未取込・0件を区別する新規テストは維持、日付は両ケースとも表示されるように変更）。`tests/integration/test_seller_history.py`は`import_date`関連のアサーションを`import_attempted`へ置き換え、MIN(imported_at)の代表値検証テスト（#44で追加、この変更で対象の仕組み自体が無くなったため）を削除し、`asin_count`・`import_attempted`のみを検証するテストに置き換えた。`tests/integration/test_cli.py`/`tests/integration/test_cli_menu.py`の「未取込」行表示アサーション（`未取込      -      0件`）を、`requested_date`が常に表示されるようになったことに合わせて更新した（`2026-05-22      -      0件`等）。単体154件・結合199件、全てgreen（テストDBはディスポーザブルなtest-dbのみで検証、ローカル開発用DBの実データでの確認は#44と同様に未実施）。
+
+## 46. `seller_performance.cli history`（対話式メニュー含む）の各行に統合ツールID（tool_run_id）列を追加（Phase 3, 2026-09-18）
+
+ユーザー依頼: セラーIDの表記ミス（余分な文字の混入等）を訂正する際、`delete-seller`/`delete-tool-run`（CLAUDE.md 3節の例外、`admin_role`限定の削除コマンド、#38参照）で削除する前に、紐づいている`tool_run_id`を控えておく必要がある。しかし従来の`history`表示には`tool_run_id`が出ておらず、確認するにはDBへ直接SQLを実行するしかなかった。
+
+**対応**: `HistoryEntry.tool_run_id`は#44・#45のSQL（`_GET_HISTORY_SQL`）で元々取得済み（並び替え・突き合わせのキーとして内部利用していた）だったため、SQL変更は不要で、`format_history()`の表示にこの列を追加するだけで済んだ。
+
+**表示**: ヘッダーを「取得日　　　　　統合ツールID　　取込ASIN数　　出品成果」とし、日付と取込ASIN数の間に統合ツールID列を挿入した（ユーザー提示の出力イメージ通りの列順）。例:
+
+```
+セラー: A1ZLNQALRE0XNB& (marketplace=JP)
+──────────────────────────────────────────
+取得日          統合ツールID    取込ASIN数    出品成果
+2026-02-10      6931276         424件         60件
+──────────────────────────────────────────
+```
+
+列の区切りは既存の固定スペース方式（#44・#45から踏襲、tool_run_idの桁数によって厳密な縦揃えにはならない）をそのまま使い、独自の動的パディング等は実装していない（既存の「取得日」「取込ASIN数」列も同様の簡易表示のため、この列だけ精緻に揃える理由が無いと判断）。
+
+**テスト**: `tests/unit/test_seller_history.py`の`_entry()`ヘルパーに`tool_run_id`引数を追加（省略時は従来通り`f"run-{day}"`）。既存の行表示アサーションに`tool_run_id`を挿入する形で更新し、ユーザー提示の出力イメージ（`tool_run_id=6931276`、`セラー=A1ZLNQALRE0XNB&`）をそのまま再現する新規テストを1件追加した。`tests/integration/test_cli.py`/`tests/integration/test_cli_menu.py`の該当アサーションも、テストが実際に使っている`tool_run_id`変数を埋め込む形で更新した。単体155件・結合199件、全てgreen（ディスポーザブルなtest-dbで検証、ローカル開発用DBの実データでの目視確認は未実施）。
+
+## 47. `storefront_blocked_seller.reason`に3つ目の値`RETRY_LATER`を追加、対話式メニューの理由選択を3択に拡張、メニュー1の削除確認質問を廃止（Phase 3, 2026-09-18）
+
+ユーザー依頼、2点:
+
+1. 既存の2択（PERMANENTLY_EXCLUDED＝今後も取得しない／COMPETITOR_SAME_SERVICE＝同業者利用）では、「同業者利用かは不明だが、何らかの一時的な理由で今は取得できず、いずれ再挑戦したい」というケースを表現できなかった。3つ目の値`RETRY_LATER`を追加する。
+2. 対話式メニュー「1. セラーの取得履歴を見る」で、禁止セラーの警告表示後に出ていた「このブロック記録を削除しますか？(y/n)」の質問を削除する。警告表示（理由・登録日・メモ）自体はそのまま残し、質問が無くなった分、すぐ後に通常の取得履歴表示・3択の提示へ進む。`delete-storefront-block`コマンド自体は変更せず、独立したコマンドとして引き続き使える。
+
+**1. RETRY_LATER追加**:
+- `alembic/versions/0012_add_retry_later_to_storefront_blocked_seller_reason.py`（新規増分マイグレーション）でCHECK制約を`(PERMANENTLY_EXCLUDED, COMPETITOR_SAME_SERVICE)`→`(PERMANENTLY_EXCLUDED, COMPETITOR_SAME_SERVICE, RETRY_LATER)`へ拡張。既存データのUPDATEは不要（値の追加のみ、リネームではない）。
+- `seller_ledger/storefront_blocked.py`の`Reason`型・`REASON_LABELS`に`RETRY_LATER: "一時的に取得できない"`を追加。
+- 対話式メニュー`cli.py`の`_ask_block_reason()`（メニュー1「2」・メニュー9で共通利用）を3択に拡張し、`_BLOCK_REASON_CHOICES`に`"3": "RETRY_LATER"`を追加。不正な選択肢のメッセージも「1または2を入力してください。」→「1〜3を入力してください。」に更新（2箇所）。
+- `seller_ledger.cli mark-storefront-blocked`コマンド自体（reasonはCOMPETITOR_SAME_SERVICE固定）は変更していない——RETRY_LATERは対話式メニューからのみ選択できる。
+
+**downgradeで踏んだ実バグ**: 当初の`0012`のdowngradeは、RETRY_LATER行が残っている場合はCHECK制約違反でそのまま失敗させる設計にしていた（#11のようなリネームと異なり、RETRY_LATERに対応する2値時代の値が存在しないため）。しかし`tests/integration/conftest.py::_migrated_schema`はテストモジュールごとに`alembic downgrade base`を実行する設計であり、あるテストモジュールがRETRY_LATER行を1件でも残したまま終了すると、それ以降に実行される全テストモジュールの`_migrated_schema`セットアップが軒並み失敗する（実際にRETRY_LATER関連のテストを追加した直後、後続の無関係な15個のテストモジュールがエラーになる形で発覚した）。#11と同様、downgrade側でCHECK制約を外す前に`UPDATE ... SET reason = 'PERMANENTLY_EXCLUDED' WHERE reason = 'RETRY_LATER'`を実行してから制約を戻す方式に修正した——「一時的に取得できない」という区別自体を無くすdowngradeなので、意味的な情報が失われることは許容し、必ず成功することを優先した。修正後、実際にRETRY_LATER行を1件挿入した状態で`alembic downgrade 0011`→`upgrade head`のロールバック往復を手動実行し、行が`PERMANENTLY_EXCLUDED`へ正しく変換されることを確認した。
+
+**教訓**: このプロジェクトの結合テストは「モジュールごとに`downgrade base`で完全リセットする」前提のため、CHECK制約の値を追加するだけの一見シンプルなマイグレーションでも、downgrade側は「対象データが残っていても必ず成功する」ように作る必要がある（`DROP TABLE`ベースのdowngradeでは問題にならないが、既存テーブルの制約を狭める形のdowngradeでは常に注意が必要）。
+
+**2. メニュー1の削除確認質問を廃止**:
+- `cli.py::_menu_history()`から、`blocked_info is not None`の分岐にあった`_ask_yes_no("このブロック記録を削除しますか？(y/n): ")`とそれに続く`delete_blocked()`呼び出しを削除した。`format_history()`（警告＋履歴表示）を`print()`した直後、そのまま3択の提示に進む。
+- `seller_ledger.cli delete-storefront-block`（`confirm_and_delete_storefront_block()`）自体は変更していない——独立したコマンドとして引き続き使える。むしろ、メニュー1から直接削除できなくなった分、誤登録の訂正はこのコマンドを使う一択になった。
+
+**テスト**: 単体1件新規（`tests/unit/test_storefront_blocked.py`: `RETRY_LATER`のreason_label）、結合1件新規（`tests/integration/test_storefront_blocked.py`: `mark_blocked()`がRETRY_LATERを受理すること）。`tests/integration/test_cli_menu.py`: 既存の禁止セラー系テスト3件から削除確認の入力（"n"）を除去、削除確認そのものを検証していた2件（y確認で削除される・n確認で残る）を1件（`test_history_blocked_seller_no_longer_offers_deletion_and_keeps_record`: 削除確認プロンプト自体が出ないこと・記録が残ることを確認）に統合、メニュー1「2」・メニュー9それぞれにRETRY_LATER選択の新規テストを追加、無効な理由選択のテスト2件は選択肢が3つになったことに合わせて無効値を"3"→"4"、メッセージを更新。単体156件・結合201件、全てgreen（ディスポーザブルなtest-dbで検証。上記のdowngrade往復は別途手動で実施）。
+
+## 48. `seller_ledger.cli link-tool-run`の`--source`引数と対話式メニューの「発見経路」質問を廃止、`tool_execution_link.source`をNULL許容化（Phase 3, 2026-09-18）
+
+ユーザー依頼: `--source`（発見経路、'SELLER_PAGE'/'BRAND_STORE'/'COMPETITOR'等）は自由入力のテキストで、毎回何を入力すべきか迷う上、表記ゆれが起きやすい。`SellerService.register()`側の同種の`--source`（discovery_source）は「どのロジックからも参照されない」という理由で既に削除済み（#25参照）で、`link-tool-run`側の`source`も同様に使われていないため削除する。
+
+**「使われていない」ことの確認**: `seller_performance/seller_history.py`・`seller_recommender.py`・`attribution.py`のいずれのSQLも`tel.source`を一切SELECTしていないことをgrepで確認した（#25の`SellerService.register()`の時と同じ判断基準）。
+
+**列自体は削除しない（ユーザー指定）**: `tool_execution_link.source`は既存データが入っている可能性があるため、`alembic/versions/0013_make_tool_execution_link_source_nullable.py`で`NOT NULL`制約のみ外した（`DROP COLUMN`はしない）。
+
+**`tool_intake/log_ingest.py`は対象外（スコープを絞った判断）**: `ingest-log`は統合ツールのログHTMLの`data-type`属性から機械的に`source`を自動記録しており（人が毎回何を書くか迷う自由入力ではない）、ユーザーの依頼文も「`link-tool-run`」と「対話式メニューの発見経路の質問」だけを対象に挙げていたため、この自動記録経路は今回変更していない。そのため`ToolRunLinkService.record()`の`source`引数自体は削除せず、`source: str | None = None`（省略可能）に変更するに留めた——`SellerService.register()`の時（引数ごと削除）とは異なり、今回は「人に自由入力で聞くのをやめる」ことが主眼で、「値を一切記録しなくする」ことは依頼されていないため。
+
+**変更箇所**:
+- `db/models.py`: `tool_execution_link.source`列を`nullable=False`→`nullable=True`（デフォルト）。
+- `alembic/versions/0013_make_tool_execution_link_source_nullable.py`（新規）: `ALTER COLUMN source DROP NOT NULL`。
+- `seller_ledger/tool_run_link.py::ToolRunLinkService.record()`: `source`引数を省略可能に変更。
+- `seller_ledger/cli.py`: `link-tool-run`の`--source`引数・`_cmd_link_tool_run()`での使用を削除。実行例からも`--source=SELLER_PAGE`を削除。
+- `cli.py`（対話式メニュー）: `_do_link_tool_run()`（メニュー1「1」・メニュー2の両方が共有）から「発見経路（例: SELLER_PAGE, BRAND_STORE, COMPETITOR等）: 」の質問を削除。
+
+**downgradeで#12と同じ教訓を先取り適用**: #12（RETRY_LATER追加）のdowngradeで、対象データが残っていると`tests/integration/conftest.py::_migrated_schema`のテストモジュールごとの`downgrade base`が軒並み失敗する実バグを踏んだばかりだったため、今回は先回りして対応した。`0013`のdowngradeは、`NOT NULL`を復元する前に`UPDATE tool_execution_link SET source = 'UNKNOWN' WHERE source IS NULL`を実行してからCHECK制約ではなくNOT NULL制約を戻す。実際に`source=NULL`の行を1件挿入した状態で`alembic downgrade 0012`→`upgrade head`のロールバック往復を手動実行し、NULL行が`'UNKNOWN'`へ正しく変換され、downgradeが失敗しないことを確認した。
+
+**テスト**: `tests/unit/test_cli_parsers.py`の`test_link_tool_run_parses`を`--source`無しに更新し`not hasattr(args, "source")`を追加、`test_link_tool_run_source_accepts_arbitrary_value_not_restricted_to_choices`（`--source`の存在を前提にしていたテスト）は削除。結合1件新規（`tests/integration/test_seller_ledger.py::test_tool_run_link_record_without_source_defaults_to_null`: `source`省略時にNULLで記録されること）。`tests/integration/test_cli.py`の3箇所・`tests/integration/test_cli_menu.py`の3箇所から`--source=SELLER_PAGE`/`"SELLER_PAGE"`等の入力・引数を除去し、`test_link_tool_run_menu_standalone`は`row.source == "BRAND_STORE"`→`row.source is None`に更新。単体155件・結合202件、全てgreen（ディスポーザブルなtest-dbで検証、downgrade往復は別途手動で実施）。
+
+## 49. `seller_performance.cli recommend`（対話式メニュー5も同様）から`storefront_blocked_seller`にPERMANENTLY_EXCLUDEDとして記録済みのセラーを除外（Phase 3, 2026-09-19）
+
+ユーザー指摘: 「今後も取得しない」（PERMANENTLY_EXCLUDED）と明示的に記録したセラーでも、`tool_execution_link`/`seller_attribution`に過去の実績（Excel移行データ等）が残っていると、`recommend`の一覧に出てきてしまっていた。`recommend`は「次に何を取得すべきか」の提案のため、除外判断済みのセラーは過去の実績に関わらず出すべきではない。COMPETITOR_SAME_SERVICE・RETRY_LATER（いずれも「今後も取得する見込みがある」という意味、#41・#47参照）は対象外とし、引き続き候補として表示する。
+
+**実装**: `seller_performance/seller_recommender.py::SellerRecommenderService.recommend()`の`candidates` CTE（絞り込みの起点、#43のdocstringで「一切変更していない」としてきたまさにこのCTE）のWHERE句に、`storefront_blocked_seller`にreason='PERMANENTLY_EXCLUDED'の行が存在するseller_idを除外する`NOT EXISTS`条件を追加した。`storefront_blocked_seller`はmarketplaceに依存しないテーブル（RLS適用対象外、CLAUDE.md 2節の例外）のため、除外はmarketplaceを問わずseller_id単位で行う——`recommend()`自体はmarketplaceでスコープされたまま（`sa.marketplace = :mp`は変更していない）。対話式メニュー`cli.py`のメニュー5は`SellerRecommenderService.recommend()`を共通利用しているため、同時に反映される。
+
+**実データでの動作確認**: ユーザー報告の`A3Q6T5KGOEMH54`（`storefront_blocked_seller`にPERMANENTLY_EXCLUDED、登録日2026-09-17として実在）について、ローカル開発用DBに対して以下を確認した:
+- 修正前の`candidates` CTEに相当する生SQL（`NOT EXISTS`無し）を直接実行したところ、JP marketplaceで`listing_occasions=2`（閾値2を満たす）・`last_requested_at`が2026-02-10（`min_days_since_last`=15日を大幅に超過）となり、修正前ロジックでは候補に該当していたことを確認した（US marketplaceでは元々対象データが無かった）。
+- 修正後、`python -m seller_performance.cli recommend --marketplace=US`（76件）・`--marketplace=JP`（287件）のいずれの出力にも`A3Q6T5KGOEMH54`が含まれないことを確認した。
+- ローカル開発用DBは本エントリ着手時点でalembicが0011止まりだったため、`alembic upgrade head`で0012（RETRY_LATER追加）・0013（tool_execution_link.source NULL許容化）を適用してから検証した。DBへの書き込みは発生しない読み取り専用コマンドのため、後片付けは不要だった。
+
+**テスト**: 結合2件新規（`tests/integration/test_seller_performance.py::TestSellerRecommenderService`: `test_excludes_seller_marked_permanently_excluded`——絞り込み条件を満たす実績があってもPERMANENTLY_EXCLUDEDなら除外されること、`test_does_not_exclude_seller_marked_with_other_reasons`——COMPETITOR_SAME_SERVICE・RETRY_LATERの2値をパラメタライズし、いずれも除外されず候補に残ることを確認）。単体155件（変更なし）・結合205件（パラメタライズにより新規3ケース）、全てgreen（ディスポーザブルなtest-dbで検証）。
+
+## 50. 【重大】対話式メニュー「2. 統合ツールのIDとひもづける」が未記録のtool_run_idを「既に記録されています」と誤報告し、link-tool-runが握りつぶされる不具合の調査・修正（Phase 3, 2026-09-19）
+
+ユーザー報告: marketplace=US・seller-id=A1UVXHQIDG1C7X・tool-run-id=7170614でメニュー2を実行したところ「既にtool_run_id=7170614が記録されています（スキップしました）。」と表示されたが、DBを直接確認するとUS/JPどちらのtool_execution_linkにも該当行が無かった（0 rows）。紐づけが一度も成功していない可能性がある、実際の記録として重大な不具合、として調査を依頼された。
+
+**該当コードの特定**: `cli.py::_do_link_tool_run()`（メニュー1「1」・メニュー2の両方が共有）が
+
+```python
+try:
+    with app_factory.get_session(marketplace) as conn, conn.begin():
+        ToolRunLinkService().record(conn, marketplace, seller_id, tool_run_id, source)
+except IntegrityError:
+    print(f"既にtool_run_id={tool_run_id}が記録されています（スキップしました）。")
+    return
+```
+
+という実装になっており、`tool_execution_link`のUNIQUE制約（`uk_tool_execution_link`、`marketplace`・`tool_run_id`）違反かどうかを一切確認せず、`IntegrityError`を無条件に「既に記録済み」として握りつぶしていた。同じパターンが`tool_intake/log_ingest.py::_process_row()`にも存在した（`SellerService.register()`と`ToolRunLinkService.record()`を同じtry/exceptで囲み、`except IntegrityError`で`summary.already_linked`をインクリメントするだけ）。
+
+**現在のスキーマでは他に候補となる制約が無いことを確認**: `tool_execution_link`テーブルの実際の制約は主キー（`id`、IDENTITY）と`uk_tool_execution_link`のみ（外部キー無し、CHECK制約無し）であることをローカル開発用DBの`\d tool_execution_link`で確認した。またRLSポリシー（`WITH CHECK (marketplace = current_setting(...))`）違反は`ProgrammingError`（`InsufficientPrivilege`、SQLSTATE 42501）として送出され`IntegrityError`にはならないことを実際に再現して確認した。つまり**現行スキーマでは`record()`のINSERT文が`IntegrityError`を送出する経路は`uk_tool_execution_link`違反以外に存在しない**——この一点だけを見ると、今回の個別インシデントが「無関係な例外を誤って握りつぶした」結果ではなく、実際に一時的な重複行が存在した可能性が高いことを示唆する（下記「根本原因について」参照）。しかし、`except IntegrityError`で違反した制約を確認しない実装そのものは、将来スキーマが変わった場合や、DBAPIの挙動差で別の`IntegrityError`が発生した場合に、本来の失敗を無条件に「重複」と誤報告し続ける構造的な欠陥であり、それ自体を修正した。
+
+**根本原因について（判明した事実と、判明しなかった点）**: `tool_execution_link`にはINSERT/DELETEの監査ログが存在しないため、報告された時点で本当に重複行が存在し、その後（`delete-tool-run`等による訂正や、他の未特定の経路で）削除されたのか、あるいは他の要因があったのかを事後的に完全には特定できなかった。`SellerDeletionService.delete()`/`ToolRunDeletionService.delete()`はいずれも`tool_execution_link`と`tool_output_asin`を同じトランザクションで一貫して削除する実装になっており（確認済み）、これらの標準コマンドの使用だけでは「tool_execution_linkだけ消えてtool_output_asinは残る」状態は説明できない。**影響範囲の調査**として、ローカル開発用DBで「`tool_output_asin`に行があるのに対応する`tool_execution_link`が無いtool_run_id」を全件チェックしたところ、US 0件・JP 1件（`7128340`、`imported_at`が2026-09-07で本インシデントよりかなり前、`import_run_history`に対応レコード無し＝`scripts/import_legacy_tool_output.py`による一括移行由来）が見つかった。この1件は既存の削除コマンドの動作と矛盾する古いデータ不整合であり、本件（2026-09-19発生、標準の削除コマンドでは説明不可）とは発生時期・パターンが異なるため、**同一の不具合ではなく別の未解明の事象**として切り分けて記録する（追加調査は本エントリのスコープ外、将来必要になれば着手すること）。それ以外に、この誤判定パターン特有の痕跡（スキップイベント自体を記録する仕組みが無い）は現状のログからは発見できなかった。
+
+**修正**: `seller_ledger/tool_run_link.py`に`DuplicateToolRunError`例外を新設し、`ToolRunLinkService.record()`が`IntegrityError`を捕捉した際、`e.orig.diag.constraint_name`が`uk_tool_execution_link`と一致する場合のみ`DuplicateToolRunError`に変換して送出、それ以外（診断情報が取得できない場合を含む安全側フォールバック）はそのまま再送出するようにした。呼び出し元（`cli.py::_do_link_tool_run()`・`tool_intake/log_ingest.py::_process_row()`）は`except IntegrityError`を`except DuplicateToolRunError`に変更した——これにより、`uk_tool_execution_link`以外の想定外の`IntegrityError`は握りつぶされず、対話式メニューの外側の`except Exception`（`main()`のループ）や`ingest_log()`の1行単位のエラー分離（CLAUDE.md 6節）へ正しく伝播するようになった。
+
+**調査中に発見した関連の不整合（追加修正）**: `seller_ledger.cli link-tool-run`単体（対話式メニューを介さない標準コマンド）には、そもそも重複時の例外処理が一切無く、実際に重複を試すと生の`IntegrityError`トレースバックでクラッシュすることを実地で確認した。対話式メニューと同じ「既にtool_run_id=...が記録されています（スキップしました）。」を表示するよう`seller_ledger/cli.py::_cmd_link_tool_run()`にも同じ`except DuplicateToolRunError`処理を追加した。
+
+**実データでの動作確認**（ローカル開発用DB、`db`サービス）:
+1. `SET app.current_marketplace='US'`で`tool_execution_link`を確認し、`tool_run_id='7170614'`が0件であることを再確認した。
+2. `python -m seller_ledger.cli link-tool-run --marketplace=US --seller-id=A1UVXHQIDG1C7X --tool-run-id=7170614`を実行し、`linked: marketplace=US seller_id=A1UVXHQIDG1C7X tool_run_id=7170614`が表示され、`tool_execution_link`に実際に1行（`seller_id=A1UVXHQIDG1C7X`, `tool_run_id=7170614`）が記録されたことを確認した。
+3. 同じコマンドをもう一度実行し、クラッシュせず「既にtool_run_id=7170614が記録されています（スキップしました）。」が表示され、`tool_execution_link`の該当行数が引き続き1件のまま（重複INSERTされていない）ことを確認した——`DuplicateToolRunError`が真の重複に対しては引き続き正しく機能することも合わせて確認。
+4. ローカル開発用DBは本エントリ着手時点でalembicが0011止まりだったため（#49と同じ状況）、`alembic upgrade head`で0012・0013を適用してから上記を実施した。
+
+**テスト**: 単体5件新規（`tests/unit/test_tool_run_link.py`新設: `_violates_unique_tool_run_constraint()`が制約名一致/不一致/診断情報欠如の3パターンを正しく判定すること、`record()`がuk_tool_execution_link違反を`DuplicateToolRunError`に変換すること、それ以外の`IntegrityError`はそのまま再送出し握りつぶさないこと——擬似的な`.orig.diag.constraint_name`を持つフェイク例外・フェイクコネクションで検証、実DB不要）。結合1件更新（`tests/integration/test_seller_ledger.py::test_tool_run_link_duplicate_tool_run_id_raises`: 期待する例外型を`IntegrityError`→`DuplicateToolRunError`に変更し、`marketplace`/`tool_run_id`属性も検証）。結合1件新規（`tests/integration/test_cli.py::test_seller_ledger_link_tool_run_duplicate_via_cli_shows_friendly_message`: `seller_ledger.cli link-tool-run`単体を2回実行し、2回目がクラッシュせず友好的なメッセージを表示し、重複INSERTされないことを確認——上記「調査中に発見した関連の不整合」の回帰テスト）。単体160件・結合206件、全てgreen（ディスポーザブルなtest-dbで検証）。
+
+## 51. `seller_performance.cli recommend`（対話式メニュー5も同様）: COMPETITOR_SAME_SERVICE・RETRY_LATERで記録した直後のセラーが上位に残り続ける問題を修正（Phase 3, 2026-09-18）
+
+ユーザー指摘: 「今回はチェックしたが保留する」という判断（COMPETITOR_SAME_SERVICE・RETRY_LATERで記録）をしたセラーが、いつまでもrecommendの上位に残り続け、同じセラーを何度もチェックしてしまう。PERMANENTLY_EXCLUDEDは#49で既にrecommendから完全除外されているが、それ以外の2つの理由は現状recommendの判定に一切影響していなかった。
+
+**対応方針**: 完全除外（#49のPERMANENTLY_EXCLUDED）ではなく、「保留を記録した日」を「最終取得日」の候補として扱う——`tool_execution_link.requested_at`の最新値と`storefront_blocked_seller.first_noted_at`（reasonがCOMPETITOR_SAME_SERVICE・RETRY_LATERの場合のみ）のうち、より新しい方（`GREATEST`）を採用する。これにより記録直後は既存の`min_days_since_last`判定（前回から15日以上経過）に自然に引っかかり一覧から外れ、期間が経過すれば通常通り再び候補に上がってくる——新しい仕組みを追加するのではなく、既存のmin_days_since_lastの仕組みにそのまま乗せる設計とした。PERMANENTLY_EXCLUDEDは変更なし（#49のNOT EXISTSで先に完全除外されるため、今回のGREATEST計算には到達しない）。
+
+**実装前に確認した前提**（ユーザーからの確認依頼）: 「tool_execution_linkの実績が全く無く、storefront_blocked_sellerの記録だけがあるセラー」（例: ユーザーが例示した「アスカモデル」のケース）がrecommendの対象になってしまわないか。`candidates` CTEは`seller_attribution sa JOIN weekly_listing_snapshot wls ... JOIN tool_execution_link tel`という構成で、`seller_attribution`自体が`tool_execution_link`経由でのみ作られる（`AttributionService`）ため、tool_execution_linkの実績が無い（＝seller_attributionが無い）セラーは`candidates`のJOIN条件そのものを満たせず、今回の変更後も自然に対象外のままであることを実装前にコードレビューで確認した。実データでも、ローカル開発用DBの`known_seller_master`に実在する「アスカモデル(ASUKAMODEL)」（JP、tool_execution_link 1件・seller_attribution 0件・storefront_blocked_seller未記録）が、実際に`recommend --marketplace=JP`（273件）に含まれないことを確認した。
+
+**実装**: `seller_performance/seller_recommender.py::SellerRecommenderService.recommend()`のSQLに`blocked_recency`CTE（`storefront_blocked_seller`のうちreason IN ('COMPETITOR_SAME_SERVICE', 'RETRY_LATER')のみ）を追加。`candidates`CTEのmin_days_since_last判定を`current_date - tel.last_requested_at::date`から`current_date - GREATEST(tel.last_requested_at::date, br.first_noted_at)`に変更（`GREATEST`はPostgreSQLの仕様上NULLを無視するため、対象外の理由や記録自体が無いセラーでは従来通りtel側の値のみが使われる）。表示・並び順に使う`last_requested_date`（`seller_stats`由来）も同様に、最終SELECTで`GREATEST(s.raw_last_requested_date, br.first_noted_at)`として算出するよう変更した（`seller_stats`内部の列名は`raw_last_requested_date`にリネームし、GREATEST後の値と区別できるようにした）。`ORDER BY`も新しい`last_requested_date`（SELECT句のエイリアス）を参照するよう変更。`recent_fetch_days`・`previous_delta`の計算方法（`daily`/`per_run`/`ranked`/`deltas`）は変更していない——これらは実際の取得実績のみを示す指標として据え置く。
+
+**実データでの動作確認**（ローカル開発用DB、alembicは既にhead=0013）:
+- 2026-09-17（前日）にCOMPETITOR_SAME_SERVICEで記録済みの実セラー`A1KIRUBS0ZW6G1`（JP、`listing_occasions=14`）について、`tool_execution_link`単体の最終取得日は2026-03-03（199日前）で、旧ロジックなら`min_days_since_last=15`を大きく超えており候補に該当していたはずだが、修正後の`recommend --marketplace=JP`（273件）には含まれないことを確認した。
+- `--min-days-since-last=0`で強制的に候補へ含めた場合、表示される「最終取得日」が実際の取得日（2026-03-03）ではなく記録日（2026-09-17）になっていることを確認し、表示・並び順ロジックの変更も正しく機能していることを確認した。
+- DBへの書き込みは発生しない読み取り専用コマンドのため、後片付けは不要だった。
+
+**テスト**: 結合7件新規（`tests/integration/test_seller_performance.py::TestSellerRecommenderService`）:
+- `test_excludes_seller_recently_marked_competitor_or_retry_later`（reasonをパラメタライズ）: tool_execution_linkの実績自体は十分古くても、直近の保留記録があれば除外されること。
+- `test_includes_seller_again_once_enough_days_pass_since_block_record`（同）: 保留記録からmin_days_since_last日以上経過すれば再び候補に上がること。
+- `test_last_requested_date_uses_more_recent_of_tool_execution_link_and_block_record`: 表示・並び順に使う`last_requested_date`が保留記録の日付を正しく反映すること。
+- `test_permanently_excluded_still_excluded_regardless_of_block_record_age`: PERMANENTLY_EXCLUDEDは記録日の新旧に関わらず引き続き完全除外されること（#49の回帰確認）。
+- `test_seller_with_only_block_record_and_no_tool_execution_link_is_not_recommended`: tool_execution_link/seller_attributionが無いセラーは対象外のままであること（上記「実装前に確認した前提」の自動テスト化）。
+既存の`test_does_not_exclude_seller_marked_with_other_reasons`は、`first_noted_at`を意図的に古い日付（30日前）に変更した——本テストの主旨（PERMANENTLY_EXCLUDEDのような完全除外はしない）と、今回追加した「直近の記録は除外する」という挙動を混同しないよう分離するため。単体160件（変更なし）・結合213件、全てgreen（ディスポーザブルなtest-dbで検証）。
+
+## 52. `seller_performance.cli recommend`（対話式メニュー5も同様）: min_listing_countの撤廃、保留記録日・保留理由の列分離（Phase 3, 2026-09-30）
+
+ユーザー依頼、3点:
+
+1. `--min-listing-count`による絞り込みを撤廃する。実績（listing_occasions）が0回のセラーも一覧に出す。
+2. #51で「最終取得日」に混ぜていた`storefront_blocked_seller.first_noted_at`を、独立した「保留記録日」列へ分離する。「最終取得日」列は`tool_execution_link.requested_at`のみを基準に戻す（実績が無い場合は空欄/「-」）。min_days_since_lastの判定・並び順には、引き続き「最終取得日と保留記録日のうち、より新しい方」を使う。
+3. 保留理由（COMPETITOR_SAME_SERVICE/RETRY_LATER、表示ラベルは既存の`REASON_LABELS`を流用）の列を新設する。
+
+PERMANENTLY_EXCLUDEDは引き続き完全除外のまま変更しない。
+
+**実装前に確認した前提**（ユーザーからの確認依頼）: 「tool_execution_linkの実績が全く無く、storefront_blocked_sellerの記録だけがあるセラー」（例えば今回のアスカモデルのケースのように、まだ一度もASINを取得できていない場合）がrecommendの対象になるべきか——ならないはず（min_listing_countの条件を満たさないので元々対象外のはず）という理解が正しいか。#51時点での結論（`candidates`の起点である`tool_execution_link`自体に行が無いセラーは対象外）は、今回`candidates`の起点を`seller_attribution`→`tool_execution_link`へ変更した後も変わらないことをコードレビューで確認した——`tel_agg`サブクエリ（`tool_execution_link`起点）に行が無ければ、そもそも`candidates`に現れようがないため。実データでも、ローカル開発用DBの「アスカモデル(ASUKAMODEL)」の実態（`storefront_blocked_seller`に記録はまだ無く、`tool_execution_link`は1件・`seller_attribution`は0件）を踏まえ、この設計が意図通りであることを確認した。
+
+**1. min_listing_countの撤廃**:
+- `candidates` CTEの起点を、`seller_attribution sa JOIN weekly_listing_snapshot wls`（INNER JOIN、listing_occasionsが1件も無いと行自体が存在しない）から、`tool_execution_link`をmarketplace・seller_idで集約した`tel_agg`サブクエリ（そのマーケットプレイスで一度でも実行されていれば必ず1行存在する）に変更した。`listing_occasions`の実績集計（`listing_agg`サブクエリ）はLEFT JOINにし、`COALESCE(listing_agg.listing_occasions, 0)`で0を許容するようにした。`HAVING COUNT(...) >= :min_count`は削除。
+- `recommend()`の`min_listing_count`引数、`seller_performance.cli recommend`の`--min-listing-count`、対話式メニューcli.pyのメニュー5内の対応する参照を削除した。`seller_recommendation_config.min_listing_count`列自体（既存データ）は変更していない——`recommend()`がもう読まないだけの未使用列として残る（`db/models.py`にコメントで明記）。
+- `lookback_days`によるlisting_occasionsの期間制限（実績のカウント対象を直近lookback_days日に絞る）は維持した——閾値（何回以上必要か）を無くしただけで、「何を数えるか」の定義自体は変えていない。
+
+**2・3. 保留記録日・保留理由の列分離**:
+- `SellerRecommendation`データクラスに`hold_recorded_date: date | None`・`hold_reason: str | None`を追加し、`last_requested_date`は純粋に`tool_execution_link`基準の値（`candidates.last_requested_date`、`tel_agg`由来）に戻した。`blocked_recency` CTEに`reason`列を追加し、最終SELECTで`br.first_noted_at AS hold_recorded_date`・`br.reason AS hold_reason`として別々に取得する。
+- `min_days_since_last`の判定（`candidates`のWHERE句）・並び順（`ORDER BY`）は、引き続き`GREATEST(tel_agg.last_requested_date, br.first_noted_at)`を使う——#51の絞り込みロジック自体は変更せず、表示のみを分離した。
+- `format_recommendation_line()`を、`seller_ledger.storefront_blocked.REASON_LABELS`を使って保留理由をラベル表示するよう変更し、出力順を「seller_id / 最終取得日 / 保留記録日 / 保留理由 / 取得日数(重複排除) / 取得回数 / 合計出品成果 / 前回比」に変更した（ユーザー提示の出力イメージ通り）。`last_requested_date`は現状の`candidates`設計では実質的に常に非NULLだが（`tel_agg`起点のため）、防御的にNoneでも「-」表示できるようにした。
+
+**実データでの動作確認**（ローカル開発用DB、alembicは既にhead=0013、スキーマ変更は無いため追加のマイグレーション適用は不要）:
+- `recommend --marketplace=JP`が287件（#51時点）→541件に増加し、`取得回数=0`のセラーが多数含まれることを確認した。
+- COMPETITOR_SAME_SERVICEで記録済みの実セラー`A1KIRUBS0ZW6G1`について、`--min-days-since-last=0`で強制的に候補へ含めた場合の表示が「最終取得日=2026-03-03　保留記録日=2026-09-17　保留理由=同業者利用」となり、#51時点で1列に混ざっていた表示が正しく分離されていることを確認した。デフォルトの`min-days-since-last=15`では、このセラーが引き続き除外されたまま（#51の絞り込みロジック自体は変わっていないこと）も確認した。
+- PERMANENTLY_EXCLUDEDの実セラー`A3Q6T5KGOEMH54`が、今回の変更後も`recommend --marketplace=JP`の541件に含まれないことを確認した（#49の回帰確認）。
+
+**テスト**: 単体5件新規（`tests/unit/test_seller_recommender.py`: 取得回数0の表示、保留記録日・保留理由の表示（RETRY_LATER/COMPETITOR_SAME_SERVICEのラベル差、`REASON_LABELS`経由）、`last_requested_date`がNoneの場合の防御的な「-」表示）。単体1件新規（`tests/unit/test_cli_parsers.py`: `--min-listing-count`自体が存在しない・渡すとargparseエラーになること）。結合テストは`tests/integration/test_seller_performance.py`の`TestSellerRecommenderService`配下を全面的に見直した——既存の`recommend()`呼び出し19箇所から`min_listing_count=2`引数を除去、`test_excludes_seller_below_threshold`は`test_includes_seller_with_single_listing_occasion`へ、`test_excludes_listing_outside_lookback_window`は`test_listing_occasions_excludes_snapshot_outside_lookback_window`へ改名の上アサーションを反転（閾値が無いため「除外される」ではなく「カウントされない」ことを検証）、`test_last_requested_date_uses_more_recent_of_tool_execution_link_and_block_record`（#51）は`test_last_requested_date_and_hold_recorded_date_are_shown_as_separate_columns`へ改名し新しい2列を別々に検証。新規2件（`test_includes_seller_with_zero_listing_occasions`——min_listing_count撤廃の核心、`test_hold_recorded_date_and_reason_are_none_when_not_blocked`）。`tests/integration/test_cli.py`の3箇所から`--min-listing-count=2`/`min_listing_count=2`を除去。単体165件・結合215件、全てgreen（ディスポーザブルなtest-dbで検証、実データでの動作確認は上記の通り別途実施）。
+
+## 53. `seller_performance.cli recommend`の候補拡大・CSV出力化、新規コマンド`asin_collector.cli check-recommendations`の追加（Phase 3, 2026-10-07）
+
+ユーザー依頼、4点:
+
+1. `tool_execution_link`に一度も紐づけていない（register済みだがlink-tool-run未実行の）セラーも`recommend`の候補に含める。`known_seller_master`を候補の基準に広げ、`tool_execution_link`が0件のセラーも出す（最終取得日は「-」/空欄表示）。PERMANENTLY_EXCLUDEDの完全除外・marketplaceの絞り込み（RLS）は変更しない。
+2. `recommend`の結果を画面ではなくCSVファイルへ出力する。出力先`exports\recommend\recommend_<marketplace>_<yyyyMMdd_HHmmss>.csv`（フォルダ無ければ自動作成）、画面には件数とファイルの場所のみ表示、列は現在の表示項目と同じ8列、UTF-8 BOM付き、並び順は現状どおり、対話式メニュー5も同じ動作にする。
+3. ストアフロント検索URL（ユーザーがブラウザで確認済み）: JP `https://www.amazon.co.jp/s?me=<seller_id>`、US `https://www.amazon.com/s?me=<seller_id>&marketplaceID=ATVPDKIKX0DER`。`check-recommendations`のURLはこの形で確定。
+4. （新規実装としての設計要件、下記「経緯」参照）`check-recommendations`が出品商品0件のセラーを正しく判定し、誤判定時は「判定不能」として記録せず一覧に残す。
+
+**経緯（調査→設計への読み替え）**: ユーザーから「`check-recommendations`を実行した結果...」という体裁で不具合報告があったが、調査の結果`check-recommendations`というコマンド自体がリポジトリに一切存在しないこと（全ファイルgrep一致ゼロ、gitログも最初の1コミットのみ）が判明したため、`AskUserQuestion`でユーザーに確認したところ「今回が新規作成」との回答を得た。ユーザーから改めて説明があり、4番の「原因調査」は実装済みコードのデバッグではなく、新規実装する判定ロジックの設計検討に読み替えることになった。ユーザー提示の実セラーID（JP `A26YLYFFSVKSNX`=商品無し、`A3SQM3QBSWZXTB`=商品あり）を使って実機で検証しながら設計した。
+
+**1. candidatesの起点をknown_seller_masterへ拡大**: `seller_performance/seller_recommender.py::SellerRecommenderService.recommend()`の`candidates` CTEの起点を、`tool_execution_link`（#52でそのmarketplaceで一度でも実行されていれば必ず1行存在するとしていた前提）から`known_seller_master`（register済みなら必ず1行存在する）へさらに広げた。`last_requested_date`・`listing_occasions`・`total_listed`・`recent_fetch_days`・`previous_delta`はいずれも`tool_execution_link`起点のLEFT JOIN経由のままのため、実行実績が無いセラーではNone/0になる（#52時点で「理論上しか起こらない」としていたNoneケースが実際に発生するようになった）。`min_days_since_last`の判定は、`last_requested_date`・`hold_recorded_date`の両方がNone（実行実績も保留記録も無い、一度も接点が無いセラー）の場合は無条件に対象へ含める（比較対象の日付が無いため「十分に日数が経過している」とみなす）。並び順（`GREATEST(...) ASC`）は`NULLS FIRST`とし、一度も接点が無いセラーを先頭（最優先）に表示する——ユーザー未指定のため、既存の「古いセラーほど上位」という設計思想から妥当と判断した。`per_run`/`seller_stats`/`deltas`への`JOIN`は、実行実績が無いセラーが最終結果から落ちないよう`LEFT JOIN`＋`COALESCE`に変更した（INNER JOINのままだと、候補には含まれるのに実績サブクエリとマッチせず消えてしまう）。
+
+**実装前にユーザーへ提示した見積り**: ローカル開発用DBでUS/JPとも`known_seller_master`1154件中、`tool_execution_link`に一度も紐づいていないセラーが39件（うちPERMANENTLY_EXCLUDED 0件）。デフォルトの`min_days_since_last=15`の下では、そのうち直近15日以内にCOMPETITOR_SAME_SERVICE/RETRY_LATERの保留記録があるものが7件あり対象外のままとなるため、新規に一覧へ加わるのは約32件/marketplaceと見積もり、ユーザーに提示・実装の了承を得た。実際の変更後、JP `recommend`は541件→583件に増加した。
+
+**2. CSV出力化**: `seller_performance/cli.py`に`write_recommendations_csv()`を新設（`seller_performance.cli recommend`・対話式メニューcli.pyのメニュー5の両方から共通利用）。出力先`exports/recommend/recommend_<marketplace>_<yyyyMMdd_HHmmss>.csv`（`asin_collector.cli export-run`の`exports/collected_asins/`と同じ「無ければ自動作成」方式）。`encoding="utf-8-sig"`でBOM付きにし、Excelでそのまま開けるようにした。列の値は画面表示用の文字列（「-」等）ではなく、空欄/生の数値に統一した——Excelでの並べ替え・フィルタに使いやすくするため（保留理由だけは`REASON_LABELS`のラベルのまま、人が読む情報のため）。`format_recommendation_line()`自体は削除せず残したが、現時点でCLI/メニューのいずれからも呼ばれていない（1行テキスト表示が必要になった場合のための汎用ユーティリティとして維持）。
+
+**3・4. 新規コマンド`asin_collector.cli check-recommendations`**: `asin_collector/check_recommendations.py`を新設。`recommend`が出力したCSVの`seller_id`列（`tool_intake.csv_utils.read_csv_rows`/`column_index`を再利用、cp932/utf-8-sig/utf-8自動判定——Excelで編集後cp932保存され得るため、CLAUDE.md技術スタック参照）を読み、各セラーのストアフロント検索URLを`open_browser()`（`asin_collector.browser_session`、既存の永続プロファイル・CAPTCHA検知の仕組みを再利用）で順に巡回する。
+
+**商品0件の判定方法（実機確認、2026-10-07）**: `asin_collector.asin_extractor.extract_search_card_asins()`（`collect-brand-page`と同じ関数、`div[data-component-type="s-search-result"]`範囲内のみを見るためスポンサー枠・おすすめ商品は含まれない）で抽出したASINが0件、かつAmazon自身の「検索結果0件」ウィジェット（`data-csa-c-content-id="messaging-messages-no-results"`、JP/US双方で同一のウィジェットID文字列であることを確認済み——表示言語に依存しないため判定に使う）が存在する、の両方を満たした場合のみ「商品なし」と判定する。実際にPlaywrightで`https://www.amazon.co.jp/s?me=A26YLYFFSVKSNX`（「該当商品なし」）と`https://www.amazon.co.jp/s?me=A3SQM3QBSWZXTB`（商品あり）を開いて検証した結果:
+- `A26YLYFFSVKSNX`: ページ上にスポンサー商品（Dyson ドライヤー、「スポンサー」表示あり）が存在するが、`extract_search_card_asins()`は0件を返す（スポンサー枠は`s-search-result`コンポーネントの外側にあるため）。「検索結果0件」ウィジェットは存在する。→ NO_PRODUCTS。
+- `A3SQM3QBSWZXTB`: `extract_search_card_asins()`は16件返し、ウィジェットは存在しない。→ HAS_PRODUCTS。
+- 念のため、広い範囲（`[data-asin]`属性全体＋`/dp/`リンク全体）を見る`extract_asins()`（ranking_page_collector等向けに残してある既存の別関数）でも`A26YLYFFSVKSNX`のページを解析したが、スポンサー枠のASINへのリンクが`<a href>`の単純な`/dp/`パターンと一致しない構造だったため、こちらも偶然0件を返した——ただし、この一致は構造的に保証されたものではないため、判定には`extract_search_card_asins()`の方（`s-search-result`コンポーネント境界による構造的な保証がある）を採用した。
+- カードが0件でもウィジェットが見つからない場合（想定外のページ構造）、CAPTCHA検知時、ページ読み込み失敗、一時的な500/503エラー（再試行後も解消しない場合）は、いずれも「商品なし」と断定せず「判定不能」として記録し、`storefront_blocked_seller`へは書き込まない（誤ってPERMANENTLY_EXCLUDEDに記録しないため、ユーザー指定）。
+
+**CAPTCHA時に人の対話待ちをしない（CLAUDE.md 7節の例外）**: `brand_page_collector.py`と異なり、CAPTCHA検知時は`wait_for_human_to_solve_captcha()`を呼ばず即座に「判定不能」としてそのセラーをスキップし、次のセラーへ進む。CLAUDE.md 7節の絶対厳守ルール「CAPTCHA発生時は人の手動対応を待つ設計とする」の例外として、同節に明記した（ユーザー確認済み、2026-10-07）——`collect-brand-page`は1回の実行で1つのtarget-urlをページ送りするだけだが、`check-recommendations`は1回の実行で`recommend`の出力（候補拡大後は1marketplaceあたり数百件規模）を順に処理するため、1件ごとに対話待ちでブロッキングする設計は現実的でないと判断した。
+
+**0件確認後の記録**: `StorefrontBlockedSellerService().mark_blocked(conn, seller_id, "PERMANENTLY_EXCLUDED", note="check-recommendationsでストアフロント検索結果0件を確認（自動記録）")`を呼ぶ。既存のmark_blocked()の「初回登録を上書きしない」設計をそのまま踏襲するため、既に何らかの理由で記録済みのセラーがあっても上書きしない。
+
+**実データでの動作確認**（ローカル開発用DB、`db`サービス）: `A26YLYFFSVKSNX`・`A3SQM3QBSWZXTB`の2件のみを含む小さなCSVを作成し、実際に`python -m asin_collector.cli check-recommendations --marketplace=JP --csv=...`を実行した（`recommend`の実出力583件全件に対する実行は、未レビューの大量のPERMANENTLY_EXCLUDED書き込みを伴う破壊的操作になり得るため、意図的に行っていない）。結果: 対象2件、商品あり1件、商品0件（PERMANENTLY_EXCLUDEDへ記録）1件、判定不能0件。DB確認の結果、`A26YLYFFSVKSNX`は`PERMANENTLY_EXCLUDED`として記録済み（実行前に既にユーザー自身が手動で記録済みだったため、今回は「既存記録を上書きしない」動作を確認する形になった）、`A3SQM3QBSWZXTB`は`storefront_blocked_seller`に一切記録が無いことを確認した。`recommend --marketplace=JP`を実際に実行し、583件のCSVが`exports/recommend/`配下にUTF-8 BOM付きで出力され、最終取得日が空欄の行（候補拡大で新たに加わったセラー）が25件含まれることを確認した。
+
+**テスト**: 単体19件新規（`tests/unit/test_check_recommendations.py`新設: `storefront_search_url()`のJP/US形式・URLエンコード・不正marketplace、`classify_search_page()`の3分類、`read_seller_ids_from_csv()`のCSV読み取り・cp932対応・列欠落時のエラー、`_check_one()`のCAPTCHA/サーバーエラー再試行/ページ読み込み失敗/想定外構造の各分岐——`tests/unit/test_brand_page_collector_retry.py`と同じ`_StatefulFakePage`パターンを使用、`check_sellers()`の集計ロジック）。単体7件新規（`tests/unit/test_seller_performance_cli.py`新設: `write_recommendations_csv()`のファイル名パターン・BOM・ヘッダー順・値の空欄化・複数行出力）。単体2件新規（`tests/unit/test_cli_parsers.py`: `check-recommendations`のパース・必須引数）。結合2件新規（`tests/integration/test_check_recommendations.py`新設: `_record_no_products()`がPERMANENTLY_EXCLUDEDを記録すること、既存記録を上書きしないこと——`brand_page_collector.py`の「DB書き込みはブラウザ無しで直接呼び出して検証する」パターンを踏襲）。結合5件新規（`tests/integration/test_seller_performance.py::TestSellerRecommenderService`: register済み・未紐づけセラーの候補化と各フィールドのNone/0確認、未紐づけ＋PERMANENTLY_EXCLUDEDの除外、未紐づけ＋直近の保留記録の除外、未紐づけ＋古い保留記録の候補化とhold列確認、未紐づけセラーが並び順の先頭に来ること）。既存2件（`tests/integration/test_cli.py`の`recommend`テスト）はCSV出力に合わせて画面出力の検証からCSVファイル読み取りの検証に書き換えた。単体192件・結合222件、全てgreen（ディスポーザブルなtest-dbで検証、実データでの動作確認は上記の通り別途実施）。
+
+## 54. `check-recommendations`: 既存の保留記録のPERMANENTLY_EXCLUDEDへの自動更新・判定不能の連続中断、`recommend`候補拡大の増分調査（Phase 3, 2026-10-07）
+
+ユーザー依頼、3点:
+
+1. `check-recommendations`がNO_PRODUCTSと判定したセラーが、すでに`storefront_blocked_seller`にCOMPETITOR_SAME_SERVICEまたはRETRY_LATERで記録されている場合は、PERMANENTLY_EXCLUDEDへ更新する。更新時、noteの先頭に「自動判定: 商品0件（元の理由: <元の理由の表示ラベル>）」を追記し、元のnoteがあればその後ろに残す。`first_noted_at`は変更しない。すでにPERMANENTLY_EXCLUDEDのセラーは何もしない。サマリに新規記録・既存保留からの更新の件数を別々に表示する。
+2. 判定不能（CAPTCHA・読み込み失敗・想定外の構造）が連続してN件続いたら処理を中断する。Nの既定値は5、`--max-consecutive-undetermined`で変更可能。中断時は処理済み件数・未処理のseller_id一覧を画面表示する。
+3. `recommend`のJP件数が541件→583件（+42件）に増えた件の調査。25件は`tool_execution_link`に一度も紐づいていないセラー（#53で意図した増分）。残り17件の内訳、および`known_seller_master`への候補拡大が意図しない行を生んでいないかの確認。
+
+**1. 既存保留記録の自動アップグレード**: `seller_ledger/storefront_blocked.py`に`StorefrontBlockedSellerService.mark_or_escalate_to_permanently_excluded(conn, seller_id, new_record_note)`を新設（戻り値`EscalateResult.status`: `"NEW"`/`"UPGRADED"`/`"ALREADY_EXCLUDED"`）。これは同モジュールの「既存行は上書きしない」という原則（`mark_blocked()`のON CONFLICT DO NOTHING）に対する唯一の例外として、モジュールdocstringに明記した。`asin_collector/check_recommendations.py::_record_no_products()`はこのメソッドを呼ぶよう変更し、戻り値をそのまま返すようにした（従来の`mark_blocked()`直呼びから変更）。`CheckRecommendationsSummary`に`no_products_new`・`no_products_upgraded`・`no_products_already_excluded`の3カウンタを新設（旧`no_products_recorded`を置き換え）。`asin_collector/cli.py::_cmd_check_recommendations()`は新規記録・既存保留からの更新を別の行で表示し、「既にPERMANENTLY_EXCLUDED（変更なし）」は0件のときは表示しない（通常の運用では`recommend`のCSVに既にPERMANENTLY_EXCLUDEDのセラーは出てこないため、ほぼ発生しない防御的分岐のため）。
+
+**2. 判定不能の連続中断**: `CheckRecommendationsService.check_sellers()`に`max_consecutive_undetermined`引数（既定値5、`_DEFAULT_MAX_CONSECUTIVE_UNDETERMINED`）を追加。HAS_PRODUCTS/NO_PRODUCTSのいずれかを1件でも判定できれば連続回数はリセットされる。閾値に達した時点で残りの`seller_id`を処理せず中断し、`CheckRecommendationsSummary.aborted=True`・`processed_count`・`remaining_seller_ids`を設定する。CLAUDE.md 6節の「1レコードの失敗で全体を止めない」というエラー分離の精神とは別の判断軸——同種の失敗（CAPTCHA等）が連続する場合は、個々の偶発的失敗ではなくブラウザ・ネットワーク・Amazon側の状態異常の可能性が高いとみなし、バッチ単位で早期中断する方が安全と判断した（ユーザー指定）。中断後は同じCSVファイルでそのまま再実行できる——`mark_or_escalate_to_permanently_excluded()`は既にPERMANENTLY_EXCLUDEDのセラーに対して何もしない（べき等）ため、処理済みの行を再度含んでいても安全。`asin_collector/cli.py`に`--max-consecutive-undetermined`（既定値5、int）を追加。
+
+**3. recommend増分調査（結論: known_seller_masterへの候補拡大に意図しない行は無い）**: ローカル開発用DBに対し、#52時点の候補ロジック（`tool_execution_link`起点）と#53時点の候補ロジック（`known_seller_master`起点）を同一のSQLWHERE条件・同一時点（今回の調査時点のcurrent_date）で再実行し、候補集合を直接比較した。
+- JP: 旧ロジックを今の時点で実行すると558件、新ロジック（実際の`recommend`出力と一致）は583件。差分は25件で、全件が`last_requested_date IS NULL`（`tool_execution_link`未紐づけ）のセラーであり、既存の紐づけ済みセラーが新たに増えた/消えたケースは0件だった。
+- US: 旧ロジック261件、新ロジック268件。差分は+8件（全件未紐づけ）だが、旧ロジックのみに含まれていたseller_id`A5EWCCV7Y5K59&`（末尾に`&`が付いた、実在しない表記）が新ロジックでは候補から落ちることも確認した。調べた結果、`tool_execution_link`（id=1484、tool_run_id=7159378、2026-09-12登録）に`seller_id`の入力ミス（正しい表記`A5EWCCV7Y5K59`は`known_seller_master`にUS登録済み）が原因で、`tool_execution_link.seller_id`には`known_seller_master`への外部キー制約が無いため検出されずに残っていた既存のデータ不整合だった。`known_seller_master`起点に変更したことで、この誤記行は（正しいseller_idとは別の、実在しない“ゴースト”候補として）recommendの一覧に出なくなった——意図した副作用ではないが、害のない方向の変化のため、本対応ではデータ修正は行わず報告のみとする。
+- 上記より、**「541件→583件」のうち25件は#53で意図した増分（未紐づけセラー）で説明がつき、known_seller_masterへの候補拡大自体は他に不要な行を増やしていない**ことを確認した。報告された「541件」と、同一ロジックを今回の調査時点で再実行した場合の558件との差（17件）は、`known_seller_master`への拡大とは無関係——`min_days_since_last`（15日）の判定基準は`last_requested_date`・`hold_recorded_date`のいずれか新しい方からの経過日数のため、保留記録・取得記録の年齢が時間の経過や記録の追加・変更によって変わるたびに、候補に出入りするセラーが生じる（通常の挙動）。「541件」測定時点の候補seller_id一覧を保存していなかったため（また本リポジトリはコード変更の履歴をgit管理していないため#52時点の実装を再現する手段が無い）、17件を1件単位で再現することはできなかったが、既存の紐づけ済みセラーについて新旧ロジックの候補集合が完全一致する（新規追加0件・消失0件）ことを直接確認できたため、候補基準の拡大が原因ではないと判断した。
+
+**テスト**: 単体5件新規（`tests/unit/test_check_recommendations.py`: `check_sellers()`の新規/更新/既存除外の3カウンタ振り分け、連続判定不能での中断・処理済み件数・未処理一覧、HAS_PRODUCTS/NO_PRODUCTSによる連続カウントのリセット。`tests/unit/test_cli_parsers.py`: `--max-consecutive-undetermined`の既定値5・上書き）。結合7件新規・1件書き換え（`tests/integration/test_check_recommendations.py`: COMPETITOR_SAME_SERVICE/RETRY_LATERからのアップグレード・既にPERMANENTLY_EXCLUDEDな場合の無変更、旧「既存記録を上書きしない」テストは新しい3分岐のテストに置き換えた。`tests/integration/test_storefront_blocked.py`: `mark_or_escalate_to_permanently_excluded()`の新規/更新/既存除外の4パターン）。単体197件・結合228件、全てgreen（ディスポーザブルなtest-dbで検証）。実データでの追加の書き込み確認は意図的に行っていない——Task Aのロジックは既存の保留記録を実際に書き換える操作のため、ローカル開発用DBの実データ（人が判断した保留理由）を検証目的で上書きするのは不適切と判断した。
+
+## 55. `seller_performance.cli export-all`新設: 全テーブルCSV抽出・分析用の結合済みCSV（Phase 3, 2026-10-08）
+
+ユーザー依頼: 全データを分析用にCSVへ抽出する機能（`python -m seller_performance.cli export-all [--output-dir <フォルダ>]`、既定の出力先`exports/analysis/<yyyyMMdd_HHmmss>/`、対話式メニューへの追加は無し）。読み取り専用（DBは一切変更しない）、US/JP両方を含める（`kpi_report_role`、BYPASSRLS）、UTF-8 BOM付き・列名はDBの列名のまま・日時はJSTへ変換せずDBの値のまま、の3点を要件として明示された。
+
+**新設モジュール**: `seller_performance/export_all.py`（`DataExportService`・`list_exportable_tables()`）。
+
+**1. 全テーブルのダンプ**: 出力対象テーブルの一覧は、`db/table_names.py`のようなPythonコード側の静的な一覧ではなく、`information_schema.tables`（`table_schema='public' AND table_type='BASE TABLE'`）から実行時に取得する——「DB内の全テーブル」という依頼に文字どおり従うほか、`storefront_blocked_seller`（共有metadataに登録されていない、既存の`db/models.py`末尾のコメント参照）のような、Pythonコード側の一覧から漏れやすいテーブルも自動的に含まれる。管理用テーブルとして`alembic_version`のみを除外した。各テーブルは`SELECT * FROM "{table_name}"`で1テーブル=1CSV（`{table_name}.csv`）に出力する。テーブル名はこの関数の戻り値（`information_schema`由来、ユーザー入力を経由しない）であることを前提にSQL文字列へ直接埋め込んでいる——識別子はバインドパラメータ化できないため（`db/session.py`の`SET app.current_marketplace`と同じ考え方、同モジュールdocstring参照）。
+
+**2. 結合済みCSV（分析用）**:
+- `seller_summary.csv`: `known_seller_master`（register済みの全セラー）を起点に、`tool_execution_link`・`tool_output_asin`・`seller_attribution`・`storefront_blocked_seller`を集計・左結合したセラー単位の1行。列は依頼どおり`marketplace, seller_id, 初回登録日, 最終取得日, 取得日数(重複排除/全期間), 取得回数, 取込ASIN数, 合計出品成果, 禁止セラー理由, 禁止セラー記録日`。「取得日数(重複排除/全期間)」は`seller_recommender.py`の`recent_fetch_days`（直近90日固定）と異なり全期間のtool_execution_link.requested_atの重複排除日数、「取得回数」はtool_execution_link行数そのもの（`seller_history.py`の「合計取得回数」と同じ定義）。「禁止セラー理由」は表示用ラベル（`REASON_LABELS`）へ変換せず生のコード値（`COMPETITOR_SAME_SERVICE`等）のまま出力する——分析用途ではフィルタ・集計のしやすさを優先した（recommendのCSVが人の判断用に表示ラベルへ変換しているのとは異なる設計判断）。
+- `tool_run_detail.csv`: `tool_execution_link`の1行（統合ツールID単位）ごとに、紐づく`tool_output_asin`件数・`seller_attribution`の出品成果件数を結合した1行。列は依頼どおり`marketplace, seller_id, 統合ツールID, 取得日, 取込ASIN数, 出品成果`。`seller_history.py`の1セラー分の履歴表示を全セラー分フラットに展開したものに相当する。
+
+**3. CLI**: `seller_performance/cli.py`に`export-all`サブコマンドを追加（`--output-dir`省略時は`exports/analysis/<yyyyMMdd_HHmmss>/`、無ければ自動作成。指定時はそのディレクトリをそのまま使う）。`ReportSessionFactory.for_kpi_report_role()`を使用（`asin_collector.cli export-run`と同じ使用パターン）。実行完了後、出力したファイルごとの行数一覧と出力先ディレクトリのパスを画面表示する。依頼どおり対話式メニュー`cli.py`への追加は行っていない。
+
+**テスト**: 単体4件新規（`tests/unit/test_export_all.py`新設: `_write_rows_to_csv()`のヘッダー・行数・UTF-8 BOM・NULLの空欄化）。単体2件新規（`tests/unit/test_cli_parsers.py`: `export-all`の`--output-dir`省略時None・上書き）。結合11件新規（`tests/integration/test_export_all.py`新設: `list_exportable_tables()`がalembic_versionを除外し各分類（通常CRUD・追記専用・kpi_report_role専用・廃止予定・RLS非適用）のテーブルを含むこと・昇順ソート、`export_all()`が全テーブル分＋結合済み2CSVのファイルを作ること・行数が実ファイル内容と一致すること・UTF-8 BOM・列名一致、読み取り専用性（前後でknown_seller_master行数が変わらないこと）、app_roleでは本来marketplace単位でしか見えないUS/JP双方のデータが1つのCSVに含まれること（RLS越え確認）、`seller_summary.csv`の集計値（取得日数/取得回数/取込ASIN数/合計出品成果/禁止セラー理由・記録日）・fetch履歴が無いセラーの0埋め、`tool_run_detail.csv`の1 tool_execution_link=1行・集計値）。単体203件・結合240件、うち既存2件は下記の無関係な事象により一時的に失敗（ディスポーザブルなtest-dbで検証）。
+
+**既知の無関係な事象（本対応では対処せず）**: 今回のテスト実行時（JST 2026-10-08 01:37、UTC 2026-10-07 16:37）、`tests/integration/test_seller_performance.py`の既存2件（`test_last_requested_date_and_hold_recorded_date_are_shown_as_separate_columns`・`test_reports_total_listed_last_requested_date_and_recent_fetch_days`）が1日ずれで失敗した。原因はPythonの`date.today()`（ローカルJST基準）とPostgreSQLの`now()`（コンテナがUTC基準）の食い違い——ローカル時刻がJSTの深夜0時〜9時台（UTCではまだ前日）の間だけ再現する、本対応以前からの既存テストの潜在的な時刻依存バグであり、本ターンで変更したファイル（`seller_performance/export_all.py`・関連テスト）とは無関係（該当テストファイルは今回編集していない）。UTCが日付を追い越せば自然に解消する。修正は依頼範囲外のため見送り、事象のみ記録する。
+
