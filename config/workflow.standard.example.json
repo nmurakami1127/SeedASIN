@@ -1,0 +1,40 @@
+{
+  "_comment": "通常運用の【提案】（確定値ではありません）。根拠と見直し方法は README の「通常運用の処理量（提案）」。試運転は config/workflow.example.json。",
+  "profile": "standard",
+  "lanes": {
+    "US": {"origin_import": 1, "routes": ["SELLER"], "selection_mode": "ordered_then_zero"},
+    "JP": {"origin_import": 2, "routes": ["SELLER"], "selection_mode": "ordered_then_zero"}
+  },
+  "limits": {
+    "origin_asins": 3,
+    "sources_per_origin": 3,
+    "pages_per_source": 10,
+    "max_asins_per_source": null,
+    "cross_asins": 2,
+    "cross_sources_per_asin": 3
+  },
+  "totals": {
+    "max_total_pages": 60,
+    "max_new_sources": 30,
+    "max_submit_asins": 20000,
+    "max_new_submissions_per_direction": 5
+  },
+  "daily": {
+    "max_pages": 200,
+    "max_new_submissions_per_direction": 10,
+    "max_submit_asins": 50000
+  },
+  "watch": {
+    "interval_minutes": 30,
+    "failure_retry_minutes": 30,
+    "human_wait_retry_minutes": 30,
+    "notify_minutes": 360
+  },
+  "cross": {"enabled": true, "fetch_discovered": false},
+  "brand_enabled": false,
+  "tool_max_asins": 5000,
+  "result_max_age_days": 30,
+  "page_revisit_days": 30,
+  "state_dir": "exports/workflow",
+  "submission_dir": "exports/tool_submission"
+}

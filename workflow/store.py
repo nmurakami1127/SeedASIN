@@ -67,6 +67,7 @@ class Task:
     result: dict = field(default_factory=dict)
     attempts: int = 0
     updated_at: str = ""
+    retry_after: str = ""          # この時刻まで再試行しない（watchの冷却。失敗の連続再試行・人手待ち表示の繰り返しを防ぐ）
 
 
 @dataclass
@@ -154,7 +155,27 @@ class WorkflowStore:
         """同じworkflowを同時に動かさない。ロックの持ち主が死んでいる（または期限切れ）なら奪う。"""
         d = self.dir(wid)
         d.mkdir(parents=True, exist_ok=True)
-        lp = d / "run.lock"
+        with self._lock_file(d / "run.lock", f"{wid} は別のプロセス", ttl_seconds):
+            yield
+
+    @contextmanager
+    def engine_lock(self, who: str = "workflow", ttl_seconds: int = 7 * 24 * 3600):
+        """外部（Amazon・統合ツール）を操作する実行（run / resume / watch）は、同時に1つだけ。watchと手動のrun/resumeの競合
+        （二重取得・二重送信）を防ぐ。ロックの持ち主が死んでいれば奪う。"""
+        self.root.mkdir(parents=True, exist_ok=True)
+        with self._lock_file(self.root / "engine.lock", "別の実行(run/resume/watch)", ttl_seconds, who=who):
+            yield
+
+    def engine_lock_info(self) -> dict | None:
+        lp = self.root / "engine.lock"
+        try:
+            info = json.loads(lp.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        return info if pid_alive(int(info.get("pid", 0))) else None
+
+    @contextmanager
+    def _lock_file(self, lp: Path, label: str, ttl_seconds: int, who: str = ""):
         for _ in range(2):
             try:
                 fd = os.open(str(lp), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
@@ -166,15 +187,15 @@ class WorkflowStore:
                     info = {}
                 stale = not pid_alive(int(info.get("pid", 0))) or (time.time() - float(info.get("t", 0)) > ttl_seconds)
                 if not stale:
-                    raise WorkflowBusy(f"{wid} は別のプロセス（pid={info.get('pid')}）が実行中です（同時に再開できません）")
+                    raise WorkflowBusy(f"{label}（pid={info.get('pid')}{'・' + info['who'] if info.get('who') else ''}）が実行中です（同時には動かせません）")
                 try:
                     lp.unlink()
                 except FileNotFoundError:
                     pass
         else:
-            raise WorkflowBusy(f"{wid} のロックを取得できません")
+            raise WorkflowBusy(f"ロックを取得できません: {lp}")
         try:
-            os.write(fd, json.dumps({"pid": os.getpid(), "t": time.time()}).encode())
+            os.write(fd, json.dumps({"pid": os.getpid(), "t": time.time(), "who": who}).encode())
             os.close(fd)
             yield
         finally:

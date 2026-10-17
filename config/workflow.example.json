@@ -1,7 +1,8 @@
 {
+  "profile": "trial",
   "lanes": {
-    "US": {"origin_import": 1, "routes": ["SELLER"]},
-    "JP": {"origin_import": 2, "routes": ["SELLER"]}
+    "US": {"origin_import": 1, "routes": ["SELLER"], "selection_mode": "ordered_then_zero"},
+    "JP": {"origin_import": 2, "routes": ["SELLER"], "selection_mode": "ordered_then_zero"}
   },
   "limits": {
     "origin_asins": 1,
@@ -12,14 +13,27 @@
     "cross_sources_per_asin": 3
   },
   "totals": {
-    "max_total_pages": 24,
+    "max_total_pages": 12,
     "max_new_sources": 12,
+    "max_submit_asins": 5000,
+    "max_new_submissions_per_direction": 1
+  },
+  "daily": {
+    "max_pages": 24,
+    "max_new_submissions_per_direction": 2,
     "max_submit_asins": 5000
+  },
+  "watch": {
+    "interval_minutes": 30,
+    "failure_retry_minutes": 30,
+    "human_wait_retry_minutes": 30,
+    "notify_minutes": 360
   },
   "cross": {"enabled": true, "fetch_discovered": false},
   "brand_enabled": false,
   "tool_max_asins": 5000,
   "result_max_age_days": 30,
+  "page_revisit_days": 30,
   "state_dir": "exports/workflow",
   "submission_dir": "exports/tool_submission"
 }

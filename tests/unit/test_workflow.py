@@ -87,3 +87,23 @@ def test_backup_restore_verifies_hashes_and_never_overwrites(tmp_path):
     with pytest.raises(backup.BackupError):
         backup.restore_backup(bad, tmp_path / "x", tmp_path / "y")
     assert not (tmp_path / "x").exists()
+
+
+def test_example_configs_load_and_old_configs_adopt_the_new_defaults():
+    from pathlib import Path
+    from workflow.config import load_config
+
+    trial = load_config(Path("config") / "workflow.example.json")
+    std = load_config(Path("config") / "workflow.standard.example.json")
+    assert trial.profile == "trial" and std.profile == "standard"
+    assert trial.daily.max_pages == 24 and trial.daily.max_new_submissions_per_direction == 2 and trial.daily.max_submit_asins == 5000
+    assert std.daily.max_pages > trial.daily.max_pages and std.limits.pages_per_source > trial.limits.pages_per_source  # 通常運用は設定で引き上げられる
+    assert std.tool_max_asins == trial.tool_max_asins == 5000  # ツールの1回5,000件は維持
+    old = config_from_dict({"lanes": {"US": {"origin_import": 1}}})  # 新しい項目が無い既存設定
+    assert old.lanes["US"].selection_mode == "ordered_then_zero" and old.watch.interval_minutes == 30 and old.page_revisit_days == 30
+    for mode in ("ordered_only", "ordered_then_zero", "zero_only"):
+        assert config_from_dict({"lanes": {"US": {"origin_import": 1, "selection_mode": mode}}}).lanes["US"].selection_mode == mode
+    with pytest.raises(ConfigError, match="selection_mode"):
+        config_from_dict({"lanes": {"US": {"origin_import": 1, "selection_mode": "everything"}}})
+    cfg = config_from_dict({"lanes": {"US": {"origin_import": 1}, "JP": {"origin_import": 2}}})
+    assert list(cfg.for_lane("JP").lanes) == ["JP"] and list(cfg.lanes) == ["US", "JP"]

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import hashlib
 import time
+from datetime import datetime, timedelta, timezone
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from typing import Callable
@@ -21,7 +22,8 @@ from typing import Callable
 from sqlalchemy import text
 
 from acquisition.discovery import (
-    DiscoveryError, DiscoveryLimits, DiscoveryService, HELD_AMAZON, USABLE_FETCH_OUTCOMES, require_own_accounts,
+    AsinPageGuard, DiscoveryError, DiscoveryLimits, DiscoveryService, GuardConfig, HELD_AMAZON, USABLE_FETCH_OUTCOMES,
+    require_own_accounts,
 )
 from acquisition.lease import AcquisitionRunService
 from acquisition.plan import PlanError, build_plan, validate_origin_imports
@@ -35,38 +37,14 @@ from tool_submission.model import SubmissionError, item_from_manifest
 from tool_submission.planner import build_items, write_plan
 from tool_submission.runner import pending_others, submit_item
 from workflow.config import OPPOSITE, WorkflowConfig
+from workflow.daily_usage import DailyUsage, jst_day, next_jst_midnight
+from workflow.selection import PendingChecker, reusable_run
+from workflow.dedupe import SUBMITTED_STATES, find_duplicates, set_hash  # noqa: F401
 from workflow.ports import PortBlocked, Ports
 from workflow.store import DONE_STATES, State, Task, WorkflowStore, now_iso, usage
 
 SUCCESS = tuple(USABLE_FETCH_OUTCOMES)
-SUBMITTED_STATES = ("SUBMITTING", "UNKNOWN", "AMBIGUOUS", "RUN_IDENTIFIED", "MEMO_SAVED", "LINKED")
 KIND_LABEL = {"discover": "発見", "acquire": "取得", "cross": "反対側展開", "acquire_x": "反対側の取得", "expand": "投入計画", "submit": "投入"}
-
-
-def set_hash(path: str | Path) -> str | None:
-    """ASIN集合の同一性（順序・重複に依存しない）。ファイルが無ければNone。"""
-    try:
-        lines = sorted({x.strip().upper() for x in Path(path).read_text(encoding="utf-8").splitlines() if x.strip()})
-    except OSError:
-        return None
-    return hashlib.sha256("\n".join(lines).encode()).hexdigest()
-
-
-def find_duplicates(ledger: SubmissionLedger, item) -> list[dict]:
-    """別のrun・別の投入キーで、同じ業務方向に**同じASIN集合**が既に投入された（または投入中の）ものを探す。
-    同じrun・方向・入力ハッシュ（=同じ投入キー）は台帳の状態で扱うので、ここでは除く。"""
-    mine = set_hash(item.input_file)
-    out = []
-    for k, st in ledger.all_states().items():
-        if k == item.key or st.state not in SUBMITTED_STATES or not st.manifest:
-            continue
-        m = st.manifest
-        if m.get("direction") != item.direction or m.get("business_market") != item.business_market:
-            continue
-        if mine is not None and set_hash(m.get("input_file", "")) == mine:
-            out.append({"key": k, "collector_run_id": m.get("collector_run_id"), "state": st.state, "tool_run_id": st.tool_run_id,
-                        "source_key": m.get("source_key")})
-    return out
 
 
 class _NoFetch:
@@ -81,12 +59,16 @@ class _NoFetch:
 
 class Engine:
     def __init__(self, factory: SessionFactory, ports: Ports, cfg: WorkflowConfig, store: WorkflowStore, *,
-                 sleep: Callable[[float], None] = time.sleep, actor: str = "workflow") -> None:
+                 sleep: Callable[[float], None] = time.sleep, actor: str = "workflow",
+                 now: Callable[[], datetime] | None = None) -> None:
+        self.now = now or (lambda: datetime.now(timezone.utc))
         self.factory, self.ports, self.cfg, self.store, self.sleep = factory, ports, cfg, store, sleep
         self.reports = ReportImportService(factory, None, actor=actor)
-        self.svc = DiscoveryService(factory, actor=actor)
+        guard = AsinPageGuard(factory, GuardConfig(revisit_days=cfg.page_revisit_days), actor=actor)  # ページ調査の間隔（出典の取得間隔とは別）
+        self.svc = DiscoveryService(factory, guard=guard, actor=actor)
         self.runs = AcquisitionRunService(factory, actor=actor)
         self.ledger = SubmissionLedger(Path(cfg.submission_dir) / "ledger.jsonl")
+        self.usage = DailyUsage(Path(cfg.state_dir) / "daily_usage.jsonl", now=self.now)  # watch全体で共有する日次使用量（JST）
         self.st: State | None = None
         self._stack: ExitStack | None = None
         self._tool_page = None
@@ -100,8 +82,15 @@ class Engine:
     def _event(self, task: str, msg: str) -> None:
         self.st.events.append({"ts": now_iso(), "task": task, "msg": msg[:300]})
 
-    def _set(self, t: Task, status: str, detail: str = "", **result) -> None:
+    def _set(self, t: Task, status: str, detail: str = "", *, retry_after: str | None = None, **result) -> None:
         t.status, t.detail, t.updated_at = status, detail[:500], now_iso()
+        w = self.cfg.watch
+        mins = {"FAILED": w.failure_retry_minutes, "HELD": w.failure_retry_minutes, "WAITING": w.human_wait_retry_minutes,
+                "UNKNOWN": w.human_wait_retry_minutes}.get(status)
+        if retry_after is not None:
+            t.retry_after = retry_after
+        else:
+            t.retry_after = (self.now() + timedelta(minutes=mins)).strftime("%Y-%m-%dT%H:%M:%SZ") if mins else ""
         if result:
             t.result.update(result)
         self._event(t.id, f"{status} {detail}")
@@ -129,6 +118,33 @@ class Engine:
     def _pages_used(self) -> int:
         """この実行で新しく取得したAmazonのページ数（出典の取得ページ + 商品ページの調査）。再利用は数えない。resumeでリセットされない。"""
         return usage(self.st)["pages"]
+
+    # ---- 日次の使用枠（JST）。操作の前に確保し、後で確定する。確保のまま残った枠は使用済みとして数える
+    def _caps(self) -> dict:
+        d = self.cfg.daily
+        return {"pages": d.max_pages, "submit:EXPORT": d.max_new_submissions_per_direction,
+                "submit:IMPORT": d.max_new_submissions_per_direction, "asins": d.max_submit_asins}
+
+    def _has_daily_room(self, kind: str | None) -> bool:
+        if not kind:
+            return False
+        cap = self._caps().get(kind)
+        return cap is None or self.usage.used().get(kind, 0) < cap
+
+    def _midnight(self) -> str:
+        return next_jst_midnight(self.now()).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    def _grant_pages(self, rid: str, want: int, t: Task) -> int:
+        """本日の残りの範囲で、ページ枠を確保して確保できた数を返す（0=確保できない）。"""
+        cap = self.cfg.daily.max_pages
+        for _ in range(3):
+            n = want if cap is None else min(want, cap - self.usage.used().get("pages", 0))
+            if n <= 0:
+                return 0
+            ok, _why = self.usage.reserve(rid, {"pages": n}, self._caps(), wf=self.st.workflow_id, task=t.id)
+            if ok:
+                return n
+        return 0
 
     @contextmanager
     def _fetcher(self, market: str, needed: bool):
@@ -178,6 +194,11 @@ class Engine:
                     t.attempts += 1
                     try:
                         getattr(self, "_run_" + ("submit" if t.kind == "submit" else t.kind))(t)
+                    except KeyboardInterrupt:  # Ctrl+C: 状態を保存して終了（下位の取得・調査は中断として確定済み）。次回、続きから
+                        t.status, t.detail = "PENDING", "中断されました（Ctrl+C）。次回、続きから再開します"
+                        self._event(t.id, "INTERRUPTED")
+                        self._save()
+                        raise
                     except PortBlocked as exc:
                         self._set(t, "WAITING", str(exc))
                     except Exception as exc:  # noqa: BLE001 - 1工程の失敗で全体を止めない（他の独立した工程は進める）
@@ -189,8 +210,9 @@ class Engine:
             self._save()
         return self.st
 
-    def prepare_resume(self) -> None:
-        """実際のDB・投入台帳を見て、再開位置を決める。完了済みは繰り返さない。"""
+    def prepare_resume(self, due_only: bool = False) -> None:
+        """実際のDB・投入台帳を見て、再開位置を決める。完了済みは繰り返さない。
+        due_only=True（watch）: 再試行時刻（retry_after）前の失敗・保留・人手待ちは、まだ再試行しない（連続再試行の防止）。"""
         for lane in self.cfg.lanes:
             for m in {self.cfg.page_market(lane), OPPOSITE[self.cfg.page_market(lane)]}:
                 try:
@@ -204,6 +226,8 @@ class Engine:
                     t.status, t.detail = "PENDING", "台帳が対応記録済みでないため再確認"
                 continue
             if t.status in DONE_STATES and t.kind != "expand":
+                continue
+            if due_only and t.status != "PENDING" and t.retry_after and t.retry_after > self.now().strftime("%Y-%m-%dT%H:%M:%SZ")                     and not self._has_daily_room(t.result.get("daily_hold")):
                 continue
             # 取得済みの記録がDB上で成功として存在するか確認（無ければ記録を捨てて再評価）
             if t.kind in ("acquire", "acquire_x"):
@@ -242,14 +266,47 @@ class Engine:
         pages_left = self.cfg.totals.max_total_pages - self._pages_used()
         if pages_left <= 0:
             return self._set(t, "HELD", f"Amazonの新規取得ページの上限（{self.cfg.totals.max_total_pages}）に達しています")
-        lim = self.cfg.limits
-        n = min(lim.origin_asins, remaining, pages_left)
-        limits = DiscoveryLimits(n, min(lim.sources_per_origin, max(1, remaining // n)), lim.cross_asins, lim.cross_sources_per_asin)
-        sel = self.svc.select_origins(ln.origin_import, pm, limits)
+        limits = self.discover_limits(remaining, pages_left)
+        sel = self.origin_selection(lane, limits)
+        fetch_picks = [pk for pk in sel.selected if pk.mode == "FETCH"]
+        rid = f"{self.st.workflow_id}:{t.id}:a{t.attempts}"
+        granted = self._grant_pages(rid, len(fetch_picks), t) if fetch_picks else 0
+        if len(fetch_picks) > granted:  # 本日(JST)の残りを超える取得は、上位から順に残りの数だけ。保存済み結果の再利用は枠を使わない
+            keep, kept = 0, []
+            for pk in sel.selected:
+                if pk.mode == "FETCH":
+                    if keep >= granted:
+                        continue
+                    keep += 1
+                kept.append(pk)
+            sel.selected = kept
+            if not sel.selected:
+                return self._set(t, "HELD", f"本日(JST)のAmazon新規取得ページの上限（{self.cfg.daily.max_pages}）に達しています。JST 0:00以降に再開します",
+                                 retry_after=self._midnight(), daily_hold="pages")
         with self._fetcher(pm, any(pk.mode == "FETCH" for pk in sel.selected)) as fetcher:
-            items = run_origin_discovery(self.svc, fetcher, ln.origin_import, pm, ln.routes, limits, sleep=self.sleep)
-        t.result["product_pages"] = t.result.get("product_pages", 0) + sum(1 for i in items if i.kind not in ("REUSED", "BLOCKED"))
+            items = run_origin_discovery(self.svc, fetcher, ln.origin_import, pm, ln.routes, limits, sleep=self.sleep, selection=sel)
+        actual = sum(1 for i in items if i.kind not in ("REUSED", "BLOCKED"))
+        if granted:
+            self.usage.commit(rid, {"pages": actual})
+        t.result["product_pages"] = t.result.get("product_pages", 0) + actual
+        t.result["selection"] = {"mode": sel.mode, "scanned": sel.scanned, "done": len(sel.done), "skipped": len(sel.skipped),
+                                 "picked": [{"asin": pk.asin, "mode": pk.mode, "units": pk.candidate.units_sum if pk.candidate else None,
+                                             "sessions": pk.candidate.sessions_sum if pk.candidate else None} for pk in sel.selected]}
         self._finish_discovery(t, items, pm)
+
+    def discover_limits(self, remaining_new: int, pages_left: int) -> DiscoveryLimits:
+        """1回の発見の上限（planと実行で同じ計算）。"""
+        lim = self.cfg.limits
+        n = max(1, min(lim.origin_asins, remaining_new, pages_left))
+        return DiscoveryLimits(n, min(lim.sources_per_origin, max(1, remaining_new // n)), lim.cross_asins, lim.cross_sources_per_asin)
+
+    def origin_selection(self, lane: str, limits: DiscoveryLimits):
+        """次の起点の選択。planと実行が同じ条件（モード・履歴・未処理の続き）でこれを使う。"""
+        ln = self.cfg.lanes[lane]
+        chk = PendingChecker(self, lane)
+        sel = self.svc.select_origins(ln.origin_import, self.cfg.page_market(lane), limits, mode=ln.selection_mode, has_pending=chk)
+        sel.reasons = chk.reasons
+        return sel
 
     def _finish_discovery(self, t: Task, items, market: str) -> None:
         prev_new = t.result.get("new_sources", [])
@@ -288,15 +345,8 @@ class Engine:
     # ------------------------------------------------------------------ 取得
 
     def _reusable(self, market: str, source_id: int) -> dict | None:
-        """利用可能な保存済みの取得結果（成功/上限打切り・鮮度内）。"""
-        with self.factory.get_session(market) as conn, conn.begin():
-            r = conn.execute(
-                text("SELECT id, outcome, pages_fetched, asin_count, extract(epoch FROM clock_timestamp() - completed_at) / 86400.0 AS age "
-                     "FROM collector_run WHERE source_id = :s AND status = 'COMPLETED' AND outcome = ANY(:ok) "
-                     "ORDER BY completed_at DESC, id DESC LIMIT 1"), {"s": source_id, "ok": list(SUCCESS)}).one_or_none()
-        if r is None or float(r.age) > self.cfg.result_max_age_days:
-            return None
-        return {"run_id": r.id, "outcome": r.outcome, "pages": 0, "asins": r.asin_count, "age_days": round(float(r.age), 1)}
+        """利用可能な保存済みの取得結果（成功/上限打切り・鮮度内）。上限打切りかどうかも持つ。"""
+        return reusable_run(self.factory, market, source_id, self.cfg.result_max_age_days)
 
     def _acquire_sources(self, t: Task, market: str, import_id: int, sources: list[dict]) -> None:
         recs: dict = t.result.setdefault("sources", {})
@@ -310,6 +360,11 @@ class Engine:
         todo = [s for s in sources if recs.get(str(s["source_id"]), {}).get("mode") not in ("FETCHED", "REUSED")]
         lim = self.cfg.limits
         fetch_ids = [s["source_id"] for s in todo if s["source_id"] in eligible]
+        cap = self.cfg.daily.max_pages
+        if fetch_ids and cap is not None and cap - self.usage.used().get("pages", 0) <= 0:  # ブラウザを開く前に日次上限を確認する
+            for sid in fetch_ids:
+                recs[str(sid)] = {"mode": "HELD", "daily": True, "reason": f"本日(JST)のAmazon新規取得ページの上限（{cap}）に達しています"}
+            fetch_ids = []
         if fetch_ids:
             with self._fetcher(market, True) as fetcher:
                 for sid in fetch_ids:
@@ -317,14 +372,22 @@ class Engine:
                     if remaining <= 0:
                         recs[str(sid)] = {"mode": "HELD", "reason": f"取得ページの上限（{self.cfg.totals.max_total_pages}）に達しています"}
                         continue
-                    limits = RunLimits(max_pages=min(lim.pages_per_source, remaining), max_asins=lim.max_asins_per_source)
+                    rid = f"{self.st.workflow_id}:{t.id}:src{sid}:a{t.attempts}"
+                    granted = self._grant_pages(rid, min(lim.pages_per_source, remaining), t)
+                    if granted <= 0:
+                        recs[str(sid)] = {"mode": "HELD", "daily": True,
+                                          "reason": f"本日(JST)のAmazon新規取得ページの上限（{self.cfg.daily.max_pages}）に達しています"}
+                        continue
+                    limits = RunLimits(max_pages=granted, max_asins=lim.max_asins_per_source)
                     items = run_batch(self.runs, self.factory, fetcher, market, [sid], limits=limits, sleep=self.sleep)
                     it = items[0]
                     if it.result == "SKIPPED":  # claimの時点で取得できなかった（間隔内・保留・他の実行中）→ 保存済みの結果を探す
+                        self.usage.release(rid)
                         blocked.setdefault(sid, None)
                         recs[str(sid)] = {"mode": "SKIPPED_AT_CLAIM", "reason": it.reason}
                         continue
                     rp = it.report
+                    self.usage.commit(rid, {"pages": rp.pages})
                     if rp.outcome in SUCCESS:
                         recs[str(sid)] = {"mode": "FETCHED", "run_id": rp.run_id, "outcome": rp.outcome, "pages": rp.pages, "asins": rp.asins,
                                           "truncated": rp.outcome == "SUCCESS_TRUNCATED"}
@@ -364,7 +427,9 @@ class Engine:
             return self._set(t, "WAITING", summary + "。CAPTCHAを解いてから resume してください")
         if modes.count("FAILED") and not modes.count("HELD"):
             return self._set(t, "FAILED", summary)
-        return self._set(t, "HELD", summary)
+        daily = any(r.get("daily") for r in recs.values() if r["mode"] == "HELD")
+        return self._set(t, "HELD", summary + ("。JST 0:00以降に再開します" if daily else ""), retry_after=self._midnight() if daily else None,
+                         **({"daily_hold": "pages"} if daily else {}))
 
     def _save_task(self, t: Task) -> None:
         t.updated_at = now_iso()
@@ -417,7 +482,13 @@ class Engine:
                 try:
                     sel = self.svc.select_cross_asins(pm, sid, opp, limits, [ln.origin_import],
                                                       max_run_age_days=self.cfg.result_max_age_days, run_id=rec["run_id"])
-                    with self._fetcher(opp, any(pk.mode == "FETCH" for pk in sel.picks)) as fetcher:
+                    n_fetch = sum(1 for pk in sel.picks if pk.mode == "FETCH")
+                    crid = f"{self.st.workflow_id}:{t.id}:via{sid}:a{t.attempts}"
+                    if n_fetch and self._grant_pages(crid, n_fetch, t) < n_fetch:
+                        done[str(sid)] = {"ok": False, "reason": "本日(JST)のAmazon新規取得ページの上限に達しています"}
+                        statuses.append("DAILY")
+                        continue
+                    with self._fetcher(opp, n_fetch > 0) as fetcher:
                         items = run_cross_discovery(self.svc, fetcher, pm, sid, opp, ln.routes, limits, [ln.origin_import],
                                                     max_run_age_days=self.cfg.result_max_age_days, run_id=rec["run_id"], sleep=self.sleep)
                 except DiscoveryError as exc:
@@ -425,6 +496,8 @@ class Engine:
                     statuses.append("HELD")
                     continue
                 kinds = [i.kind for i in items]
+                if n_fetch:
+                    self.usage.commit(crid, {"pages": sum(1 for k in kinds if k not in ("REUSED", "BLOCKED"))})
                 inv = sum(1 for k in kinds if k in ("FOUND", "REUSED", "NOT_FOUND"))
                 quota -= inv
                 t.result["product_pages"] = t.result.get("product_pages", 0) + sum(1 for k in kinds if k not in ("REUSED", "BLOCKED"))
@@ -442,6 +515,8 @@ class Engine:
         t.result.update({"sources": list(sources.values()), "new_sources": list(new.values())})
         if "CAPTCHA" in statuses:
             return self._set(t, "WAITING", f"{opp}でCAPTCHAが解消されませんでした。解いてから resume してください")
+        if "DAILY" in statuses:
+            return self._set(t, "HELD", "本日(JST)のAmazon新規取得ページの上限に達しています。JST 0:00以降に再開します", retry_after=self._midnight(), daily_hold="pages")
         if "HELD" in statuses or "BLOCKED" in statuses:
             return self._set(t, "HELD", f"反対側の調査が保留です（{sorted(set(statuses))}）。登録済み出典{len(sources)}件")
         if "FAILED" in statuses:
@@ -536,13 +611,27 @@ class Engine:
             others = pending_others(self.ledger, key)
             if others:
                 return self._set(t, "HELD", f"別の投入が未完了です: {others}（完了・解決するまで次の投入に進みません）")
+            amounts = {f"submit:{item.direction}": 1, "asins": item.asin_count}
+            used = self.usage.used()
+            over = [k for k, v in amounts.items() if self._caps().get(k) is not None and used.get(k, 0) + v > self._caps()[k]]
+            if over and self.usage.has(f"submit:{key}") in (None, "RELEASED"):  # ブラウザを開く前に確認する
+                return self._set(t, "HELD", f"本日(JST)の統合ツール投入の上限に達しています（{over}）。JST 0:00以降に再開します", retry_after=self._midnight(), daily_hold=over[0])
         page = self._page()
+        if fresh:
+            ok, why = self.usage.reserve(f"submit:{key}", amounts, self._caps(), wf=self.st.workflow_id, task=t.id)  # SAVEの前に枠を確保
+            if not ok:
+                return self._set(t, "HELD", f"本日(JST)の統合ツール投入の上限に達しています: {why}", retry_after=self._midnight(), daily_hold=next(iter(amounts)))
         t.result["send_started"] = t.result.get("send_started") or fresh
         self._save_task(t)  # 保存に失敗しても、投入台帳はSAVEの前に送信開始を記録するので再送しない
         if st.state in ("MEMO_SAVED",):
             return self._link(t, item, page)
         r = submit_item(self.ledger, page, item, Path(item.input_file), require_evidence=True)
         t.result["tool_run_id"] = r.tool_run_id
+        if fresh:
+            if r.kind in ("NOT_SUBMITTED", "REFUSED") and not r.clicked:
+                self.usage.release(f"submit:{key}")  # SAVEを押していないと確認できた時だけ枠を返す（結果不明は使用済みのまま）
+            else:
+                self.usage.commit(f"submit:{key}", amounts)
         if r.kind in ("MEMO_SAVED", "ALREADY_DONE"):
             return self._link(t, item, page)
         label = {"MEMO_UNSAVED": ("FAILED", "実行IDは特定済みですがメモ未保存です。resumeでメモ保存から再開します（ASINは再投入しません）"),

@@ -452,11 +452,28 @@ class Pick:
     stored_run_id: int | None = None
 
 
+SELECTION_MODES = ("ordered_only", "ordered_then_zero", "zero_only")
+
+
+def rank_candidates(cands: list[Candidate], mode: str) -> list[Candidate]:
+    """候補の探索順（レポートのimport単位の集計値のみ。必須の足切りは無い）。
+    注文あり: 注文点数→セッション数→最大獲得率の降順。注文0点: セッション数→最大獲得率の降順。同点はASIN順で安定。
+    ordered_only=注文ありのみ / ordered_then_zero=注文あり→注文0点 / zero_only=注文0点のみ。"""
+    if mode not in SELECTION_MODES:
+        raise DiscoveryError(f"selection_mode は {SELECTION_MODES} から指定してください: {mode!r}")
+    ordered = sorted((c for c in cands if c.units_sum > 0), key=lambda c: (-c.units_sum, -c.sessions_sum, -float(c.buybox_rate_max_pct), c.asin))
+    zero = sorted((c for c in cands if c.units_sum <= 0), key=lambda c: (-c.sessions_sum, -float(c.buybox_rate_max_pct), c.asin))
+    return {"ordered_only": ordered, "ordered_then_zero": ordered + zero, "zero_only": zero}[mode]
+
+
 @dataclass
 class OriginSelection:
     selected: list[Pick]
     skipped: list[tuple[str, str, datetime | None]] = field(default_factory=list)  # (asin, state, until)
     origin_market: str | None = None
+    done: list[tuple[str, datetime | None]] = field(default_factory=list)  # 探索済み（未処理の続きが無い）と再探索可能時刻
+    scanned: int = 0  # 今回の選択で調べた候補数（上位から）
+    mode: str | None = None
 
 
 @dataclass
@@ -488,11 +505,35 @@ class DiscoveryService:
 
     # ---- 起点の選択
     def select_origins(self, origin_import_id: int, page_market: str, limits: DiscoveryLimits, include_zero_units: bool = False,
-                       after_rank: int = 0) -> OriginSelection:
+                       after_rank: int = 0, *, mode: str | None = None,
+                       has_pending: Callable[[Candidate, ProductPageResult | None], bool] | None = None) -> OriginSelection:
+        """mode=None: 従来の選択（レポート順位・include_zero_units）。modeを指定すると、候補を`rank_candidates`の順に調べ、
+        ①未調査/再調査可能(ELIGIBLE)→取得 ②30日内に調査済み(REUSABLE)→**未処理の続き(has_pending)があれば**保存済み結果で続行、
+        無ければ「探索済み」として枠を使わず次へ ③実行中・冷却中・自動停止・該当なし→飛ばして次へ（上位の保留が他の候補を塞がない）。
+        配列位置のカーソルは持たず、毎回この履歴（調査行・経路・投入台帳）から決まる。"""
         limits.validate()
         info = validate_origin_imports(self._reports, [origin_import_id])[0]
         with self._app.get_session(info.marketplace) as conn, conn.begin():
             ranked = fetch_candidates(conn, origin_import_id)
+        if mode is not None:
+            sel = OriginSelection([], origin_market=info.marketplace, mode=mode)
+            for c in rank_candidates(ranked, mode):
+                if c.rank <= after_rank:
+                    continue
+                sel.scanned += 1
+                lk = self.guard.lookup(page_market, c.asin)
+                if lk.state == "ELIGIBLE":
+                    sel.selected.append(Pick(c.asin, "FETCH", c))
+                elif lk.state == "REUSABLE":
+                    if has_pending is not None and has_pending(c, lk.stored):
+                        sel.selected.append(Pick(c.asin, "REUSE", c, lk.stored, lk.run_id))  # 外部再取得せず、保存済みの結果から続きを処理
+                    else:
+                        sel.done.append((c.asin, lk.until))
+                else:
+                    sel.skipped.append((c.asin, lk.state, lk.until))
+                if len(sel.selected) >= limits.max_origin_asins:
+                    break
+            return sel
         sel = OriginSelection([], origin_market=info.marketplace)
         for c in ranked:
             if c.rank <= after_rank:

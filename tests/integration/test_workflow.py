@@ -113,7 +113,7 @@ class FakeToolPage:
 
     def submit(self, item, input_path):
         self.submits += 1
-        asins = [a for a in open(input_path, encoding="utf-8").read().split() if a]
+        asins = [a for a in __import__("pathlib").Path(input_path).read_text(encoding="utf-8").split() if a]
         self.rows.append(LogEntry(self.next, "asin_list", "jp", "", "待機中", None, "{cn_safe:on,variation:}"))
         self.next += 2
         if self.timeout_after_save:
@@ -159,7 +159,7 @@ class FakePorts:
 class World:
     """US・JPの架空データ一式（起点ASIN・販売元・出典のASIN）と、設定。"""
 
-    def __init__(self, app_role_factory, tmp_path, *, cfg_extra: dict | None = None) -> None:
+    def __init__(self, app_role_factory, tmp_path, *, cfg_extra: dict | None = None, single: bool = False) -> None:
         self.f, self.tmp = app_role_factory, tmp_path
         t = uuid.uuid4().hex[:6].upper()
         self.us_top, self.us_low = f"B0{t}U1", f"B0{t}U2"
@@ -168,7 +168,8 @@ class World:
         self.us_asins = [f"B0{t}A{i}" for i in range(3)]
         self.jp_asins = [f"B0{t}B{i}" for i in range(3)]
         self.cross_jp_seller, self.cross_us_seller = uid("AXJ"), uid("AXU")
-        self.us_import = make_active_report(app_role_factory, tmp_path, "US", [(self.us_top, 80, 3.0, 9), (self.us_low, 10, 1.0, 2)], name="us.csv")
+        us_rows = [(self.us_top, 80, 3.0, 9)] + ([] if single else [(self.us_low, 10, 1.0, 2)])
+        self.us_import = make_active_report(app_role_factory, tmp_path, "US", us_rows, name="us.csv")
         self.jp_import = make_active_report(app_role_factory, tmp_path, "JP", [(self.jp_top, 60, 2.0, 7)], name="jp.csv")
         self.us = Routing({self.us_top: self.us_seller, self.us_low: "A9SECOND0001", self.us_asins[0]: self.cross_us_seller,
                            self.jp_asins[0]: self.cross_us_seller}, {self.us_seller: self.us_asins})
@@ -241,19 +242,22 @@ def test_full_flow_ends_at_link_record_even_though_the_tool_is_still_waiting(wor
     assert not any(world.cross_jp_seller in u for u in world.jp.urls)
 
 
-def test_a_second_run_reuses_stored_results_and_never_resends_completed_submissions(world):
+def test_a_second_run_moves_on_to_the_next_candidate_and_never_resends_completed_submissions(world):
+    low_seller = "A9SECOND0001"
+    world.us.seller_asins[low_seller] = [f"B0{uuid.uuid4().hex[:8].upper()}"[:10] for _ in range(2)]
     first = world.run()
-    n_tool, n_us, n_jp = world.tool.submits, len(world.us.urls), len(world.jp.urls)
+    n_tool, n_us = world.tool.submits, len(world.us.urls)
     second = world.run()
     assert wcli.overall(second.st) == "COMPLETED"
-    assert world.tool.submits == n_tool  # 成功済みの投入は繰り返さない
-    # 同じ出典は30日間隔で再取得できないが、保存済みの結果が使えるので投入計画には使える（再取得と再投入は別管理）
-    assert any(r["mode"] == "REUSED" for r in second.st.tasks["acquire:US"].result["sources"].values())
-    assert not any(world.us_seller in u for u in world.us.urls[n_us:])
-    assert not any(f"/dp/{world.us_top}" in u for u in world.us.urls[n_us:])  # 調査済みの商品ページは再アクセスしない
+    picked = [p["asin"] for p in second.st.tasks["discover:US"].result["selection"]["picked"]]
+    assert picked == [world.us_low]  # 完了済みの上位候補(us_top)を選び直さず、次の候補へ進む
+    assert not any(f"/dp/{world.us_top}" in u for u in world.us.urls[n_us:])  # 調査済みの商品ページへ再アクセスしない
+    assert not any(world.us_seller in u for u in world.us.urls[n_us:])       # 取得済みの出典を再取得しない
     keys1 = {t.result["key"] for t in submit_tasks(first)}
-    assert keys1 == {t.result["key"] for t in submit_tasks(second)}
-    assert all(t.status == "DONE" for t in submit_tasks(second))
+    keys2 = {t.result["key"] for t in submit_tasks(second)}
+    assert keys1.isdisjoint(keys2) and len(keys2) == 1  # 前回の投入は繰り返さず、次の候補の分だけを新しく投入
+    assert world.tool.submits == n_tool + 1
+    assert second.st.tasks["discover:JP"].result["selection"]["picked"] == []  # JPの候補は処理済み
 
 
 def test_limits_are_applied_and_totals_stop_the_run_with_a_hold(app_role_factory, tmp_path, own):
@@ -382,7 +386,8 @@ def test_ingest_login_wait_then_resume_sends_after_login(world):
 
 # ---------------------------------------------------------------- 重複・保全・過去のimport
 
-def test_same_asin_set_from_a_different_run_is_held_as_a_duplicate_candidate_and_can_be_allowed(world):
+def test_same_asin_set_from_a_different_run_is_held_as_a_duplicate_candidate_and_can_be_allowed(app_role_factory, tmp_path, own):
+    world = World(app_role_factory, tmp_path, single=True)
     first = world.run()
     n = world.tool.submits
     # 別のrun（別の出典・別のキー）で同じASIN集合・同じ方向の投入計画を作る
@@ -572,22 +577,23 @@ def test_status_text_names_what_to_do_and_how_to_resume(world, capsys):
 
 # ---------------------------------------------------------------- 既存結果の引き継ぎ・外部操作ゼロ・新規投入の上限
 
-def test_a_fresh_workflow_adopts_existing_results_with_zero_external_operations(world, tmp_path):
-    first = world.run()
-    n_tool = world.tool.submits
-    world.ports.forbid_all = True  # ブラウザ・統合ツールに一切触れてはいけない
-    cfg2 = config_from_dict({**world.cfg_dict, "state_dir": str(tmp_path / "wf_fresh")})  # 空のworkflow状態（投入台帳は既存のまま）
-    second = world.run(world.engine(cfg2))
+def test_a_fresh_workflow_with_no_remaining_candidates_makes_zero_external_operations(app_role_factory, tmp_path, own):
+    w = World(app_role_factory, tmp_path, single=True)
+    first = w.run()
+    n_tool = w.tool.submits
+    w.ports.forbid_all = True  # ブラウザ・統合ツールに一切触れてはいけない
+    cfg2 = config_from_dict({**w.cfg_dict, "state_dir": str(tmp_path / "wf_fresh")})  # 空のworkflow状態（投入台帳・調査履歴は既存のまま）
+    second = w.run(w.engine(cfg2))
     assert wcli.overall(second.st) == "COMPLETED"
     from workflow.store import usage
 
     u = usage(second.st)
-    assert u["pages"] == 0 and u["new_sources"] == 0 and u["new_submissions"] == 0 and u["adopted_submissions"] == 2
-    assert world.tool.submits == n_tool
-    assert all(t.result.get("adopted") for t in submit_tasks(second))
-    assert {t.result["tool_run_id"] for t in submit_tasks(second)} == {t.result["tool_run_id"] for t in submit_tasks(first)}
-    out = "\n".join(wcli.status_lines(second.st))
-    assert "引き継ぎ(既存の対応記録)" in out and "再利用(保存済みの取得結果)" in out and "再利用(保存済みの調査結果)" in out
+    assert u["pages"] == 0 and u["new_sources"] == 0 and u["new_submissions"] == 0
+    assert not submit_tasks(second) and w.tool.submits == n_tool
+    from tool_submission.ledger import SubmissionLedger
+
+    led = SubmissionLedger(tmp_path / "sub" / "ledger.jsonl")
+    assert all(led.state(t.result["key"]).state == "LINKED" for t in submit_tasks(first))
 
 
 def test_new_submissions_per_direction_are_capped_and_the_cap_survives_resume(world):

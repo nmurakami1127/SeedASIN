@@ -13,6 +13,7 @@ from pathlib import Path
 MARKETS = ("US", "JP")
 OPPOSITE = {"US": "JP", "JP": "US"}
 ROUTES = ("SELLER", "BRAND")
+SELECTION_MODES = ("ordered_only", "ordered_then_zero", "zero_only")
 
 # 安全な範囲（これを超える設定は拒否する）。出典発見側の上限（acquisition.discovery.HARD_CAPS）と同じか、より厳しい。
 HARD = {
@@ -31,6 +32,7 @@ class Lane:
     origin_import: int
     page_market: str | None = None  # 商品ページ（発見）と出典の取得先の市場。省略時は起点レポートの市場と同じ
     routes: list[str] = field(default_factory=lambda: ["SELLER"])
+    selection_mode: str = "ordered_then_zero"  # ordered_only=注文ありのみ / ordered_then_zero=注文あり→注文0点 / zero_only=注文0点のみ
 
 
 @dataclass
@@ -53,6 +55,23 @@ class Totals:
 
 
 @dataclass
+class Daily:
+    """watch全体で共有する日次上限（Asia/Tokyoの午前0時で区切る）。nullは無制限。再起動・新しいworkflow・resumeでリセットされない。
+    既定値は**試運転用**で、通常運用の確定値ではない（config/workflow.standard.example.json と README の提案を参照）。"""
+    max_pages: int | None = 24                          # Amazon新規取得ページ（出典の取得 + 商品ページ調査。保存済み結果の再利用は含まない）
+    max_new_submissions_per_direction: int | None = 2   # 統合ツールへの新規投入（方向ごと）。SAVE後の結果不明も使用済み
+    max_submit_asins: int | None = 5000                 # 投入ASIN数の合計
+
+
+@dataclass
+class Watch:
+    interval_minutes: int = 30          # 対象が無い時の再確認間隔
+    failure_retry_minutes: int = 30     # 失敗した工程を再試行するまでの冷却（連続再試行しない）
+    human_wait_retry_minutes: int = 30  # 人手待ち（ログイン・CAPTCHA等）を再確認する間隔
+    notify_minutes: int = 360           # 同じ人手待ちの表示を繰り返す最短間隔
+
+
+@dataclass
 class Cross:
     enabled: bool = True
     fetch_discovered: bool = False  # 反対側で新たに発見した出典の自動取得（初期OFF。再帰的な探索はしない）
@@ -69,12 +88,24 @@ class WorkflowConfig:
     result_max_age_days: int = 30   # 保存済みの取得結果を投入に使ってよい鮮度
     state_dir: str = "exports/workflow"
     submission_dir: str = "exports/tool_submission"
+    page_revisit_days: int = 30     # 同じ商品ページの再調査間隔（出典の取得間隔 = acquisition側の設定 とは別）
+    daily: Daily = field(default_factory=Daily)
+    watch: Watch = field(default_factory=Watch)
+    profile: str = "trial"          # 表示用の名前（trial=試運転 / standard=通常運用）。動作は上の値だけで決まる
 
     def to_dict(self) -> dict:
         return asdict(self)
 
     def sha256(self) -> str:
         return hashlib.sha256(json.dumps(self.to_dict(), sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+
+    def for_lane(self, lane: str) -> "WorkflowConfig":
+        """1つの市場だけのworkflow用の設定（watchは市場ごとに別のworkflowにする。一方が人手待ちでも他方を止めないため）。"""
+        import copy
+
+        c = copy.deepcopy(self)
+        c.lanes = {lane: self.lanes[lane]}
+        return c
 
     def page_market(self, lane: str) -> str:
         return self.lanes[lane].page_market or lane
@@ -89,6 +120,8 @@ class WorkflowConfig:
                 raise ConfigError(f"{m}: origin_import（ACTIVEレポートのimport_id）を明示してください")
             if (ln.page_market or m) not in MARKETS:
                 raise ConfigError(f"{m}: page_market は {MARKETS} です")
+            if ln.selection_mode not in SELECTION_MODES:
+                raise ConfigError(f"{m}: selection_mode は {SELECTION_MODES} から指定してください: {ln.selection_mode!r}")
             if not ln.routes or any(r not in ROUTES for r in ln.routes):
                 raise ConfigError(f"{m}: routes は {ROUTES} から指定してください")
             if "BRAND" in ln.routes and not self.brand_enabled:
@@ -105,6 +138,16 @@ class WorkflowConfig:
             v = getattr(self.totals, name)
             if not isinstance(v, int) or v < 1 or v > HARD[name]:
                 raise ConfigError(f"totals.{name} は1〜{HARD[name]}で指定してください（指定: {v}）")
+        for name in ("max_pages", "max_new_submissions_per_direction", "max_submit_asins"):
+            v = getattr(self.daily, name)
+            if v is not None and (not isinstance(v, int) or v < 1 or v > 1_000_000):
+                raise ConfigError(f"daily.{name} は1以上の整数またはnull（無制限）")
+        for name in ("interval_minutes", "failure_retry_minutes", "human_wait_retry_minutes", "notify_minutes"):
+            v = getattr(self.watch, name)
+            if not isinstance(v, int) or not 1 <= v <= 7 * 24 * 60:
+                raise ConfigError(f"watch.{name} は1〜10080（分）")
+        if not isinstance(self.page_revisit_days, int) or not 1 <= self.page_revisit_days <= 365:
+            raise ConfigError("page_revisit_days は1〜365")
         mn = self.totals.max_new_submissions_per_direction
         if mn is not None and (not isinstance(mn, int) or mn < 1 or mn > 100):
             raise ConfigError("totals.max_new_submissions_per_direction は1〜100またはnull")
@@ -116,11 +159,14 @@ class WorkflowConfig:
 
 
 def config_from_dict(d: dict) -> WorkflowConfig:
+    d = {k: v for k, v in d.items() if not k.startswith("_")}  # "_comment" など説明用のキーは無視する
     try:
         lanes = {m: Lane(**v) for m, v in (d.get("lanes") or {}).items()}
         cfg = WorkflowConfig(
             lanes=lanes, limits=Limits(**d.get("limits", {})), totals=Totals(**d.get("totals", {})), cross=Cross(**d.get("cross", {})),
-            **{k: d[k] for k in ("brand_enabled", "tool_max_asins", "result_max_age_days", "state_dir", "submission_dir") if k in d},
+            daily=Daily(**d.get("daily", {})), watch=Watch(**d.get("watch", {})),
+            **{k: d[k] for k in ("brand_enabled", "tool_max_asins", "result_max_age_days", "state_dir", "submission_dir",
+                                 "page_revisit_days", "profile") if k in d},
         )
     except TypeError as exc:
         raise ConfigError(f"設定に未知の項目があります: {exc}") from exc

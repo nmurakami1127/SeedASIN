@@ -113,11 +113,14 @@ def run_origin_discovery(
     svc: DiscoveryService, fetcher: PageFetcher, origin_import_id: int, page_market: str, routes: Iterable[str],
     limits: DiscoveryLimits, *, include_zero_units: bool = False, after_rank: int = 0,
     sleep: Callable[[float], None] = time.sleep, stop_after_failures: int = 2, heartbeat_interval: float | None = None,
+    selection=None,
 ) -> list[ItemReport]:
+    """selection: 呼び出し側（workflowのplan/実行）が同じ条件で選んだ結果を渡すと、再選択せずそのまま調べる（planと実行で同じ候補）。"""
     routes = list(routes)
     routes_tag(routes)
     own = require_own_accounts(svc._app, page_market)  # 未設定なら取得を始めない
-    selection = svc.select_origins(origin_import_id, page_market, limits, include_zero_units, after_rank)
+    if selection is None:
+        selection = svc.select_origins(origin_import_id, page_market, limits, include_zero_units, after_rank)
 
     def make_record(pick):
         return lambda res, run_id, check: svc.record_origin(pick.candidate, page_market, res, routes, own, limits, run_id, check)
