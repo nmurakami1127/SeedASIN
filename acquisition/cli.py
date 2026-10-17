@@ -410,6 +410,29 @@ def _cmd_legacy_select(a, ctx: Context) -> int:
     return EXIT_OK
 
 
+def _cmd_own_account_add(a, ctx: Context) -> int:
+    from sqlalchemy import text
+
+    with ctx.app_factory.get_session(a.market) as conn, conn.begin():
+        conn.execute(
+            text("INSERT INTO marketplace_account_config (marketplace, account_id, is_active) VALUES (:m, :a, true) "
+                 "ON CONFLICT (marketplace, account_id) DO UPDATE SET is_active = true"),
+            {"m": a.market, "a": a.account_id.strip().upper()},
+        )
+    print(f"自社セラーID {a.account_id.strip().upper()} を市場{a.market}に設定しました（商品ページからの発見で除外されます）")
+    return EXIT_OK
+
+
+def _cmd_own_account_list(a, ctx: Context) -> int:
+    from sqlalchemy import text
+
+    for m in MARKETS:
+        with ctx.app_factory.get_session(m) as conn, conn.begin():
+            rows = conn.execute(text("SELECT account_id, is_active FROM marketplace_account_config ORDER BY account_id")).all()
+        print(f"{m}: " + (", ".join(f"{r.account_id}{'' if r.is_active else '(無効)'}" for r in rows) or "未設定"))
+    return EXIT_OK
+
+
 def _cmd_legacy_list(a, ctx: Context) -> int:
     n = 0
     for g in ctx.legacy.list_groups():
@@ -507,6 +530,9 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--ledger-jp-sheet", default="セラーリスト")
     sp.add_argument("--ledger-us", default=None, help="legacy-select と同じUS台帳(xlsx)")
     sp.add_argument("--ledger-us-sheet", default="セラー台帳")
+    sp = add("own-account-add", _cmd_own_account_add, "自社セラーIDを設定する（商品ページからの発見で除外する）", market=True)
+    sp.add_argument("--account-id", required=True)
+    add("own-account-list", _cmd_own_account_list, "自社セラーIDの設定状況", market=False)
     sp = add("legacy-list", _cmd_legacy_list, "適用済みの旧証拠と状態", market=False)
     sp.add_argument("--unclassified", action="store_true")
     sp.add_argument("--state", choices=["UNKNOWN", "CONFIRMED_THIS", "CONFIRMED_OTHER", "DISMISSED"], default=None)

@@ -986,3 +986,17 @@ PERMANENTLY_EXCLUDEDは引き続き完全除外のまま変更しない。
 - 人が手動でお届け先を設定（US: Beaverton 97005 / JP: 山武市埴谷 289-1223）し、表示の一致を確認してから実行（自動変更なし）。US: source_id=10 (AB49KC99NVKLD) run=79 `SUCCESS_TRUNCATED`(PAGE_LIMIT) 1ページ16 ASIN（重複なし・JPのrun 78との重複0）、`--require-delivery-match`付きで警告なし。claim/planとも`TOO_RECENT`、再取得可能は2026-11-16 08:37 UTC。
 - **JP run 78 は配送先153-0064（想定外）で取得した結果**。削除・補正・再取得はしていない。接続確認としては有効だが、想定配送先（289-1223）での取得品質は**未検証**のまま（30日制限により当面再取得しない）。
 - 既存の`collector_run`（id<=77）はハッシュ一致で無変更。旧RUNNING(33/38)・保留・レポートも無変更。
+
+## 59. 起点ASINからの出典発見と反対側市場への展開（段階4、Phase 4, 2026-10-17）
+
+**目的**: 注文点数上位の起点ASINの商品ページから、他セラー・ブランドを出典として登録し、取得済みの出典のASINから反対側市場の探索経路を作る。**出典の取得は行わない**（登録した出典は既存の plan・claim・30日間隔を通す）。既存スキーマの範囲で実装（マイグレーションなし）。実ページ・実DBでの実行は未実施（疑似ページ＋test-dbで検証）。
+
+- 追加: `asin_collector/product_page.py`（商品ページの抽出＝純粋関数＋取得結果の区別）、`asin_collector/discovery_runner.py`（実行部）、`acquisition/discovery.py`（起点選択・再探索間隔・自社ID・登録）、`SourceRegistry.register_via_path`、CLI `asin_collector.cli discover-origin / discover-cross`、`acquisition.cli own-account-add / own-account-list`。
+- 流れ: ①`--origin-import`で明示したACTIVEレポートから注文点数順に起点ASINを選ぶ（注文0点は既定で対象外）②**商品ページの市場(`--page-market`)を明示**して調べる（セラー＝そのページの出品者、ブランド＝bylineのストアリンク／ブランド絞込リンク／詳細表。経路は`--routes SELLER,BRAND`）③自社セラー(`marketplace_account_config`のis_active)とAmazon自身を除外。**自社IDが未設定の市場では実行しない**④`acquisition_source`へ登録、`acquisition_path`にORIGIN_ASIN経路（起点import・ASIN・方向・指標をコピー）。抽出元・セラー範囲・商品ページURL・調査runはnoteのJSON。同じ出典を複数起点から見つけても出典は1つ・経路が増える⑤反対側市場: 取得済み出典の最新の完了した実行のASINを、**反対側市場**の商品ページで調べ、VIA_SOURCE経路（元の出典の代表起点の方向・指標をコピーして順位を引き継ぐ。planの経路条件にVIA_SOURCEを追加）。**同じASINが反対側市場にあるとは仮定しない**: 存在確認(FOUND)・該当なし(HTTP404のみ)・構造不明(UNCONFIRMED)・読込失敗/5xx/CAPTCHAを区別して記録。
+- セラー範囲: 購入ボックスの1件だけは`BUYBOX_ONLY`（全セラー取得とは扱わない）、出品一覧パネルは`VISIBLE_OFFERS`（表示範囲。全出品者とは確認していない）。認識した領域の外（おすすめ・広告）のリンクは拾わない。ブランドストア／ブランド名（絞込リンク・詳細表）は別の出典種別で、ストアの文言からブランド名は作らない。
+- **再探索間隔（既存構造での管理）**: 商品ページの調査は出典種別に無い（CHECK制約）ため、`collector_run`の行（run_type='ASIN_PAGE'、target='ASIN:<ASIN>|<routes>'、source_id無し）で管理する。完了から30日・失敗後60分の冷却・3回連続失敗で30日停止・実行中の二重起動拒否（stale 30分）・中断は失敗に数えない（`AsinPageGuard`、識別ロック付き）。該当なし(404)は完了として間隔に数え、構造不明・候補0件は**成功にしない**。旧履歴の走査(`legacy_scan`)はASIN_PAGEを除外。**限界**: lease/heartbeat/フェンシングは無い（人が手元で1つずつ起動する対話式の前提）。
+- 展開数の上限（CLI引数＋ハード上限）: 起点ASIN数(既定2/最大10)・起点ごとの出典数(3/10)・反対側へ展開するASIN数(2/5)・展開ASINごとの出典数(3/5)。2回連続の調査失敗・CAPTCHA未解決で残りを実行しない。配送先が確認できなければ調査を始めない（上書き不可）。
+
+**実ページで未検証**: 商品ページのセレクタ（bylineInfo / po-brand / merchant-info / aod-offer-list 等）、404の挙動、出品一覧パネルが商品ページ内に出るか（出ない場合は`BUYBOX_ONLY`止まりで、全出品者の取得には別の画面が要る）、Amazon自身の出品者ID（US ATVPDKIKX0DER / JP AN1VRQENFRJN5）。
+
+**スキーマ変更案（保留。不可欠ではない）**: ①出典種別`ASIN_PAGE`の追加（acquisition_source / acquisition_interval_config / 旧証拠のCHECKとシード）で、商品ページ調査を他の出典と同じ claim・lease・間隔に乗せる ②`acquisition_path`に抽出元・セラー範囲・ページ市場・調査runの構造化列（現在はnote JSON）③展開数の上限を設定テーブル化（`processing_limit_config`のlimit_typeはCHECKで固定のため拡張が要る）。

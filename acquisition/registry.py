@@ -154,6 +154,49 @@ class SourceRegistry:
             ).one_or_none()
         return RegisteredPath(source, created is not None)
 
+    def register_via_path(
+        self,
+        marketplace: str,
+        source_type: str,
+        primary: str,
+        qualifier: str = "",
+        *,
+        via_market: str,
+        via_source_id: int,
+        via_asin: str,
+        note: str | None = None,
+    ) -> RegisteredPath:
+        """取得済みの出典(via_market, via_source_id)が持っていたASINから、別の市場`marketplace`で見つけた出典を登録する
+        （VIA_SOURCE経路）。起点の指標・方向は、元の出典の代表起点（注文点数→セッション→獲得率が最良の起点）から
+        **コピー**し、順位を引き継ぐ。元の出典に起点が無ければ、起点なし（方向・指標なし）の経路になる。"""
+        source = self.register_source(marketplace, source_type, primary, qualifier)
+        with self._app.get_session(via_market) as conn, conn.begin():
+            rep = conn.execute(
+                text(
+                    "SELECT direction, origin_marketplace, origin_import_id, origin_asin, origin_units, origin_sessions, "
+                    "origin_buybox_max_pct FROM acquisition_path WHERE source_id = :sid AND marketplace = :mp "
+                    "AND stage = 'ORIGIN_ASIN' ORDER BY origin_units DESC, origin_sessions DESC, "
+                    "origin_buybox_max_pct DESC, origin_asin LIMIT 1"
+                ),
+                {"sid": via_source_id, "mp": via_market},
+            ).one_or_none()
+        params = {"direction": None, "om": None, "oi": None, "oa": None, "ou": None, "os": None, "ob": None}
+        if rep is not None:
+            params = {"direction": rep.direction, "om": rep.origin_marketplace, "oi": rep.origin_import_id,
+                      "oa": rep.origin_asin, "ou": rep.origin_units, "os": rep.origin_sessions, "ob": rep.origin_buybox_max_pct}
+        with self._app.get_session(marketplace) as conn, conn.begin():
+            created = conn.execute(
+                text(
+                    "INSERT INTO acquisition_path (source_id, marketplace, direction, stage, origin_marketplace, "
+                    "origin_import_id, origin_asin, origin_units, origin_sessions, origin_buybox_max_pct, via_source_id, "
+                    "via_asin, note, registered_by) VALUES (:sid, :mp, :direction, 'VIA_SOURCE', :om, :oi, :oa, :ou, :os, "
+                    ":ob, :vs, :va, :note, :by) ON CONFLICT DO NOTHING RETURNING path_id"
+                ),
+                {"sid": source.source_id, "mp": marketplace, "vs": via_source_id, "va": via_asin.strip().upper(),
+                 "note": note, "by": self._actor, **params},
+            ).one_or_none()
+        return RegisteredPath(source, created is not None)
+
     # ------------------------------------------------------------------ 状態・間隔の変更
 
     def _locked_source(self, conn: Connection, marketplace: str, source_id: int):

@@ -159,7 +159,8 @@ def collect_collector_runs(app_factory: SessionFactory, marketplace: str) -> tup
     stats = {"legacy_running_untouched": 0, "total": 0}
     with app_factory.get_session(marketplace) as conn, conn.begin():
         _set_read_only(conn)
-        where = " WHERE source_id IS NULL" if _has_column(conn, "collector_run", "source_id") else ""
+        # 商品ページの調査記録(run_type='ASIN_PAGE'、acquisition.discovery)は旧収集の履歴ではないので除く
+        where = " WHERE source_id IS NULL AND run_type <> 'ASIN_PAGE'" if _has_column(conn, "collector_run", "source_id") else ""
         rows = conn.execute(
             text(
                 "SELECT id, run_type, target, status, asin_count, started_at, completed_at "

@@ -105,7 +105,8 @@ def build_plan(
             text(
                 "SELECT source_id, direction, origin_marketplace, origin_import_id, origin_asin, origin_units, "
                 "origin_sessions, origin_buybox_max_pct FROM acquisition_path "
-                "WHERE stage = 'ORIGIN_ASIN' AND origin_import_id = ANY(:ids)"
+                "WHERE stage IN ('ORIGIN_ASIN', 'VIA_SOURCE') AND origin_import_id = ANY(:ids) "
+                "AND origin_units IS NOT NULL AND direction IS NOT NULL"
             ),
             {"ids": origin_import_ids},
         ).all()

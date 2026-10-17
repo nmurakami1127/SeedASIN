@@ -43,6 +43,9 @@ asin_collector/check_recommendations.pyのモジュールdocstring参照）。CA
 出典管理（acquisition）に接続した取得（claimで取得間隔・保留・実行中を再判定、heartbeat、結果の区別）:
     python -m asin_collector.cli collect-source --market=JP --source-id=12 --max-pages=3
     python -m asin_collector.cli collect-next --market=JP --origin-import=2 --section=IMPORT --max-sources=1 --dry-run
+起点ASINからの出典発見（商品ページを調べ、セラー/ブランドを登録する。出典の取得は行わない）:
+    python -m asin_collector.cli discover-origin --origin-import=2 --page-market=JP --routes=SELLER --dry-run
+    python -m asin_collector.cli discover-cross --via-market=US --via-source-id=10 --page-market=JP --routes=SELLER --dry-run
 従来の collect-brand-page / export-run / check-recommendations は変更していない（export-run は新方式の実行も同じ
 collector_asin から書き出せる）。
 """
@@ -227,6 +230,100 @@ def _cmd_collect_next(args: argparse.Namespace) -> None:
     _run_in_browser(factory, args.market, [e.facts.source_id for e in targets], args)
 
 
+def _discovery_limits(args: argparse.Namespace):
+    from acquisition.discovery import DiscoveryLimits
+
+    return DiscoveryLimits(args.max_origin_asins, args.max_sources_per_origin, args.max_cross_asins, args.max_cross_sources_per_asin).validate()
+
+
+def _print_discovery(items) -> None:
+    for it in items:
+        print(f"  {it.asin} ({it.page_market}) {it.kind} run={it.run_id}" + (f" scope={it.seller_scope}" if it.seller_scope else "")
+              + (f" {it.detail}" if it.detail else ""))
+        for r in it.registered:
+            print(f"      登録 {r.source_type} source_id={r.source_id} {r.key} 出典{'新規' if r.source_created else '既存'}"
+                  f"/経路{'追加' if r.path_created else '既存'}")
+        for k in it.skipped:
+            print(f"      見送り {k.key}: {k.reason}")
+
+
+def _discover_in_browser(factory: SessionFactory, page_market: str, args: argparse.Namespace, run) -> None:
+    from asin_collector.browser_session import open_browser
+    from asin_collector.source_runner import PlaywrightFetcher
+
+    with open_browser(page_market) as context:  # 商品ページを調べる市場のプロファイル
+        fetcher = PlaywrightFetcher(context.new_page())
+        warning = fetcher.delivery_warning(page_market)
+        if warning:  # 配送先が確認できない間は、調査を始めない（履歴も残さない）
+            print(f"[中止] {warning}")
+            return
+        _print_discovery(run(fetcher))
+
+
+def _cmd_discover_origin(args: argparse.Namespace) -> None:
+    from acquisition.discovery import AsinPageGuard, DiscoveryError, DiscoveryService, load_own_account_ids
+    from asin_collector.discovery_runner import run_origin_discovery
+
+    factory = SessionFactory.for_app_role()
+    routes = args.routes.split(",")
+    try:
+        limits = _discovery_limits(args)
+        svc = DiscoveryService(factory)
+        own = load_own_account_ids(factory, args.page_market)
+        sel = svc.select_origins(args.origin_import, args.page_market, routes, limits, args.include_zero_units)
+        print(f"起点レポート import_id={args.origin_import}（市場{sel.origin_market}）→ 商品ページの市場={args.page_market} 経路={routes}")
+        print(f"自社セラーID({args.page_market}): " + (f"{len(own)}件設定済み" if own else "未設定 — 実行できません"))
+        print(f"上限: 起点ASIN{limits.max_origin_asins} / 起点ごとの出典{limits.max_sources_per_origin}")
+        for c in sel.selected:
+            print(f"  調査対象 #{c.rank} {c.asin} 注文{c.units_sum}点 セッション{c.sessions_sum} → https://…/dp/{c.asin}")
+        for asin, state, until in sel.skipped:
+            print(f"  見送り {asin}: {state}" + (f"（{until:%Y-%m-%d %H:%M} UTCまで）" if until else ""))
+        if args.dry_run:
+            print("（--dry-run: 取得も登録もしていません）想定: 調査ごとにcollector_run(ASIN_PAGE)1行、見つかった出典ごとにacquisition_source/pathを追加")
+            return
+        _discover_in_browser(factory, args.page_market, args, lambda f: run_origin_discovery(
+            svc, f, args.origin_import, args.page_market, routes, limits, include_zero_units=args.include_zero_units))
+    except DiscoveryError as exc:
+        raise SystemExit(f"[中止] {exc}")
+
+
+def _cmd_discover_cross(args: argparse.Namespace) -> None:
+    from acquisition.discovery import DiscoveryError, DiscoveryService, load_own_account_ids
+    from asin_collector.discovery_runner import run_cross_discovery
+
+    factory = SessionFactory.for_app_role()
+    routes = args.routes.split(",")
+    try:
+        limits = _discovery_limits(args)
+        svc = DiscoveryService(factory)
+        own = load_own_account_ids(factory, args.page_market)
+        asins, skipped, run_id = svc.select_cross_asins(args.via_market, args.via_source_id, args.page_market, routes, limits)
+        print(f"取得済みの出典 {args.via_market}/source_id={args.via_source_id}（run={run_id}）→ 反対側市場{args.page_market}の商品ページ 経路={routes}")
+        print(f"自社セラーID({args.page_market}): " + (f"{len(own)}件設定済み" if own else "未設定 — 実行できません"))
+        print(f"上限: 展開ASIN{limits.max_cross_asins} / ASINごとの出典{limits.max_cross_sources_per_asin}")
+        for a in asins:
+            print(f"  調査対象 {a}（{args.page_market}に存在するかは未確認）")
+        for a, state, until in skipped:
+            print(f"  見送り {a}: {state}" + (f"（{until:%Y-%m-%d %H:%M} UTCまで）" if until else ""))
+        if args.dry_run:
+            print("（--dry-run: 取得も登録もしていません）")
+            return
+        _discover_in_browser(factory, args.page_market, args, lambda f: run_cross_discovery(
+            svc, f, args.via_market, args.via_source_id, args.page_market, routes, limits))
+    except DiscoveryError as exc:
+        raise SystemExit(f"[中止] {exc}")
+
+
+def _add_discovery_options(sp: argparse.ArgumentParser) -> None:
+    sp.add_argument("--page-market", required=True, choices=["US", "JP"], help="商品ページを調べる市場（明示。ブラウザプロファイルもこの市場）")
+    sp.add_argument("--routes", default="SELLER", help="SELLER,BRAND のどちらか/両方（カンマ区切り。既定: SELLER）")
+    sp.add_argument("--max-origin-asins", type=int, default=2, help="調べる起点ASINの上限（既定2、最大10）")
+    sp.add_argument("--max-sources-per-origin", type=int, default=3, help="起点ASINごとに登録する出典の上限（既定3、最大10）")
+    sp.add_argument("--max-cross-asins", type=int, default=2, help="反対側市場へ展開するASINの上限（既定2、最大5）")
+    sp.add_argument("--max-cross-sources-per-asin", type=int, default=3, help="展開ASINごとに登録する出典の上限（既定3、最大5）")
+    sp.add_argument("--dry-run", action="store_true", help="対象と上限を表示するだけ（ブラウザ起動・取得・登録なし）")
+
+
 def _add_run_options(sp: argparse.ArgumentParser) -> None:
     sp.add_argument("--market", required=True, choices=["US", "JP"], help="取得先市場（ブラウザプロファイルもこの市場のものを使う）")
     sp.add_argument("--max-pages", type=int, default=5, help="1出典あたりの最大ページ数（上限で打ち切ると SUCCESS_TRUNCATED。既定: 5）")
@@ -297,6 +394,24 @@ def build_parser() -> argparse.ArgumentParser:
     p_next.add_argument("--include-no-origin", action="store_true", help="起点のない出典も対象にする")
     p_next.add_argument("--dry-run", action="store_true", help="対象を表示するだけ（ブラウザ起動・claimなし）")
     p_next.set_defaults(func=_cmd_collect_next)
+
+    p_do = subparsers.add_parser(
+        "discover-origin",
+        help="注文点数上位の起点ASINの商品ページを調べ、セラー/ブランドを出典として登録する（対話式。出典の取得はしない）",
+    )
+    _add_discovery_options(p_do)
+    p_do.add_argument("--origin-import", required=True, type=int, help="起点にするACTIVEレポートのimport_id（明示）")
+    p_do.add_argument("--include-zero-units", action="store_true", help="注文0点の起点ASINも調べる（既定: 調べない）")
+    p_do.set_defaults(func=_cmd_discover_origin)
+
+    p_dc = subparsers.add_parser(
+        "discover-cross",
+        help="取得済みの出典のASINから、反対側市場の商品ページを調べて出典を登録する（対話式。出典の取得はしない）",
+    )
+    _add_discovery_options(p_dc)
+    p_dc.add_argument("--via-market", required=True, choices=["US", "JP"], help="取得済みの出典の市場")
+    p_dc.add_argument("--via-source-id", required=True, type=int, help="取得済みの出典のsource_id")
+    p_dc.set_defaults(func=_cmd_discover_cross)
 
     return parser
 

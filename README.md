@@ -229,3 +229,13 @@ claimで取得間隔・保留・実行中・旧証拠を再判定し、結果（
 - `--require-delivery-match`: プロファイルのお届け先表示が想定（US 97005 / JP 289-1223）と確認できなければ、claimせずに中止する（取得履歴・失敗回数を増やさない）。指定しない場合は警告のみで続行する。お届け先は自動では変更しない（人が手動で設定する）。
 - CAPTCHA: 回避しない。対話端末ではEnter待ち、端末の無い実行ではブラウザ画面で人が解くのを最大5分ポーリングして待ち、解けなければその実行は`CAPTCHA_UNSOLVED`で終了する（同じ対象へ自動で再試行しない）。
 
+
+### 起点ASINからの出典発見（段階4、対話式・出典の取得はしない）
+
+```
+python -m acquisition.cli own-account-add --market JP --account-id <自社セラーID>   # 自社ID（未設定の市場では発見を実行しない）
+python -m asin_collector.cli discover-origin --origin-import 2 --page-market JP --routes SELLER --dry-run   # 対象・上限の確認だけ
+python -m asin_collector.cli discover-cross --via-market US --via-source-id <ID> --page-market JP --routes SELLER --dry-run
+```
+
+起点ASINの商品ページ（`--page-market`で市場を明示）から他セラー/ブランドを出典として登録する。登録後の取得は `collect-next`（plan・claim・30日間隔を通る）。詳細・未検証事項・スキーマ変更案は docs/DEVIATIONS.md #59。
