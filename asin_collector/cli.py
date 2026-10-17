@@ -468,7 +468,15 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = build_parser().parse_args()
-    args.func(args)
+    try:
+        args.func(args)
+    except Exception as exc:  # noqa: BLE001 - 未適用のマイグレーションは案内して終了
+        from db.schema_guard import explain
+
+        msg = explain(exc)
+        if msg is None:
+            raise
+        raise SystemExit(f"[中止] {msg}") from None
 
 
 if __name__ == "__main__":

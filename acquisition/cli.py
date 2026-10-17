@@ -146,7 +146,7 @@ def format_plan(plan: Plan) -> str:
                    f"獲得率{float(e.rep.buybox):g}%") if e.rep else "起点なし"
             shared = f" 共有取得(他: {','.join(e.also_in)})" if e.also_in else ""
             old = " ※旧証拠(参考)あり" if e.decision.gate_basis == "LEGACY" else ""
-            lines.append(f"  {e.rank:>3}. [{'未取得' if e.group == 'NEVER' else '再取得'}] source_id={e.facts.source_id} "
+            lines.append(f"  {e.rank:>3}. [{ {'NEVER': '未取得', 'CONTINUE': '続き'}.get(e.group, '再取得') }] source_id={e.facts.source_id} "
                          f"{e.facts.source_type} {e.facts.display_primary} / {rep}{shared}{old}")
     lines.append(f"\n実行不可（順位なし）: {len(plan.blocked)}件")
     from collections import Counter
@@ -218,6 +218,28 @@ def _cmd_exclude(a, ctx): return _simple(lambda: ctx.registry.set_status(a.marke
 def _cmd_release(a, ctx): return _simple(lambda: ctx.registry.release(a.market, a.source_id, a.reason), "解除しました（以降、それ以前の失敗は連続失敗に数えません）")
 def _cmd_set_interval(a, ctx): return _simple(
     lambda: ctx.registry.set_interval(a.market, a.source_id, None if a.clear else a.days, a.reason), "取得間隔を更新しました")
+def _cmd_set_cycle_config(a, ctx) -> int:
+    """続き取得の設定（取得先市場×出典種別）。cycle_max_age_days=一巡を放置してよい日数 / overlap_pages=続きの前に取り直す前回の最後のページ数 /
+    max_cycle_restarts=一巡が異常終了したあと先頭から取り直す連続回数の上限。指定した項目だけを更新する（取得間隔などは変えない）。"""
+    from sqlalchemy import text
+
+    cols = {"cycle_max_age_days": a.cycle_max_age_days, "overlap_pages": a.overlap_pages, "max_cycle_restarts": a.max_cycle_restarts}
+    cols = {k: v for k, v in cols.items() if v is not None}
+    if not cols:
+        print("[中止] 更新する項目を指定してください")
+        return 2
+    sets = ", ".join(f"{k} = :{k}" for k in cols)
+    try:
+        with ctx.app_factory.get_session(a.market) as conn, conn.begin():
+            n = conn.execute(text(f"UPDATE acquisition_interval_config SET {sets} WHERE marketplace = :mp AND source_type = :t"),
+                             {**cols, "mp": a.market, "t": a.type}).rowcount
+    except Exception as exc:  # noqa: BLE001 - CHECK制約の範囲外など
+        print(f"[中止] 更新できません（範囲外の値の可能性）: {type(exc).__name__}")
+        return 2
+    print(f"{a.market}/{a.type} の続き取得の設定を更新しました: {cols}" if n else "[中止] 該当する設定がありません")
+    return 0 if n else 2
+
+
 def _cmd_abort_run(a, ctx): return _simple(lambda: ctx.runs.abort_run(a.market, a.run_id, a.reason), "中断として確定しました（USER_ABORT。連続失敗には数えません）")
 
 
@@ -498,6 +520,11 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--days", type=int)
     g.add_argument("--clear", action="store_true")
     sp.add_argument("--reason", required=True)
+    sp = add("set-cycle-config", _cmd_set_cycle_config, "続き取得の設定（一巡の放置期限・重なり確認のページ数・取り直しの上限）を更新する")
+    sp.add_argument("--type", required=True, choices=["SELLER", "BRAND_NAME", "BRAND_STORE", "KEYWORD"])
+    sp.add_argument("--cycle-max-age-days", type=int, default=None, help="既定14（1〜365）")
+    sp.add_argument("--overlap-pages", type=int, default=None, help="既定1（0〜3。0=重なり確認なし）")
+    sp.add_argument("--max-cycle-restarts", type=int, default=None, help="既定2（1〜10）")
     sp = add("abort-run", _cmd_abort_run, "新方式の実行を人が中断として確定する（旧経路の行は対象外）")
     sp.add_argument("--run-id", required=True, type=int)
     sp.add_argument("--reason", required=True)
@@ -556,7 +583,16 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None, ctx_factory: Callable[[], Context] | None = None) -> int:
     args = build_parser().parse_args(argv)
     ctx = (ctx_factory or _make_context)()
-    return args.func(args, ctx)
+    try:
+        return args.func(args, ctx)
+    except Exception as exc:  # noqa: BLE001 - 未適用のマイグレーションは案内して終了
+        from db.schema_guard import explain
+
+        msg = explain(exc)
+        if msg is None:
+            raise
+        print(f"[中止] {msg}")
+        return 2
 
 
 if __name__ == "__main__":

@@ -53,6 +53,12 @@ RUN_TYPE = {
 }
 
 
+# 次ページ位置を信頼できなくなった理由（一巡をBROKENにする。正常な完了・正常な0件にはしない）。CAPTCHA・5xx・読み込み失敗は
+# 一時的な失敗なので含めない（位置は保存済みの最後のページのまま、一巡はOPENで残る）。
+BROKEN_CODES = frozenset({"CURSOR_INVALID", "REVISITED_URL", "EMPTY_PAGE_AFTER_RESULTS", "CURSOR_LOOP", "REPEATED_PAGE",
+                          "NO_NEW_ASINS_LOOP", "OVERLAP_MISMATCH"})
+
+
 class LeaseLost(Exception):
     """lease が失効・回収済み、またはトークン不一致。この実行はこれ以上何も書いてはならない。"""
 
@@ -64,6 +70,16 @@ class NotEligible(Exception):
 
 
 @dataclass(frozen=True)
+class PageCursor:
+    """1ページ保存した時点の再開位置。ASINの保存と同じトランザクションで書く。"""
+    next_url: str | None
+    next_page_no: int | None
+    last_page_url: str
+    last_page_signature: str
+    last_page_asins: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class Claim:
     run_id: int
     token: str
@@ -71,6 +87,16 @@ class Claim:
     marketplace: str
     lease_seconds: int
     captcha_lease_seconds: int
+    # --- 続き取得（claim時にDBの状態から決まる）---
+    plan: str = "FRESH"                 # FRESH / CONTINUE / RESTART_EXPIRED / RESTART_BROKEN
+    cycle_id: int | None = None
+    cycle_seq: int | None = None
+    resume_url: str | None = None       # CONTINUE: 続きの開始位置
+    resume_page_no: int | None = None
+    last_page_url: str | None = None    # CONTINUE: 重なり確認で取り直す、最後に保存したページ
+    last_page_signature: str | None = None
+    last_page_asins: tuple[str, ...] | None = None
+    overlap_pages: int = 0              # CONTINUE: 取り直すページ数（設定。0なら確認しない）
 
 
 def _actor() -> str:
@@ -117,20 +143,38 @@ class AcquisitionRunService:
                 raise NotEligible(decision)
             target = facts.display_primary + (f" [{facts.display_qualifier}]" if facts.display_qualifier else "")
             token = str(uuid.uuid4())
+            plan, cyc = decision.plan or "FRESH", decision.cycle
+            cols = {"cycle_seq": 1, "cycle_id": None, "continues_run_id": None, "supersedes_cycle_id": None, "cycle_start_reason": "FRESH",
+                    "restart_streak": 0, "start_url": None, "start_page_no": None}
+            if plan == "CONTINUE":
+                cols.update(cycle_seq=cyc.last_seq + 1, cycle_id=cyc.cycle_id, continues_run_id=cyc.last_run_id, cycle_start_reason="CONTINUE",
+                            restart_streak=None, start_url=cyc.resume_url, start_page_no=cyc.resume_page_no)
+            elif plan in ("RESTART_EXPIRED", "RESTART_BROKEN"):
+                released = facts.failure_streak_reset_at is not None and cyc.ended_at is not None and facts.failure_streak_reset_at >= cyc.ended_at
+                cols.update(supersedes_cycle_id=cyc.cycle_id, cycle_start_reason=plan,
+                            restart_streak=0 if released else cyc.restart_streak + 1)
             try:
                 run_id = conn.execute(
                     text(
                         "INSERT INTO collector_run (marketplace, run_type, target, status, source_id, attempt_token, "
-                        "heartbeat_at, lease_expires_at, lease_seconds) "
+                        "heartbeat_at, lease_expires_at, lease_seconds, cycle_seq, cycle_id, continues_run_id, supersedes_cycle_id, "
+                        "cycle_start_reason, restart_streak, start_url, start_page_no, cycle_state) "
                         "VALUES (:mp, :rt, :target, 'RUNNING', :sid, CAST(:tok AS uuid), clock_timestamp(), "
-                        "clock_timestamp() + make_interval(secs => :ls), :ls) RETURNING id"
+                        "clock_timestamp() + make_interval(secs => :ls), :ls, :cycle_seq, :cycle_id, :continues_run_id, :supersedes_cycle_id, "
+                        ":cycle_start_reason, :restart_streak, :start_url, :start_page_no, 'OPEN') RETURNING id"
                     ),
                     {"mp": marketplace, "rt": RUN_TYPE[facts.source_type], "target": target, "sid": source_id,
-                     "tok": token, "ls": cfg.lease_seconds},
+                     "tok": token, "ls": cfg.lease_seconds, **cols},
                 ).scalar_one()
             except IntegrityError as exc:
                 raise NotEligible(decide(facts, cfg, db_now(conn))) from exc
-        return Claim(run_id, token, source_id, marketplace, cfg.lease_seconds, cfg.captcha_lease_seconds)
+        cont = plan == "CONTINUE"
+        return Claim(run_id, token, source_id, marketplace, cfg.lease_seconds, cfg.captcha_lease_seconds,
+                     plan=plan, cycle_id=cols["cycle_id"] or (cyc.cycle_id if cont else None), cycle_seq=cols["cycle_seq"],
+                     resume_url=cyc.resume_url if cont else None, resume_page_no=cyc.resume_page_no if cont else None,
+                     last_page_url=cyc.last_page_url if cont else None, last_page_signature=cyc.last_page_signature if cont else None,
+                     last_page_asins=cyc.last_page_asins if cont else None,
+                     overlap_pages=cfg.overlap_pages if cont and cyc.last_page_url else 0)
 
     # ------------------------------------------------------------------ 内部
 
@@ -194,9 +238,11 @@ class AcquisitionRunService:
                 {"ls": claim.lease_seconds, "id": claim.run_id},
             )
 
-    def append_asins(self, claim: Claim, asins: list[str], pages: int = 1) -> int:
+    def append_asins(self, claim: Claim, asins: list[str], pages: int = 1, *, cursor: PageCursor | None = None) -> int:
         """1ページ分のASINを追記する。run行をロックし、leaseが有効なときだけ書く。
-        回収と競合した場合は、回収後なら何も書かずに LeaseLost。"""
+        回収と競合した場合は、回収後なら何も書かずに LeaseLost。
+        cursorを渡すと、**ASINの保存と同じトランザクション**で再開位置（次ページ・最後に保存したページ）を更新する
+        （保存済みのページと再開位置が食い違わない: どちらも書かれる/どちらも書かれない）。"""
         with self._app.get_session(claim.marketplace) as conn, conn.begin():
             row = self._lock_valid_run(conn, claim)
             if asins:
@@ -204,15 +250,59 @@ class AcquisitionRunService:
                     text("INSERT INTO collector_asin (marketplace, collector_run_id, asin) VALUES (:mp, :rid, :asin)"),
                     [{"mp": claim.marketplace, "rid": claim.run_id, "asin": a} for a in asins],
                 )
+            params = {"pages": pages, "n": len(asins), "ls": self._lease_expr(row.status, claim), "id": claim.run_id,
+                      "nu": None, "np": None, "lu": None, "ls2": None, "la": None, "has_cursor": cursor is not None}
+            if cursor is not None:
+                params.update(nu=cursor.next_url, np=cursor.next_page_no, lu=cursor.last_page_url, ls2=cursor.last_page_signature,
+                              la=list(cursor.last_page_asins))
             conn.execute(
                 text(
                     "UPDATE collector_run SET pages_fetched = coalesce(pages_fetched, 0) + :pages, "
                     "asin_count = coalesce(asin_count, 0) + :n, heartbeat_at = clock_timestamp(), "
-                    "lease_expires_at = clock_timestamp() + make_interval(secs => :ls) WHERE id = :id"
+                    "lease_expires_at = clock_timestamp() + make_interval(secs => :ls), "
+                    "next_url = CASE WHEN :has_cursor THEN CAST(:nu AS text) ELSE next_url END, "
+                    "next_page_no = CASE WHEN :has_cursor THEN CAST(:np AS integer) ELSE next_page_no END, "
+                    "last_page_url = CASE WHEN :has_cursor THEN CAST(:lu AS text) ELSE last_page_url END, "
+                    "last_page_signature = CASE WHEN :has_cursor THEN CAST(:ls2 AS char(64)) ELSE last_page_signature END, "
+                    "last_page_asins = CASE WHEN :has_cursor THEN CAST(:la AS text[]) ELSE last_page_asins END "
+                    "WHERE id = :id"
                 ),
-                {"pages": pages, "n": len(asins), "ls": self._lease_expr(row.status, claim), "id": claim.run_id},
+                params,
             )
         return len(asins)
+
+    def set_start(self, claim: Claim, url: str, page_no: int = 1) -> None:
+        """このrunの開始URLを一度だけ記録する（続きのrunは、claim時に前回の位置が入っているので何もしない）。"""
+        with self._app.get_session(claim.marketplace) as conn, conn.begin():
+            self._lock_valid_run(conn, claim)
+            conn.execute(
+                text("UPDATE collector_run SET start_url = :u, start_page_no = :n WHERE id = :id AND start_url IS NULL"),
+                {"u": url, "n": page_no, "id": claim.run_id},
+            )
+
+    def record_overlap(self, claim: Claim, *, ratio: float, drift: bool) -> None:
+        """重なり確認（前回の最後のページの取り直し）の結果。ASINは入れない。取り直したページ数を数える（日次のページ使用量に含める）。"""
+        with self._app.get_session(claim.marketplace) as conn, conn.begin():
+            row = self._lock_valid_run(conn, claim)
+            conn.execute(
+                text(
+                    "UPDATE collector_run SET overlap_pages = coalesce(overlap_pages, 0) + 1, overlap_ratio = :r, "
+                    "drift_detected = coalesce(drift_detected, false) OR :d, heartbeat_at = clock_timestamp(), "
+                    "lease_expires_at = clock_timestamp() + make_interval(secs => :ls) WHERE id = :id"
+                ),
+                {"r": round(ratio, 3), "d": drift, "ls": self._lease_expr(row.status, claim), "id": claim.run_id},
+            )
+
+    def cycle_asins(self, claim: Claim) -> set[str]:
+        """この一巡で既に保存したASIN（続きで同じASINを重ねて保存しない）。"""
+        if claim.cycle_id is None:
+            return set()
+        with self._app.get_session(claim.marketplace) as conn, conn.begin():
+            return {
+                r[0] for r in conn.execute(
+                    text("SELECT ca.asin FROM collector_asin ca JOIN collector_run r ON r.id = ca.collector_run_id "
+                         "WHERE r.cycle_id = :c AND r.source_id = :s"), {"c": claim.cycle_id, "s": claim.source_id})
+            }
 
     def finish(
         self,
@@ -240,32 +330,59 @@ class AcquisitionRunService:
             identity_lock(conn, claim.marketplace, ident.source_type, ident.key_hash.strip())
             conn.execute(text("SELECT 1 FROM acquisition_source WHERE source_id = :id FOR UPDATE"), {"id": claim.source_id})
             self._lock_valid_run(conn, claim)
+            # 一巡の状態: 最後のページまで正常に到達(SUCCESS_NONEMPTY/EMPTY)した時だけCOMPLETE。上限での打切りはOPEN（位置を保存済み）。
+            # 次ページ位置を信頼できない失敗(BROKEN_CODES)はBROKEN。CAPTCHA・5xx・読み込み失敗は一時的なのでOPENのまま（完了にも正常0件にもしない）。
+            # 再開位置を保存していない打切り(SUCCESS_TRUNCATED かつ next_url なし)は CLOSED_NO_CURSOR（続き不可。従来どおり成功扱い）。
+            if outcome in ("SUCCESS_NONEMPTY", "SUCCESS_EMPTY"):
+                cycle_state = "COMPLETE"
+            elif outcome == "SUCCESS_TRUNCATED":
+                cycle_state = "TRUNCATED"
+            elif status == "FAILED" and error_code in BROKEN_CODES:
+                cycle_state = "BROKEN"
+            else:
+                cycle_state = "OPEN"
             conn.execute(
                 text(
                     "UPDATE collector_run SET status = :status, outcome = :outcome, completeness = :comp, "
                     "truncation_reason = :tr, error_code = :ec, error_message = :em, "
                     "pages_fetched = coalesce(:pf, pages_fetched), completed_at = clock_timestamp(), "
-                    "heartbeat_at = clock_timestamp() WHERE id = :id"
+                    "heartbeat_at = clock_timestamp(), "
+                    "cycle_state = CASE WHEN cycle_seq IS NULL THEN NULL WHEN :cs = 'TRUNCATED' THEN "
+                    "(CASE WHEN next_url IS NULL THEN 'CLOSED_NO_CURSOR' ELSE 'OPEN' END) ELSE CAST(:cs AS varchar(16)) END, "
+                    "cursor_error = CASE WHEN cycle_seq IS NULL THEN NULL ELSE CAST(:ce AS varchar(40)) END, "
+                    "next_url = CASE WHEN CAST(:cmp AS boolean) THEN NULL ELSE next_url END, "
+                    "next_page_no = CASE WHEN CAST(:cmp AS boolean) THEN NULL ELSE next_page_no END "
+                    "WHERE id = :id"
                 ),
                 {"status": status, "outcome": outcome, "comp": DEFAULT_COMPLETENESS[outcome], "tr": truncation_reason,
-                 "ec": error_code, "em": error_message, "pf": pages_fetched, "id": claim.run_id},
+                 "ec": error_code, "em": error_message, "pf": pages_fetched, "id": claim.run_id, "cs": cycle_state,
+                 "ce": error_code if cycle_state == "BROKEN" else None, "cmp": cycle_state == "COMPLETE"},
             )
             if status == "FAILED":
                 facts = load_facts(conn, claim.marketplace, [claim.source_id])[0]
                 cfg = load_configs(conn, claim.marketplace)[facts.source_type]
                 decision = decide(facts, cfg, db_now(conn))
-                if decision.should_auto_hold:
-                    detail = (
-                        f"連続{decision.consecutive_failures}回の失敗（最新run={claim.run_id}, outcome={outcome}, "
-                        f"error={error_code or '-'}）。ユーザーの中断・lease失効は数えていません。"
-                        "release-holdで明示的に解除してください"
-                    )
+                restart_limit = facts.status == "ACTIVE" and any(b.code == "CYCLE_RESTART_LIMIT" for b in decision.blockers)
+                if decision.should_auto_hold or restart_limit:
+                    if decision.should_auto_hold:
+                        reason = "AUTO_FAILURES"
+                        detail = (
+                            f"連続{decision.consecutive_failures}回の失敗（最新run={claim.run_id}, outcome={outcome}, "
+                            f"error={error_code or '-'}）。ユーザーの中断・lease失効は数えていません。"
+                            "release-holdで明示的に解除してください"
+                        )
+                    else:  # 一巡が異常終了して先頭から取り直す回数が上限に達した: 同じ状態で先頭から何度も取り直すループを止める
+                        reason = "AUTO_CYCLE_RESTARTS"
+                        detail = (
+                            f"一巡の異常終了（{error_code or '-'}）が続き、先頭からの取り直しが上限（{cfg.max_cycle_restarts}回）に達しました"
+                            f"（最新run={claim.run_id}）。原因を確認し、release-holdで明示的に解除してください"
+                        )
                     conn.execute(
                         text(
-                            "UPDATE acquisition_source SET status = 'ON_HOLD', hold_reason = 'AUTO_FAILURES', "
+                            "UPDATE acquisition_source SET status = 'ON_HOLD', hold_reason = :hr, "
                             "hold_detail = :d, held_at = clock_timestamp() WHERE source_id = :id"
                         ),
-                        {"d": detail, "id": claim.source_id},
+                        {"d": detail, "id": claim.source_id, "hr": reason},
                     )
                     conn.execute(
                         text(

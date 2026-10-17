@@ -23,6 +23,7 @@ heartbeat は別スレッドで続け、CAPTCHAの人の待機中も切らさな
 """
 from __future__ import annotations
 
+import hashlib
 import threading
 import time
 from dataclasses import dataclass, field
@@ -31,7 +32,7 @@ from urllib.parse import quote, quote_plus, urlparse
 
 from sqlalchemy import text
 
-from acquisition.lease import AcquisitionRunService, Claim, LeaseLost
+from acquisition.lease import AcquisitionRunService, Claim, LeaseLost, PageCursor
 from asin_collector.asin_extractor import extract_search_card_asins
 from asin_collector.browser_session import html_is_captcha, html_is_server_error
 from asin_collector.check_recommendations import NO_RESULTS_MARKER, storefront_search_url
@@ -42,6 +43,7 @@ DOMAIN = {"US": "www.amazon.com", "JP": "www.amazon.co.jp"}
 # 「検索結果0件」ウィジェットでの0件判定が実ページで検証済みの種別（docs/DEVIATIONS.md #53）。
 VERIFIED_EMPTY_TYPES = frozenset({"SELLER"})
 _ABSOLUTE_PAGE_LIMIT = 200
+OVERLAP_MIN_RATIO = 0.2  # 重なり確認で、前回の最後のページのASINがこの割合未満しか再び見えないなら、ページ送りの位置を信頼しない（BROKEN）
 
 
 class PageLoadError(Exception):
@@ -85,6 +87,10 @@ class RunReport:
     error_code: str | None = None
     detail: str | None = None
     auto_held: bool = False
+    overlap_pages: int = 0       # 続きの前に取り直したページ数（日次のページ使用量に含める）
+    drift: bool = False          # 重なり確認で、検索結果の変化を検知した（欠落の可能性）
+    plan: str = "FRESH"          # FRESH / CONTINUE / RESTART_*
+    cycle_id: int | None = None
 
 
 @dataclass
@@ -186,7 +192,7 @@ def run_claimed_source(
     limits = limits or RunLimits()
     marketplace = claim.marketplace
     src = load_source(app, marketplace, claim.source_id)
-    report = RunReport(claim.run_id, claim.source_id, "FAILED")
+    report = RunReport(claim.run_id, claim.source_id, "FAILED", plan=claim.plan, cycle_id=claim.cycle_id)
     try:
         with Heartbeat(service, claim, heartbeat_interval) as hb:
             try:
@@ -250,11 +256,39 @@ def _get(service, fetcher, claim, url, limits, sleep, hb, pages_saved: int) -> F
         return page
 
 
+def _signature(cards: list[str]) -> str:
+    return hashlib.sha256("\n".join(cards).encode()).hexdigest()
+
+
 def _crawl(service, fetcher, claim, src, start_url, limits, sleep, hb, report: RunReport) -> tuple[str, str | None]:
+    """ページを辿り、1ページごとに ASINの保存と再開位置の更新を同じトランザクションで行う。
+    続き(CONTINUE)では、前回の最後に保存したページを `overlap_pages` だけ取り直して（ASINは入れない）ページ送りが有効か確認し、
+    保存済みの次ページから続ける。取得済みのASINは重ねて保存しない。ループする次ページ・繰り返すページ・無効な次ページは
+    BROKEN（一巡を完了にも正常な0件にもしない）。検索結果は時間で変わるため、これで欠落が無いとは保証できない（driftとして記録する）。"""
+    continuing = claim.plan == "CONTINUE" and bool(claim.resume_url)
+    seen: set[str] = service.cycle_asins(claim) if continuing else set()
     visited: set[str] = set()
-    seen: set[str] = set()
-    target = start_url
+    target = claim.resume_url if continuing else start_url
+    page_no = (claim.resume_page_no or 1) if continuing else 1
+    if not continuing:
+        service.set_start(claim, start_url, 1)
+    prev_sig = claim.last_page_signature if continuing else None
+    if continuing and claim.overlap_pages > 0 and claim.last_page_url:
+        ov = _get(service, fetcher, claim, claim.last_page_url, limits, sleep, hb, report.pages)
+        cards0 = extract_search_card_asins(ov.html)
+        stored = set(claim.last_page_asins or ())
+        ratio = (len(set(cards0) & stored) / len(stored)) if stored else (1.0 if cards0 else 0.0)
+        drift = ratio < 1.0 or (claim.last_page_signature is not None and _signature(cards0) != claim.last_page_signature)
+        report.overlap_pages += 1
+        service.record_overlap(claim, ratio=ratio, drift=drift)
+        report.drift = report.drift or drift
+        if ratio < OVERLAP_MIN_RATIO:
+            raise _Stop("PARTIAL", "OVERLAP_MISMATCH", f"前回の最後のページを取り直したところ、ASINの重なりが{ratio:.0%}しかありません。ページ送りの位置を信頼できません")
+        visited.add(ov.url)
+    elif continuing and claim.last_page_url:
+        visited.add(claim.last_page_url)
     max_pages = min(limits.max_pages, _ABSOLUTE_PAGE_LIMIT)
+    zero_new = 0
     while True:
         page = _get(service, fetcher, claim, target, limits, sleep, hb, report.pages)
         if page.url in visited:
@@ -264,16 +298,27 @@ def _crawl(service, fetcher, claim, src, start_url, limits, sleep, hb, report: R
         if not cards:
             if report.pages > 0:
                 raise _Stop("PARTIAL", "EMPTY_PAGE_AFTER_RESULTS", "結果の途中で0件のページになりました（想定外）")
+            if continuing:
+                raise _Stop("PARTIAL", "CURSOR_INVALID", "保存した次ページのURLを開いても結果がありません（次ページ位置が無効）。正常な0件・完了とは扱いません")
             if html_has_no_results_widget(page.html) and src.source_type in VERIFIED_EMPTY_TYPES:
                 return "SUCCESS_EMPTY", None
             code = "EMPTY_NOT_VERIFIED_FOR_TYPE" if html_has_no_results_widget(page.html) else "NO_CARDS_NO_WIDGET"
             raise _Stop("UNVERIFIED_EMPTY", code, "0件に見えるが、0件と確認できません（成功に数えません）")
+        sig = _signature(cards)
+        if sig == prev_sig:
+            raise _Stop("PARTIAL", "REPEATED_PAGE", "直前のページと同じ内容が繰り返されました（ページ送りが進んでいません）")
+        prev_sig = sig
         new = [a for a in cards if a not in seen]
+        zero_new = zero_new + 1 if not new else 0
+        if zero_new >= 2:
+            raise _Stop("PARTIAL", "NO_NEW_ASINS_LOOP", "新しいASINが2ページ続けて0件でした（ループの疑い）")
         seen.update(new)
-        service.append_asins(claim, new, pages=1)  # lease・トークンを確認して保存。失効なら LeaseLost
+        nxt = find_next_url(page.html, page.url)
+        cursor = PageCursor(nxt, page_no + 1 if nxt else None, page.url, sig, tuple(cards))
+        service.append_asins(claim, new, pages=1, cursor=cursor)  # lease・トークンを確認し、ASIN保存と再開位置を同じトランザクションで保存
         report.pages += 1
         report.asins += len(new)
-        nxt = find_next_url(page.html, page.url)
+        page_no += 1
         if not nxt:
             return "SUCCESS_NONEMPTY", None
         if report.pages >= max_pages:

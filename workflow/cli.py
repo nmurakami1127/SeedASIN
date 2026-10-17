@@ -58,8 +58,13 @@ def mode_summary(t) -> str:
     elif t.kind in ("acquire", "acquire_x"):
         for r in t.result.get("sources", {}).values():
             lab = {"REUSED": "再利用(保存済みの取得結果)", "FETCHED": "新規取得", "HELD": "保留", "CAPTCHA": "待機(CAPTCHA)",
-                   "FAILED": "失敗", "SKIPPED_AT_CLAIM": "スキップ"}.get(r["mode"], r["mode"])
-            add(lab + "・上限打切り" if r.get("truncated") else lab)  # 上限打切りと取得完了を区別する
+                   "FAILED": "失敗", "SKIPPED_AT_CLAIM": "スキップ", "SKIPPED_POLICY": "枝をスキップ(除外/保留/期間内)"}.get(r["mode"], r["mode"])
+            if r["mode"] == "FETCHED":
+                lab += "(続き)" if r.get("plan") == "CONTINUE" else ""
+                lab += "・一巡完了" if r.get("cycle_complete") else "・上限打切り" if r.get("truncated") else ""  # 打切りと取得完了を区別する
+            elif r.get("truncated"):
+                lab += "・上限打切り"
+            add(lab)
     elif t.kind == "submit":
         add("引き継ぎ(既存の対応記録)" if t.result.get("adopted") else "新規投入" if t.result.get("send_started") else "未送信")
     elif t.kind == "expand":
@@ -327,6 +332,14 @@ def main(argv: list[str] | None = None, *, factory=None, ports=None) -> int:
         return 2
     except WorkflowBusy as exc:
         print(f"[中止] {exc}")
+        return 2
+    except Exception as exc:  # noqa: BLE001 - 未適用のマイグレーションは案内して終了（それ以外は通常の例外として送出）
+        from db.schema_guard import explain
+
+        msg = explain(exc)
+        if msg is None:
+            raise
+        print(f"[中止] {msg}")
         return 2
 
 

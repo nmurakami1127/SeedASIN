@@ -132,19 +132,22 @@ class PendingChecker:
             if (self.pm, sid) in self._held_src:
                 continue  # 取得が保留/失敗の冷却中。続きとして選び直さない（他の候補を塞がず、自動保留を迂回しない）
             run = reusable_run(self.e.factory, self.pm, sid, cfg.result_max_age_days)
+            if sid in self._eligible_sources():  # 未取得、または途中の続き(ELIGIBLE_CONTINUATION)・取得間隔後の再取得
+                self.reasons[cand.asin] = f"出典{sid}が取得可能（未取得または続き）"
+                return True
             if run is None:
-                if sid in self._eligible_sources():
-                    self.reasons[cand.asin] = f"出典{sid}が未取得（取得可能）"
-                    return True
-                continue  # 取得間隔内/保留/実行中など。今は進められないので枠を塞がない
+                continue  # 取得間隔内/除外/保留/実行中など。今は進められないので枠を塞がない（状態が変われば次の選択で再評価される）
             try:
-                items, _ = build_items(self.e.factory, self.pm, run["run_id"], out_dir=Path(cfg.submission_dir), max_per_input=cfg.tool_max_asins)
+                items, _ = build_items(self.e.factory, self.pm, run["run_id"], out_dir=Path(cfg.submission_dir), max_per_input=cfg.tool_max_asins,
+                                       ledger=self.e.ledger)
             except SubmissionError:
                 continue
             for it in items:
                 if not any(p.get("direction") == it.direction and p.get("origin_import_id") == self.ln.origin_import for p in it.paths):
                     continue
                 st = self.e.ledger.state(it.key).state
+                if it.repeat_of_earlier_cycle and it.key not in self.e.allowed_repeat_keys():
+                    continue  # 過去の一巡で投入済みのASINの再投入は、明示許可があるまで続きとして数えない（新しいASINを待たせない）
                 if st in ACTIONABLE_STATES and it.key not in self._held and not find_duplicates(self.e.ledger, it):
                     self.reasons[cand.asin] = f"出典{sid}の取得結果に未投入の計画あり"
                     return True

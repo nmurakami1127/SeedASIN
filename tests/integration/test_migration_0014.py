@@ -1,6 +1,6 @@
 """alembic 0014 の検証（実PostgreSQL、使い捨てtest-db）。
 
-- 空DB: conftestの_migrated_schemaがモジュールごとにalembic upgrade headを空DBから実行する（head=0016）
+- 空DB: conftestの_migrated_schemaがモジュールごとにalembic upgrade headを空DBから実行する（head=0017）
   （0001〜0013→0014→0015）。
 - 既存DB: 0013まで戻して既存テーブルにデータを入れ、0014・0015だけを適用して無傷を確認する。
 - 0015（DEACTIVATEDイベント種別・理由必須CHECK）: 0014適用済みDBへの追加適用、再実行、downgradeを確認する。
@@ -47,7 +47,7 @@ def test_fresh_build_creates_tables_rls_policies_grants_and_views(superuser_url)
     engine = create_engine(superuser_url)
     with engine.connect() as conn:
         assert _tables(conn) == set(INCREMENTAL_RLS_TABLES)
-        assert conn.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0016"
+        assert conn.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0017"
         rls = {
             r[0]: r[1]
             for r in conn.execute(
@@ -149,7 +149,7 @@ def test_existing_db_path_preserves_data_and_downgrade_roundtrip(superuser_url, 
     _alembic(superuser_url, "upgrade", "head")  # 既存DBへ0014だけを適用
     with engine.connect() as conn:
         assert _tables(conn) == set(INCREMENTAL_RLS_TABLES)
-        assert conn.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0016"
+        assert conn.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0017"
         assert conn.execute(text("SELECT count(*) FROM known_seller_master WHERE seller_id='SENTINEL_MIG_0014'")).scalar_one() == 1
         assert conn.execute(text("SELECT count(*) FROM tool_execution_link WHERE tool_run_id='SENT-0014'")).scalar_one() == 1
     with engine.begin() as conn:
@@ -239,7 +239,7 @@ def test_0015_downgrade_keeps_events_as_superseded_and_reupgrades(superuser_url)
                 )
     _alembic(superuser_url, "upgrade", "head")
     with engine.begin() as conn:
-        assert conn.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0016"
+        assert conn.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0017"
         conn.execute(text("DELETE FROM business_report_import_event WHERE actor='mig'"))
         conn.execute(text("DELETE FROM business_report_import WHERE source_path='m.csv'"))
         conn.execute(text("DELETE FROM import_run_history WHERE import_run_id='US-BUSINESS_REPORT-m15-0001'"))

@@ -473,3 +473,122 @@ def test_stop_command_only_acts_when_a_run_is_active(app_role_factory, tmp_path,
     with WorkflowStore(sd).engine_lock("watch"):
         assert wcli.main(["stop", "--state-dir", str(sd)]) == 0
         assert (sd / "stop.request").exists()
+
+
+# ---------------------------------------------------------------- 除外・保留の枝で探索を止めない／除外の解除で再評価
+
+def _exclude_sellers(env, asins, registry):
+    sids = {}
+    for a in asins:
+        rp = registry.register_path("US", "SELLER", env.seller[a], "", origin_import_id=env.import_id, origin_asin=a)
+        registry.set_status("US", rp.source.source_id, "EXCLUDED", "テスト: 永久除外")
+        sids[a] = rp.source.source_id
+    return sids
+
+
+def test_excluded_branches_are_skipped_without_retry_and_the_search_moves_on_to_zero_unit_candidates(app_role_factory, tmp_path, own, ranked_rows):
+    from acquisition.registry import SourceRegistry
+
+    r = ranked_rows
+    env = Env(app_role_factory, tmp_path, r["rows"])
+    _exclude_sellers(env, [r["o1"], r["o2"], r["o3"]], SourceRegistry(app_role_factory, actor="tester"))  # 注文あり候補の出品者は全て除外
+    picked, first = [], None
+    for i in range(4):
+        eng = env.run()
+        picked += [p["asin"] for p in eng.st.tasks["discover:US"].result["selection"]["picked"]]
+        first = first or eng
+    assert picked == [r["o2"], r["o1"], r["o3"], r["z2"]]  # 注文ありの枝が全て除外 → 注文0点の次候補へ進む
+    acq = first.st.tasks["acquire:US"]
+    assert acq.status == "SKIPPED" and acq.retry_after == "" and "枝" in acq.detail          # 保留/失敗でも完了成功でもない（枝の状態）
+    assert acq.result["branches"]["permanent"] == 1 and list(acq.result["sources"].values())[0]["mode"] == "SKIPPED_POLICY"
+    assert wcli.overall(first.st) == "COMPLETED"                                              # 他の候補を処理でき、workflowは止まらない
+    assert not any(env.seller[a] in u for a in (r["o1"], r["o2"], r["o3"]) for u in env.routing.urls)  # 除外した出品者のページは取得しない
+    assert env.tool.submits == 1                                                               # 注文0点の候補だけが投入された
+    # watchは除外の枝を30分ごとに再試行しない
+    w = make_watcher(env, env.clock, [])
+    assert not w._due(first.st)
+    assert env.engine().usage.used().get("pages", 0) == 4 + 1  # 商品ページ4 + 注文0点の出品者の取得1ページ（除外の枝は0）
+
+
+def test_released_exclusion_is_reevaluated_from_state_and_the_branch_resumes_without_refetching_the_product_page(app_role_factory, tmp_path, own, ranked_rows):
+    from acquisition.registry import SourceRegistry
+
+    r = ranked_rows
+    reg = SourceRegistry(app_role_factory, actor="tester")
+    env = Env(app_role_factory, tmp_path, r["rows"][:1])
+    sids = _exclude_sellers(env, [r["o1"]], reg)
+    first = env.run()
+    assert statuses(first)["acquire:US"] == "SKIPPED" and env.tool.submits == 0
+    n_pages = len(env.product_asins_fetched())
+    assert env.engine().origin_selection("US", DiscoveryLimits(1, 3, 1, 3)).selected == []  # 除外中: 枝は進められないので候補にならない
+    reg.release("US", sids[r["o1"]], "除外を解除した")
+    sel = env.engine().origin_selection("US", DiscoveryLimits(1, 3, 1, 3))
+    assert [(p.asin, p.mode) for p in sel.selected] == [(r["o1"], "REUSE")]  # 状態から再評価され、保存済みの調査結果から続きとして選ばれる
+    second = env.run()
+    assert env.product_asins_fetched()[n_pages:] == [] and statuses(second)["acquire:US"] == "DONE" and env.tool.submits == 1
+
+
+# ---------------------------------------------------------------- 続き取得のworkflow統合（overlapを日次使用量に含める・差分投入）
+
+def test_continuation_runs_through_the_workflow_counts_overlap_pages_and_submits_only_new_asins(app_role_factory, tmp_path, own, ranked_rows):
+    r = ranked_rows
+    env = Env(app_role_factory, tmp_path, r["rows"][:1],
+              cfg_extra={"daily": {"max_pages": 100, "max_new_submissions_per_direction": 10}, "limits": {"pages_per_source": 2}})
+    seller = env.seller[r["o1"]]
+    env.routing.seller_pages[seller] = [[asin10() for _ in range(3)] for _ in range(5)]  # 5ページ × 3 = 15 ASIN
+    all_asins = [a for pg in env.routing.seller_pages[seller] for a in pg]
+    w1 = env.run()
+    u1 = usage(w1.st)
+    assert u1["pages"] == 1 + 2 and w1.st.tasks["acquire:US"].result["sources"][next(iter(w1.st.tasks["acquire:US"].result["sources"]))]["truncated"]
+    w2 = env.run()  # 次の候補ではなく、保存済みの調査結果の続き（打切りの続き）を処理する
+    rec2 = next(iter(w2.st.tasks["acquire:US"].result["sources"].values()))
+    assert rec2["plan"] == "CONTINUE" and rec2["overlap_pages"] == 1 and rec2["pages"] == 2 and not env.product_asins_fetched()[1:]
+    assert usage(w2.st)["pages"] == 0 + 2 + 1  # 商品ページは再取得せず、新しい2ページ + 重なり確認の1ページ（日次使用量に含める）
+    assert env.engine().usage.used()["pages"] == 3 + 3  # 日次使用量: 1回目 商品1+2、2回目 新規2+重なり確認1
+    w3 = env.run()
+    rec3 = next(iter(w3.st.tasks["acquire:US"].result["sources"].values()))
+    assert rec3["outcome"] == "SUCCESS_NONEMPTY" and rec3["cycle_complete"] and not rec3["truncated"]  # 最後のページまで到達 = 一巡完了
+    assert (rec3["pages"], rec3["overlap_pages"], usage(w3.st)["pages"]) == (1, 1, 2)  # 4ページ目の確認 + 5ページ目
+    items = [t for w in (w1, w2, w3) for t in submit_tasks(w)]
+    assert len(items) == 3 and len({t.result["key"] for t in items}) == 3 and env.tool.submits == 3  # 同じASINの再送なし
+    sent = []
+    from tool_submission.ledger import SubmissionLedger
+
+    led = SubmissionLedger(tmp_path / "sub" / "ledger.jsonl")
+    for t in items:
+        sent += [x for x in __import__("pathlib").Path(led.state(t.result["key"]).manifest["input_file"]).read_text(encoding="utf-8").split() if x]
+    assert sorted(sent) == sorted(all_asins) and len(sent) == len(set(sent)) == 15  # 全期間で15件を1回ずつ
+    assert wcli.overall(w3.st) == "COMPLETED"
+    # 一巡完了後は30日間隔。同じ出典は続きも再取得もされず、次の候補も無いので何もしない
+    env.ports.forbid_all = True
+    sel = env.engine().origin_selection("US", DiscoveryLimits(1, 3, 1, 3))
+    assert sel.selected == [] and len(sel.done) == 1
+
+
+def test_repeat_input_is_held_until_explicitly_allowed_while_new_asins_are_submitted_first(app_role_factory, tmp_path, own, ranked_rows):
+    from acquisition.registry import SourceRegistry
+    from tests.integration.test_submission_delta import phantom
+    from tool_submission.ledger import SubmissionLedger
+
+    r = ranked_rows
+    env = Env(app_role_factory, tmp_path, r["rows"][:1], cfg_extra={"totals": {"max_new_submissions_per_direction": 5}})
+    seller = env.seller[r["o1"]]
+    env.routing.seller_pages[seller] = [[asin10() for _ in range(3)]]
+    rp = SourceRegistry(app_role_factory, actor="tester").register_path("US", "SELLER", seller, "", origin_import_id=env.import_id, origin_asin=r["o1"])
+    asins = env.routing.seller_pages[seller][0]
+    ledger = SubmissionLedger(tmp_path / "sub" / "ledger.jsonl")
+    phantom(ledger, tmp_path, "k_old_cycle", run_id=77, source_id=rp.source.source_id, source_key=seller, cycle_key="legacy:run77", asins=asins[:2],
+            events=("SUBMIT_STARTED", ("RUN_IDENTIFIED", {"tool_run_id": "7000001"}), "MEMO_SAVED", "LINKED"))  # 過去の別の一巡で、2件を投入済み
+    # （結果不明の投入が残っている間は、実行IDの特定を曖昧にしないため、ASINの内容に関係なく新しい送信自体を既存の規則で保留する）
+    eng = env.run()
+    subs = {t.result["repeat"]: t for t in submit_tasks(eng)}
+    assert subs[False].status == "DONE" and subs[False].result["asin_count"] == 1  # 新しい1件は、過去の2件の判断を待たずに投入される
+    assert subs[True].status == "HELD" and "重複候補" in subs[True].detail and subs[True].result["asin_count"] == 2
+    assert env.tool.submits == 1
+    key = subs[True].result["key"]
+    eng2 = env.engine()
+    eng2.st = WorkflowStore(env.cfg.state_dir).load(eng.st.workflow_id)
+    eng2.st.allow_duplicates.append(key)  # 意図した再投入として明示許可
+    eng2.prepare_resume()
+    eng2.drive()
+    assert next(t for t in submit_tasks(eng2) if t.result["repeat"]).status == "DONE" and env.tool.submits == 2

@@ -41,6 +41,9 @@ class Config:
     max_consecutive_failures: int = 3
     lease_seconds: int = 300
     captcha_lease_seconds: int = 1800
+    cycle_max_age_days: int = 14   # 続き取得の一巡を放置してよい期間（超えたら新しい一巡へ）
+    overlap_pages: int = 1         # 続きの前に取り直す「前回の最後のページ」の数（ページ送りの有効性の確認）
+    max_cycle_restarts: int = 2    # 一巡が異常終了（BROKEN/期限切れ）したあと、先頭から取り直す連続回数の上限
 
 
 @dataclass(frozen=True)
@@ -52,6 +55,64 @@ class RunFact:
     lease_expires_at: datetime | None
     interrupt_kind: str | None = None
     completeness: str | None = None
+    # --- 続き取得（cycle。旧方式の行は全てNone）---
+    cycle_id: int | None = None
+    cycle_seq: int | None = None
+    cycle_state: str | None = None          # OPEN / COMPLETE / BROKEN
+    supersedes_cycle_id: int | None = None
+    cycle_start_reason: str | None = None
+    restart_streak: int | None = None
+    start_url: str | None = None
+    start_page_no: int | None = None
+    next_url: str | None = None
+    next_page_no: int | None = None
+    last_page_url: str | None = None
+    last_page_signature: str | None = None
+    last_page_asins: tuple[str, ...] | None = None
+
+
+@dataclass(frozen=True)
+class CycleView:
+    """出典の「最新の一巡」を、複数のrunから決定的に解決した結果（cycle_idが最大の一巡、その中でcycle_seqが最大のrun）。"""
+    cycle_id: int
+    first_run_id: int
+    last_run_id: int
+    last_seq: int
+    state: str                       # OPEN / COMPLETE / BROKEN / EXPIRED（OPENのまま期限切れ）/ RUNNING
+    resume_url: str | None           # 続きの開始位置（保存済みの最後のページの次。1ページも無ければ、そのrunの開始URL）
+    resume_page_no: int | None
+    last_page_url: str | None        # 重なり確認（overlap）で取り直す、最後に保存したページ
+    last_page_signature: str | None
+    last_page_asins: tuple[str, ...] | None
+    ended_at: datetime | None
+    restart_streak: int              # この一巡の最初のrunに記録された「異常終了後の取り直しの連続回数」
+    has_pages: bool = False          # この一巡で1ページでも保存済みか（保存が無い一巡は、続きではなく「やり直し」と同じ扱い）
+
+
+def resolve_cycle(runs: list["RunFact"], as_of: datetime, cfg: "Config") -> CycleView | None:
+    """純粋関数。cycle_idを持つrunが無ければNone（旧方式の出典）。
+    決定規則: 最新の一巡 = cycle_idが最大。その一巡の最後のrun = cycle_seqが最大。状態は最後のrunのcycle_state。
+    OPENで最後のrunの終了から cycle_max_age_days を超えていればEXPIRED（COMPLETEにはしない）。"""
+    cyc = [r for r in runs if r.cycle_id is not None]
+    if not cyc:
+        return None
+    cid = max(r.cycle_id for r in cyc)
+    mine = sorted((r for r in cyc if r.cycle_id == cid), key=lambda r: r.cycle_seq)
+    first, last = mine[0], mine[-1]
+    active = [r for r in mine if r.status in ("RUNNING", "CAPTCHA_WAIT") and r.lease_expires_at is not None and r.lease_expires_at > as_of]
+    state = last.cycle_state or "OPEN"
+    if state == "CLOSED_NO_CURSOR":
+        state = "COMPLETE"   # 再開位置が無いので続きではない。取得間隔の扱いは_counts_as_successが従来どおり判定する
+    if active:
+        state = "RUNNING"
+    elif state == "OPEN" and last.completed_at is not None and as_of - last.completed_at > timedelta(days=cfg.cycle_max_age_days):
+        state = "EXPIRED"
+    page = next((r for r in reversed(mine) if r.last_page_url), None)
+    url = last.next_url or last.start_url
+    page_no = last.next_page_no if last.next_url else last.start_page_no
+    return CycleView(cid, first.run_id, last.run_id, last.cycle_seq, state, url, page_no,
+                     page.last_page_url if page else None, page.last_page_signature if page else None,
+                     page.last_page_asins if page else None, last.completed_at, first.restart_streak or 0, page is not None)
 
 
 @dataclass
@@ -98,6 +159,9 @@ class Decision:
     running_run_id: int | None
     expired_run_ids: list[int]
     should_auto_hold: bool
+    cycle: CycleView | None = None
+    plan: str | None = None    # FRESH / CONTINUE / RESTART_EXPIRED / RESTART_BROKEN（実行できる場合の始め方）
+    overlap_pages: int = 0     # 続き取得で、前回の最後のページを取り直す数（日次のページ使用量に含める）
 
     @property
     def eligible(self) -> bool:
@@ -106,6 +170,11 @@ class Decision:
 
 def _counts_as_success(run: RunFact, cfg: Config) -> bool:
     if run.status != "COMPLETED" or run.completed_at is None:
+        return False
+    if run.cycle_id is not None and run.cycle_state in ("OPEN", "BROKEN"):
+        # 続き取得の対象の行: 一巡の途中（OPEN。打切りで続きあり）や、位置を信頼できない(BROKEN)ものは、取得間隔（30日）の起点に数えない。
+        # 最後のページまで正常に到達した一巡（COMPLETE）と、再開位置なしで打ち切った成功（CLOSED_NO_CURSOR。従来どおりの扱い）だけが、
+        # 以下の結果ごとの規則（設定）で数えられる。
         return False
     if run.outcome == "SUCCESS_NONEMPTY":
         return True
@@ -182,6 +251,18 @@ def decide(facts: SourceFacts, cfg: Config, as_of: datetime) -> Decision:
             )
             break
 
+    # --- 続き取得（最新の一巡の状態）---
+    cyc = resolve_cycle(facts.runs, as_of, cfg)
+    plan = "FRESH"
+    if cyc is not None:
+        plan = {"OPEN": "CONTINUE", "EXPIRED": "RESTART_EXPIRED", "BROKEN": "RESTART_BROKEN", "COMPLETE": "FRESH", "RUNNING": None}[cyc.state]
+    if plan in ("RESTART_EXPIRED", "RESTART_BROKEN") and cyc.restart_streak + 1 > cfg.max_cycle_restarts \
+            and (facts.failure_streak_reset_at is None or cyc.ended_at is None or facts.failure_streak_reset_at < cyc.ended_at):
+        blockers.append(Blocker(
+            "CYCLE_RESTART_LIMIT",
+            f"一巡が異常終了（{cyc.state}）して先頭から取り直す回数が上限（{cfg.max_cycle_restarts}回）に達しています。"
+            "原因を確認し、release-holdで明示的に解除してください（同じ状態で先頭から何度も取り直すループを防ぐ）"))
+
     # --- 取得間隔 ---
     counted = [r for r in facts.runs if _counts_as_success(r, cfg)]
     last_run = max(counted, key=lambda r: r.completed_at) if counted else None
@@ -191,7 +272,8 @@ def decide(facts: SourceFacts, cfg: Config, as_of: datetime) -> Decision:
         if ts is not None and (gate_at is None or ts > gate_at):
             gate_at, gate_basis = ts, basis
     due_at = gate_at + interval if gate_at is not None else None
-    if due_at is not None and as_of < due_at:
+    continuing = plan == "CONTINUE" and cyc is not None and cyc.has_pages
+    if due_at is not None and as_of < due_at and not continuing:  # 保存済みのページがある途中の継続取得には30日の待機を適用しない（他の判定は全て通す）
         blockers.append(
             Blocker(
                 "TOO_RECENT",
@@ -226,6 +308,10 @@ def decide(facts: SourceFacts, cfg: Config, as_of: datetime) -> Decision:
 
     if blockers:
         state = blockers[0].code
+    elif continuing:
+        state = "ELIGIBLE_CONTINUATION"
+    elif plan in ("RESTART_EXPIRED", "RESTART_BROKEN"):
+        state = "ELIGIBLE_RESTART"
     else:
         state = "ELIGIBLE_NEVER" if gate_at is None else "ELIGIBLE_REFETCH"
     return Decision(
@@ -243,6 +329,9 @@ def decide(facts: SourceFacts, cfg: Config, as_of: datetime) -> Decision:
         running_run_id=running_run_id,
         expired_run_ids=expired_run_ids,
         should_auto_hold=(facts.status == "ACTIVE" and consecutive_failures >= cfg.max_consecutive_failures),
+        cycle=cyc,
+        plan=plan,
+        overlap_pages=cfg.overlap_pages if continuing and cyc.last_page_url else 0,
     )
 
 
@@ -254,7 +343,8 @@ def load_configs(conn: Connection, marketplace: str) -> dict[str, Config]:
     rows = conn.execute(
         text(
             "SELECT source_type, min_interval_days, empty_counts_as_success, truncated_counts_as_success, "
-            "retry_cooldown_minutes, max_consecutive_failures, lease_seconds, captcha_lease_seconds "
+            "retry_cooldown_minutes, max_consecutive_failures, lease_seconds, captcha_lease_seconds, "
+            "cycle_max_age_days, overlap_pages, max_cycle_restarts "
             "FROM acquisition_interval_config WHERE marketplace = :mp"
         ),
         {"mp": marketplace},
@@ -263,6 +353,7 @@ def load_configs(conn: Connection, marketplace: str) -> dict[str, Config]:
         r.source_type: Config(
             r.min_interval_days, r.empty_counts_as_success, r.truncated_counts_as_success,
             r.retry_cooldown_minutes, r.max_consecutive_failures, r.lease_seconds, r.captcha_lease_seconds,
+            r.cycle_max_age_days, r.overlap_pages, r.max_cycle_restarts,
         )
         for r in rows
     }
@@ -293,14 +384,19 @@ def load_facts(conn: Connection, marketplace: str, source_ids: Iterable[int] | N
     run_where = " AND source_id = ANY(:ids)" if ids is not None else ""
     for r in conn.execute(
         text(
-            "SELECT source_id, id, status, outcome, completed_at, lease_expires_at, interrupt_kind, completeness "
+            "SELECT source_id, id, status, outcome, completed_at, lease_expires_at, interrupt_kind, completeness, "
+            "cycle_id, cycle_seq, cycle_state, supersedes_cycle_id, cycle_start_reason, restart_streak, start_url, start_page_no, "
+            "next_url, next_page_no, last_page_url, last_page_signature, last_page_asins "
             f"FROM collector_run WHERE source_id IS NOT NULL{run_where} ORDER BY id"
         ),
         params,
     ):
         if r.source_id in facts:
             facts[r.source_id].runs.append(
-                RunFact(r.id, r.status, r.outcome, r.completed_at, r.lease_expires_at, r.interrupt_kind, r.completeness)
+                RunFact(r.id, r.status, r.outcome, r.completed_at, r.lease_expires_at, r.interrupt_kind, r.completeness,
+                        r.cycle_id, r.cycle_seq, r.cycle_state, r.supersedes_cycle_id, r.cycle_start_reason, r.restart_streak,
+                        r.start_url, r.start_page_no, r.next_url, r.next_page_no, r.last_page_url, r.last_page_signature,
+                        tuple(r.last_page_asins) if r.last_page_asins is not None else None)
             )
     blocked = {
         row.seller_id.strip().upper(): row.reason

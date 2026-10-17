@@ -179,8 +179,8 @@ def test_unverified_empty_is_never_a_success(app_role_factory, registry, runs, r
 
 # ---------------------------------------------------------------- 上限・部分・失敗
 
-@pytest.mark.parametrize("counts,expected", [(True, "TOO_RECENT"), (False, "ELIGIBLE_NEVER")])
-def test_page_limit_truncates_and_follows_the_truncated_setting(app_role_factory, registry, runs, restore_config, counts, expected):
+@pytest.mark.parametrize("counts,expected", [(True, "ELIGIBLE_CONTINUATION"), (False, "ELIGIBLE_CONTINUATION")])
+def test_page_limit_truncates_and_keeps_the_resume_position_so_the_interval_is_not_started(app_role_factory, registry, runs, restore_config, counts, expected):
     cfg(app_role_factory, "US", "SELLER", truncated_counts_as_success=counts)
     src = new_source(registry, "US")
     f = FakeFetcher(results(["B000000001"], "https://www.amazon.com/s?p=2"), results(["B000000002"], "https://www.amazon.com/s?p=3"))
@@ -190,6 +190,16 @@ def test_page_limit_truncates_and_follows_the_truncated_setting(app_role_factory
     assert (row.status, row.outcome, row.completeness) == ("COMPLETED", "SUCCESS_TRUNCATED", "TRUNCATED")
     with app_role_factory.get_session("US") as conn, conn.begin():
         assert conn.execute(text("SELECT truncation_reason FROM collector_run WHERE id = :i"), {"i": claim.run_id}).scalar_one() == "PAGE_LIMIT"
+    # 次ページ位置を保存した打切りは「一巡の途中(OPEN)」なので、30日間隔の起点にならず、続きを取得できる（truncated_counts_as_successは適用しない）
+    assert decision(app_role_factory, "US", src.source_id).state == expected
+
+
+@pytest.mark.parametrize("counts,expected", [(True, "TOO_RECENT"), (False, "ELIGIBLE_NEVER")])
+def test_truncated_without_a_resume_position_still_follows_the_truncated_setting(app_role_factory, registry, runs, restore_config, counts, expected):
+    cfg(app_role_factory, "US", "SELLER", truncated_counts_as_success=counts)
+    src = new_source(registry, "US")
+    c = runs.claim("US", src.source_id)
+    runs.finish(c, "SUCCESS_TRUNCATED", truncation_reason="PAGE_LIMIT", pages_fetched=2)  # 再開位置を保存していない打切り（旧来の扱い）
     assert decision(app_role_factory, "US", src.source_id).state == expected
 
 
@@ -295,7 +305,7 @@ def test_ctrl_c_is_an_interrupt_that_is_not_counted_as_a_failure(app_role_factor
     assert (row.status, row.outcome, row.interrupt_kind) == ("INTERRUPTED", "INTERRUPTED", "USER")
     assert collected(app_role_factory, "US", claim.run_id) == ["B000000001"]
     d = decision(app_role_factory, "US", src.source_id)
-    assert d.consecutive_failures == 0 and d.state == "ELIGIBLE_NEVER"  # 中断は失敗に数えず、自動保留もしない
+    assert d.consecutive_failures == 0 and d.state == "ELIGIBLE_CONTINUATION"  # 中断は失敗に数えず、自動保留もしない（保存済みのページの次から続けられる）
 
 
 def test_a_run_that_lost_its_lease_writes_nothing_more_and_cannot_finish(app_role_factory, registry, runs):

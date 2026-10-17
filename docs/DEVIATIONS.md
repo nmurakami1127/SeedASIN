@@ -1176,3 +1176,42 @@ PERMANENTLY_EXCLUDEDは引き続き完全除外のまま変更しない。
 - **今回の確認で行われなかったこと（実画面で未検証のまま）**: 統合ツールのログイン待ち、実Amazonでのcaptcha、新規の投入（SAVE・実行ID特定・メモ保存・対応記録）、ログ300件の保全チェックの実動作。新しい取得対象（取得可能な新規出典）が1サイクルでは出なかったため。次の1〜2サイクルで確認する。
 - 追加実装: `workflow.cli stop`（安全な区切りでの停止依頼。`stop.request`）。
 - 続き取得の具体設計: `docs/continuation_fetch_design.md`（スキーマ変更案。未適用）。
+
+
+## 63. 上限で打ち切った出典の続き取得（collector_run の cycle）と、除外・保留の枝で探索を止めない変更（Phase 4, 2026-10-18）
+
+承認済み（2026-10-18）: collector_runへの列追加／`cycle_max_age_days`=14日／`overlap_pages`=1／同じ出典・業務方向での投入差分管理／次ページ位置のない旧run（82・83等）は再開不可で、既存履歴と30日制限は変更しない。設計の経緯は `docs/continuation_fetch_design.md`。
+**実DBへのマイグレーション適用と実地取得は、この変更では行っていない（test-dbのみで検証）。**
+
+**1. 除外・保留の枝で探索を止めない（先に直した点）**
+- 出典が `PERMANENTLY_EXCLUDED`・`ON_HOLD`・旧証拠・取得間隔内（30日）のとき、acquireの枝は `SKIPPED_POLICY` として記録する（`mode`・理由・`permanent`・再評価の目安時刻）。**保留を完了成功に書き換えず**、タスクは `SKIPPED`（全ての枝がこれで、使える取得結果が無い場合）になる。`retry_after`を付けないので、watchは30分ごとに再試行しない（source15のような永久除外は自動再試行の対象外）。他の候補・注文0点の次候補の処理は止まらない。
+- 除外・保留は毎回DBの状態から評価し直す。解除（`registry.release`等）されれば、起点が「取得可能な出典あり」として次の候補選択で続きに選ばれ、商品ページを取り直さずに取得へ進む。除外・保留中の出典の過去の取得結果は使わない。
+- 一時的な理由（実行中・失敗の冷却・日次上限）は従来どおり `HELD`（再試行時刻つき）。
+
+**2. DB（マイグレーション0017。`alembic/versions/0017_collector_run_cycles.py`）**
+- `collector_run` に列を追加: `cycle_id / cycle_seq / continues_run_id / supersedes_cycle_id / cycle_start_reason / restart_streak / start_url / start_page_no / next_url / next_page_no / last_page_url / last_page_signature / last_page_asins / cycle_state / overlap_pages / overlap_ratio / drift_detected / cursor_error`。`acquisition_interval_config` に `cycle_max_age_days(14) / overlap_pages(1) / max_cycle_restarts(2)`。既存行は全てNULL/既定値のまま（書き換えない）。
+- `cycle_state`: `OPEN`（続きあり・実行中・一時的な失敗）/ `COMPLETE`（最後のページまで正常に到達）/ `BROKEN`（次ページ位置を信頼できない）/ `CLOSED_NO_CURSOR`（再開位置を保存していない打切り。従来どおりの成功扱いで続き不可）。
+- 制約: 同じ出典・市場・cycleの連鎖（複合外部キー）、1つのrunは1回しか続けられない、1つのcycleは1回しか置き換えられない、`COMPLETE`は正常終了（`SUCCESS_NONEMPTY/EMPTY`）かつ`next_url`なしのときだけ、`BROKEN`は失敗かつ`cursor_error`あり。トリガー: OPENの一巡が残る出典に先頭からの新しい一巡を始められない／COMPLETEの一巡は置き換えられない／置き換えの理由と状態が一致／一巡の識別・開始位置は不変。終了後の行は既存の保護トリガーで書き換え不可（`next_url`等の更新は実行中だけ）。
+- 一巡の最新状態・再開位置は、複数runから決定的に解決（`cycle_id`最大の一巡、その中の`cycle_seq`最大のrun。並び順に依存しない）。
+
+**3. 取得（`acquisition/lease.py`・`asin_collector/source_runner.py`・`acquisition/eligibility.py`）**
+- 1ページごとに、ASIN保存と再開位置（`next_url`・`next_page_no`・最後に保存したページとそのASIN）の更新を**同一トランザクション**で行う。保存直前・直後にプロセスが死んでも、位置と保存済みページは食い違わない（テスト）。
+- 続き: 前回の最後に保存したページを`overlap_pages`だけ取り直して（ASINは入れない）ページ送りを確認 → 保存済みの次ページから。重なりが20%未満なら `OVERLAP_MISMATCH`（BROKEN）。重なりが一部（<100%）なら`drift`として記録して続ける。同じ一巡で保存済みのASINは再保存しない。ループ（`REVISITED_URL`）・繰り返すページ（`REPEATED_PAGE`）・新規0件が2ページ続く（`NO_NEW_ASINS_LOOP`）・続きのURLで結果0件（`CURSOR_INVALID`）は BROKEN。CAPTCHA・5xx・読み込み失敗は一時的な失敗として一巡を`OPEN`のまま残す（完了にも正常な0件にもしない）。
+- 判定: `OPEN`の続きは、除外・保留・旧証拠・冷却・lease・日次上限を通し、**30日待機だけを適用しない**（`ELIGIBLE_CONTINUATION`）。30日間隔の起点は、最後のページへ到達（`COMPLETE`）した時点。`cycle_max_age_days`を超えて放置された一巡は `RESTART_EXPIRED`、BROKENは `RESTART_BROKEN` で新しい一巡（旧cycleは`COMPLETE`にならず、新cycleの`cycle_start_reason`/`supersedes_cycle_id`に理由を記録）。異常終了後の取り直しが`max_cycle_restarts`回に達したら自動保留（`AUTO_CYCLE_RESTARTS`。`release`で解除）して、同じ状態で先頭から何度も取り直すループを止める。
+- 旧方式の行（`cycle_id`なし。run82・83等）は再開できるものとして扱わず、従来の30日制限のまま。30日後は先頭から新しい一巡。
+- 設定: `python -m acquisition.cli set-cycle-config --market US --type SELLER --cycle-max-age-days 14 --overlap-pages 1 --max-cycle-restarts 2`（指定した項目だけ更新）。
+
+**4. 投入差分（`tool_submission/planner.py`）**
+- 同じ出典・業務方向では、同じ一巡で既に投入（送信開始済み・結果不明・未送信の投入計画への予約を含む。`NOT_SUBMITTED`は除く）したASINを再送しない。過去の別の一巡（旧runを含む）で投入済みのASINは、新しいASINとは**別の入力**（`repeat_of_earlier_cycle`・ファイル名`_repeat`）にして、明示許可（`--allow-duplicate`）があるまで保留する（黙って再送もせず、永久に除外もしない）。新しいASINの投入は、repeatの判断を待たずに進む。別の出典・別の業務方向は別に判定。別の出典の入力に同じASINがあれば`also_from`（台帳の入力からの参照情報）に残し、実際の取得記録は`fetched_from`（`collector_asin`）として区別する。**結果不明の投入が台帳に残っている間は、実行IDの特定を曖昧にしないため、ASINの内容に関係なく新しい送信自体を既存の規則で保留する**（変更なし）。
+
+**5. workflow・watch**: 続き（`plan=CONTINUE`）は`acquire`で「新規取得(続き)」「一巡完了／上限打切り」と区別して表示。重なり確認のページも日次のページ使用量・実行全体のページ数に含める。起点の選択（`PendingChecker`）は、取得可能な出典（未取得・続き）がある起点を「続きあり」と見なす。
+
+**6. 実DBへの適用手順（未実施。実DBは現在 `0016`。0017未適用のDBに新しいコードを向けるとCLIが案内して終了する）**
+1. watch・run・resume・取得CLIを止める（`workflow.cli stop` / Ctrl+C）。`exports/workflow/engine.lock` が無いことを確認。
+2. バックアップ: `docker compose exec db pg_dump -U seedasin -Fc seedasin > exports/backups/pre_0017.dump` と `python -m workflow.cli backup --out exports/backups/pre_0017.zip`。
+3. 適用: `$env:SEEDASIN_DATABASE_URL = '<DB所有者の接続文字列>'; alembic upgrade head`（0016→0017。既存行は変更されない）。
+4. 確認: `alembic current`=0017、`SELECT count(*) FROM collector_run` が適用前と同じ、`python -m workflow.cli plan --config config/workflow.json` が動く。
+5. 戻す場合: `alembic downgrade 0016`（行は削除されない。失われるのは0017の追加列の値だけ）。その場合、コードも0017より前のコミットに戻すこと。
+6. 初回の続き取得の試行案は最終報告を参照。
+
+**7. 検証**: test-dbで全テスト成功（空DB・0016からの移行・0017のdowngrade/再upgrade・再実行の冪等・既存の取得/発見/投入/workflowテストの維持）。既存の2テストは意図した仕様変更に合わせて更新した（再開位置を保存した打切りは`truncated_counts_as_success`ではなく`ELIGIBLE_CONTINUATION`、中断は続きを取れる）。**未検証**: 実Amazonでの続き取得（ページ送りURLの有効期間、検索結果の変化の大きさ）、実画面での投入、長期運用。

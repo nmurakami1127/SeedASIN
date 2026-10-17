@@ -34,12 +34,51 @@ def _path_dict(p) -> dict:
             "origin_asin": p.origin_asin, "origin_units": p.origin_units, "via_source_id": p.via_source_id, "via_asin": p.via_asin}
 
 
+OCCUPYING = ("PLANNED", "SUBMITTING", "UNKNOWN", "AMBIGUOUS", "RUN_IDENTIFIED", "MEMO_SAVED", "LINKED")  # 未送信の予約・送信開始済み・結果不明を含む
+
+
+def _cycle_key(cycle_id: int | None, run_id: int) -> str:
+    return f"c{cycle_id}" if cycle_id is not None else f"legacy:run{run_id}"
+
+
+def _read_asins(path) -> list[str]:
+    try:
+        return [x.strip().upper() for x in Path(path).read_text(encoding="utf-8").splitlines() if x.strip()]
+    except OSError:
+        return []
+
+
+def _occupancy(ledger: SubmissionLedger | None, run_id: int, source_id: int, direction: str, market: str) -> tuple[dict[str, set[str]], list[dict]]:
+    """台帳から、この出典・業務方向で既に投入（予約・送信開始・結果不明を含む）されたASINを一巡ごとに集める。
+    同じrunの計画は自分自身なので除く。別の出典の同じ方向の入力は、参照情報(also_from)としてASINの重なりだけを数える。"""
+    by_cycle: dict[str, set[str]] = {}
+    others: list[dict] = []
+    if ledger is None:
+        return by_cycle, others
+    for key, st in ledger.all_states().items():
+        m = st.manifest
+        if not m or st.state not in OCCUPYING or m.get("collector_run_id") == run_id or m.get("direction") != direction:
+            continue
+        if m.get("source_id") == source_id and m.get("fetch_market") == market:
+            ck = m.get("cycle_key") or f"legacy:run{m.get('collector_run_id')}"
+            by_cycle.setdefault(ck, set()).update(_read_asins(m.get("input_file", "")))
+        elif m.get("business_market") == BUSINESS_MARKET[direction]:
+            others.append({"key": key, "source_id": m.get("source_id"), "source_key": m.get("source_key"), "run_id": m.get("collector_run_id"),
+                           "state": st.state, "asins": _read_asins(m.get("input_file", ""))})
+    return by_cycle, others
+
+
 def build_items(app: SessionFactory, fetch_market: str, run_id: int, *, out_dir: Path, direction_override: str | None = None,
-                max_per_input: int = MAX_ASINS_PER_INPUT) -> tuple[list[SubmissionItem], list[bytes]]:
-    """計画と、各入力ファイルの内容を返す。書き込みはしない。"""
+                max_per_input: int = MAX_ASINS_PER_INPUT, ledger: SubmissionLedger | None = None) -> tuple[list[SubmissionItem], list[bytes]]:
+    """計画と、各入力ファイルの内容を返す。書き込みはしない。
+    ledgerを渡すと、**同じ出典・業務方向**の投入差分を管理する:
+    - 同じ一巡で既に投入（送信開始済み・結果不明・未送信の投入計画への予約を含む）したASINは、この入力から除く（再送しない）。
+    - 過去の別の一巡で投入済みのASINは、新しいASINとは**別の入力**（repeat_of_earlier_cycle）にして、明示許可があるまで投入しない
+      （黙って再送もしない・永久に除外もしない。新しいASINの投入は、その判断を待たずに進められる）。
+    - 別の出典・別の業務方向は別に判定する。別の出典の入力にも同じASINがある場合は、参照情報(also_from)として残す。"""
     with app.get_session(fetch_market) as conn, conn.begin():
         run = conn.execute(
-            text("SELECT id, marketplace, source_id, status, outcome, truncation_reason, pages_fetched, completed_at "
+            text("SELECT id, marketplace, source_id, status, outcome, truncation_reason, pages_fetched, completed_at, cycle_id "
                  "FROM collector_run WHERE id = :id AND source_id IS NOT NULL"), {"id": run_id}).one_or_none()
         if run is None:
             raise SubmissionError(f"run={run_id} は市場{fetch_market}の出典取得として存在しません")
@@ -66,7 +105,7 @@ def build_items(app: SessionFactory, fetch_market: str, run_id: int, *, out_dir:
         raise SubmissionError(f"出典{src.source_id}の経路に業務方向がありません（手動登録・起点なし）。--direction で明示してください")
     key_name = src.key_primary if src.source_type == "SELLER" else src.display_primary
     partial = run.outcome == "SUCCESS_TRUNCATED"
-    chunks = split_asins(asins, max_per_input)
+    ckey = _cycle_key(run.cycle_id, run_id)
     prior: dict[str, list[str]] = {}
     for d in directions:  # 情報のみ（照合の除外には使わない。除外は送信前のログ一覧の基準）
         with app.get_session(BUSINESS_MARKET[d]) as conn, conn.begin():
@@ -77,11 +116,37 @@ def build_items(app: SessionFactory, fetch_market: str, run_id: int, *, out_dir:
     for d in directions:
         dpaths = [p for p in paths if p.direction == d] or []
         best = max((p for p in dpaths if p.origin_units is not None), key=lambda p: (p.origin_units, p.origin_asin or ""), default=None)
+        by_cycle, others = _occupancy(ledger, run_id, src.source_id, d, fetch_market)
+        same_cycle = by_cycle.get(ckey, set())
+        earlier = set().union(*[v for k, v in by_cycle.items() if k != ckey]) if by_cycle else set()
+        remaining = [a for a in asins if a not in same_cycle]
+        new_part = [a for a in remaining if a not in earlier]
+        repeat_part = [a for a in remaining if a in earlier]
+        also_from = [{"source_id": o["source_id"], "source_key": o["source_key"], "run_id": o["run_id"], "key": o["key"], "state": o["state"],
+                      "shared_asins": len(set(remaining) & set(o["asins"])), "basis": "ledger_submission_input"}
+                     for o in others if set(remaining) & set(o["asins"])][:20]
+        fetched_from = {"collector_run_id": run_id, "fetch_market": fetch_market, "source_id": src.source_id, "cycle_key": ckey,
+                        "basis": "collector_asin"}
+        for is_repeat, part in ((False, new_part), (True, repeat_part)):
+            if not part:
+                continue
+            chunks_d = split_asins(part, max_per_input)
+            items_d, files_d = _items_for(d, part, chunks_d, is_repeat, run_id, fetch_market, src, key_name, run, partial, asins, raw, paths,
+                                          dpaths, best, directions, prior, out_dir, ckey, len(asins) - len(remaining), fetched_from, also_from)
+            items += items_d
+            files += files_d
+    return items, files
+
+
+def _items_for(d, part, chunks, is_repeat, run_id, fetch_market, src, key_name, run, partial, asins, raw, paths, dpaths, best, directions,
+               prior, out_dir, ckey, excluded, fetched_from, also_from):
+    items, files = [], []
+    if True:
         for idx, chunk in enumerate(chunks, start=1):
             content = asin_file_bytes(chunk)
             sha = hashlib.sha256(content).hexdigest()
             key = submission_key(run_id, d, sha)
-            suffix = f"_p{idx}of{len(chunks)}" if len(chunks) > 1 else ""
+            suffix = (f"_p{idx}of{len(chunks)}" if len(chunks) > 1 else "") + ("_repeat" if is_repeat else "")
             items.append(SubmissionItem(
                 key=key, collector_run_id=run_id, fetch_market=fetch_market, source_id=src.source_id, source_type=src.source_type,
                 source_key=key_name, direction=d, business_market=BUSINESS_MARKET[d], memo=build_memo(d, key_name),
@@ -93,6 +158,7 @@ def build_items(app: SessionFactory, fetch_market: str, run_id: int, *, out_dir:
                                                   "asin": best.origin_asin, "units": best.origin_units},
                 paths=[_path_dict(p) for p in dpaths], other_directions=[x for x in directions if x != d],
                 chunk_index=idx, chunk_count=len(chunks), run_asin_total=len(asins), prior_tool_runs=prior[d],
+                cycle_key=ckey, repeat_of_earlier_cycle=is_repeat, same_cycle_excluded=excluded, fetched_from=fetched_from, also_from=also_from,
             ))
             files.append(content)
     return items, files

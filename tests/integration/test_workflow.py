@@ -58,6 +58,7 @@ class Routing:
     def __init__(self, product_seller: dict[str, str], seller_asins: dict[str, list[str]]) -> None:
         self.product_seller, self.seller_asins, self.urls = product_seller, seller_asins, []
         self.captcha_products: set[str] = set()
+        self.seller_pages: dict[str, list[list[str]]] = {}
         self.product_offers: dict[str, tuple] = {}
         self.on_fetch = None
 
@@ -72,6 +73,14 @@ class Routing:
             return FetchedPage(product_html(buybox=self.product_seller.get(m.group(1), "A9NOBODY0001"), offers=self.product_offers.get(m.group(1), ())), url, 200)
         m = re.search(r"me=([A-Z0-9]+)", url)
         if m:
+            pages = self.seller_pages.get(m.group(1))
+            if pages:  # 複数ページの出品者一覧（次ページは &page=N+1）
+                pm = re.search(r"[?&]page=(\d+)", url)
+                n = int(pm.group(1)) if pm else 1
+                base = re.sub(r"&page=\d+", "", url)
+                cards = "".join(f'<div data-component-type="s-search-result" data-asin="{a}"></div>' for a in pages[n - 1])
+                nxt = f'<a class="s-pagination-next" href="{base}&page={n + 1}">Next</a>' if n < len(pages) else ""
+                return FetchedPage(f"<html><body>{cards}{nxt}</body></html>", url, 200)
             return FetchedPage(results(self.seller_asins.get(m.group(1), [])), url, 200)
         raise AssertionError(f"想定外のURL: {url}")
 

@@ -106,6 +106,12 @@ class SubmissionItem:
     run_asin_total: int = 0  # 取得run全体の（重複除去後の）ASIN数
     prior_tool_runs: list[str] = field(default_factory=list)  # 計画時点で既に`tool_execution_link`にある、同じ業務方向・同じ文字列の実行ID（情報のみ。照合の除外には使わない）
     screen_options: dict | None = None  # 送信直前に画面から読み取った設定値（計画時は未取得）
+    # --- 続き取得・投入差分（同じ出典・業務方向）---
+    cycle_key: str | None = None  # 取得の一巡の識別（続き取得のrun: "c<cycle_id>"、旧方式のrun: "legacy:run<id>"）。同じ一巡かの判定に使う
+    repeat_of_earlier_cycle: bool = False  # 過去の別の一巡で投入済み（または投入予約済み）のASINだけの入力。明示許可があるまで投入しない
+    same_cycle_excluded: int = 0  # 同じ一巡で既に投入（送信開始済み・結果不明・投入予約を含む）したため、この入力から除いたASIN数
+    fetched_from: dict | None = None  # 実際の取得記録（取得run・出典・一巡）。collector_asinにある事実
+    also_from: list[dict] = field(default_factory=list)  # 他の出典の投入入力にも同じASINがある（台帳の入力から推定した参照情報。取得記録ではない）
 
     @property
     def status(self) -> str:

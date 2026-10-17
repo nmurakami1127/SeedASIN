@@ -46,7 +46,7 @@ class RepOrigin:
 @dataclass
 class PlanEntry:
     section: str
-    group: str  # NEVER / REFETCH
+    group: str  # CONTINUE（途中の続き）/ NEVER / REFETCH
     rank: int
     facts: SourceFacts
     decision: Decision
@@ -129,7 +129,7 @@ def build_plan(
         if not d.eligible:
             blocked.append((f, d))
             continue
-        group = "NEVER" if d.state == "ELIGIBLE_NEVER" else "REFETCH"
+        group = {"ELIGIBLE_NEVER": "NEVER", "ELIGIBLE_CONTINUATION": "CONTINUE"}.get(d.state, "REFETCH")
         by_dir = reps.get(f.source_id, {})
         if group_by_direction:
             sections = sorted(by_dir) if by_dir else ["NO_ORIGIN"]
@@ -142,7 +142,7 @@ def build_plan(
 
     def order(e: PlanEntry):
         rep_key = e.rep.sort_key() if e.rep else (0, 0, 0, "")
-        return (0 if e.group == "NEVER" else 1, 0 if e.rep else 1, rep_key if e.rep else (), e.facts.key_primary, e.facts.source_id)
+        return ({"CONTINUE": 0, "NEVER": 1}.get(e.group, 2), 0 if e.rep else 1, rep_key if e.rep else (), e.facts.key_primary, e.facts.source_id)
 
     sections_out: dict[str, list[PlanEntry]] = {}
     for s in SECTION_ORDER:

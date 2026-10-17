@@ -44,6 +44,7 @@ from workflow.ports import PortBlocked, Ports
 from workflow.store import DONE_STATES, State, Task, WorkflowStore, now_iso, usage
 
 SUCCESS = tuple(USABLE_FETCH_OUTCOMES)
+POLICY_CODES = ("EXCLUDED", "ON_HOLD", "TOO_RECENT", "REVIEW_LEGACY", "CYCLE_RESTART_LIMIT")  # 方針による枝のスキップ（自動で再試行しない）
 KIND_LABEL = {"discover": "発見", "acquire": "取得", "cross": "反対側展開", "acquire_x": "反対側の取得", "expand": "投入計画", "submit": "投入"}
 
 
@@ -121,6 +122,10 @@ class Engine:
         return usage(self.st)["pages"]
 
     # ---- 日次の使用枠（JST）。操作の前に確保し、後で確定する。確保のまま残った枠は使用済みとして数える
+    def allowed_repeat_keys(self) -> set[str]:
+        """人が `--allow-duplicate` で許可した、過去の一巡で投入済みのASINの再投入キー（このworkflowの状態にあるもの）。"""
+        return set(self.st.allow_duplicates) if self.st else set()
+
     def _caps(self) -> dict:
         d = self.cfg.daily
         return {"pages": d.max_pages, "submit:EXPORT": d.max_new_submissions_per_direction,
@@ -353,17 +358,22 @@ class Engine:
         return reusable_run(self.factory, market, source_id, self.cfg.result_max_age_days)
 
     def _acquire_sources(self, t: Task, market: str, import_id: int, sources: list[dict]) -> None:
+        """出典ごとの枝を処理する。枝の状態（取得・再利用・除外/保留/期間内でスキップ・一時的な保留/失敗）と、他の候補を処理できることを分ける:
+        除外・保留・期間内の枝はSKIPPED_POLICY（自動で再試行しない。状態が変われば次の候補選択で再評価される）。完了済みに書き換えない。"""
         recs: dict = t.result.setdefault("sources", {})
         t.result["market"] = market
         try:
             plan = build_plan(self.factory, self.reports, market, [import_id])
         except PlanError as exc:
             return self._set(t, "HELD", str(exc))
-        eligible = {e.facts.source_id for es in plan.sections.values() for e in es}
+        entries = {e.facts.source_id: e for es in plan.sections.values() for e in es}
         blocked = {f.source_id: d for f, d in plan.blocked}
-        todo = [s for s in sources if recs.get(str(s["source_id"]), {}).get("mode") not in ("FETCHED", "REUSED")]
+        for s_ in sources:  # 完了(取得/再利用)以外の記録は、毎回DBの状態から評価し直す（除外・保留が解除されていれば取得できる）
+            if recs.get(str(s_["source_id"]), {}).get("mode") not in ("FETCHED", "REUSED"):
+                recs.pop(str(s_["source_id"]), None)
+        todo = [s_ for s_ in sources if str(s_["source_id"]) not in recs]
         lim = self.cfg.limits
-        fetch_ids = [s["source_id"] for s in todo if s["source_id"] in eligible]
+        fetch_ids = [s_["source_id"] for s_ in todo if s_["source_id"] in entries]
         cap = self.cfg.daily.max_pages
         if fetch_ids and cap is not None and cap - self.usage.used().get("pages", 0) <= 0:  # ブラウザを開く前に日次上限を確認する
             for sid in fetch_ids:
@@ -372,60 +382,78 @@ class Engine:
         if fetch_ids:
             with self._fetcher(market, True) as fetcher:
                 for sid in fetch_ids:
+                    d = entries[sid].decision
+                    overlap = d.overlap_pages
                     remaining = self.cfg.totals.max_total_pages - self._pages_used()
-                    if remaining <= 0:
+                    if remaining - overlap <= 0:
                         recs[str(sid)] = {"mode": "HELD", "reason": f"取得ページの上限（{self.cfg.totals.max_total_pages}）に達しています"}
                         continue
                     rid = f"{self.st.workflow_id}:{t.id}:src{sid}:a{t.attempts}"
-                    granted = self._grant_pages(rid, min(lim.pages_per_source, remaining), t)
-                    if granted <= 0:
+                    # 続きでは、前回の最後のページの取り直し(overlap)も日次のページ使用量に含める
+                    granted = self._grant_pages(rid, min(lim.pages_per_source, remaining - overlap) + overlap, t)
+                    if granted <= overlap:
+                        if granted:
+                            self.usage.release(rid)
                         recs[str(sid)] = {"mode": "HELD", "daily": True,
                                           "reason": f"本日(JST)のAmazon新規取得ページの上限（{self.cfg.daily.max_pages}）に達しています"}
                         continue
-                    limits = RunLimits(max_pages=granted, max_asins=lim.max_asins_per_source)
+                    limits = RunLimits(max_pages=granted - overlap, max_asins=lim.max_asins_per_source)
                     items = run_batch(self.runs, self.factory, fetcher, market, [sid], limits=limits, sleep=self.sleep)
                     it = items[0]
-                    if it.result == "SKIPPED":  # claimの時点で取得できなかった（間隔内・保留・他の実行中）→ 保存済みの結果を探す
+                    if it.result == "SKIPPED":  # claimの時点で取得できなかった（他の実行中・状態の変化）→ 一時的な保留として扱う
                         self.usage.release(rid)
-                        blocked.setdefault(sid, None)
-                        recs[str(sid)] = {"mode": "SKIPPED_AT_CLAIM", "reason": it.reason}
+                        recs[str(sid)] = {"mode": "HELD", "reason": f"claimできませんでした: {it.reason}"}
                         continue
                     rp = it.report
-                    self.usage.commit(rid, {"pages": rp.pages})
+                    self.usage.commit(rid, {"pages": rp.pages + rp.overlap_pages})
+                    base = {"run_id": rp.run_id, "plan": rp.plan, "pages": rp.pages, "overlap_pages": rp.overlap_pages, "asins": rp.asins,
+                            "drift": rp.drift}
                     if rp.outcome in SUCCESS:
-                        recs[str(sid)] = {"mode": "FETCHED", "run_id": rp.run_id, "outcome": rp.outcome, "pages": rp.pages, "asins": rp.asins,
-                                          "truncated": rp.outcome == "SUCCESS_TRUNCATED"}
+                        recs[str(sid)] = {"mode": "FETCHED", "outcome": rp.outcome, **base, "truncated": rp.outcome == "SUCCESS_TRUNCATED",
+                                          "cycle_complete": rp.outcome == "SUCCESS_NONEMPTY"}
                     elif rp.error_code and "CAPTCHA" in rp.error_code:
-                        recs[str(sid)] = {"mode": "CAPTCHA", "run_id": rp.run_id, "reason": "CAPTCHAが解消されませんでした"}
+                        recs[str(sid)] = {"mode": "CAPTCHA", **base, "reason": "CAPTCHAが解消されませんでした"}
                     elif rp.outcome == "LEASE_LOST":
-                        recs[str(sid)] = {"mode": "FAILED", "run_id": rp.run_id, "reason": "leaseを失いました"}
+                        recs[str(sid)] = {"mode": "FAILED", **base, "reason": "leaseを失いました"}
                     else:
-                        recs[str(sid)] = {"mode": "FAILED", "run_id": rp.run_id, "outcome": rp.outcome, "reason": rp.detail or rp.error_code or rp.outcome}
+                        recs[str(sid)] = {"mode": "FAILED", "outcome": rp.outcome, **base, "reason": rp.detail or rp.error_code or rp.outcome,
+                                          "error_code": rp.error_code}
                     self._save_task(t)
-        for s in todo:  # 取得できない出典: 保存済みの結果が使えるか
-            sid = s["source_id"]
-            cur = recs.get(str(sid))
-            if cur and cur["mode"] in ("FETCHED", "CAPTCHA", "FAILED"):
+        for s_ in todo:  # 取得しない出典: 保存済みの結果を使うか、枝をスキップするか、一時的に保留するか
+            sid = s_["source_id"]
+            if str(sid) in recs:
                 continue
-            if cur and cur["mode"] == "HELD":
-                continue
-            reuse = self._reusable(market, sid)
+            d = blocked.get(sid)
+            codes = [b.code for b in d.blockers] if d else []
+            policy_only = bool(codes) and all(c in POLICY_CODES for c in codes)
+            stop_use = any(c in ("EXCLUDED", "ON_HOLD") for c in codes)  # 除外・保留中の出典の過去の結果は使わない
+            reuse = None if stop_use else self._reusable(market, sid)
             if reuse:
                 recs[str(sid)] = {"mode": "REUSED", **reuse}
+            elif policy_only:
+                until = max((b.until for b in d.blockers if b.until), default=None)
+                recs[str(sid)] = {"mode": "SKIPPED_POLICY", "codes": codes, "permanent": "EXCLUDED" in codes,
+                                  "reeval_at": until.strftime("%Y-%m-%dT%H:%M:%SZ") if until and "EXCLUDED" not in codes else None,
+                                  "reason": "; ".join(f"{b.code}({b.detail})" for b in d.blockers)[:300]}
             else:
-                d = blocked.get(sid)
                 why = "; ".join(f"{b.code}" + (f"({b.detail})" if b.detail else "") for b in (d.blockers if d else [])) or "取得できる状態ではありません"
                 recs[str(sid)] = {"mode": "HELD", "reason": why + "（利用できる保存済みの結果もありません）"}
         self._save_task(t)
         usable = sum(1 for r in recs.values() if r["mode"] in ("FETCHED", "REUSED"))
         t.result["usable"] = usable
         modes = [r["mode"] for r in recs.values()]
+        skipped = modes.count("SKIPPED_POLICY")
+        t.result["branches"] = {"skipped_policy": skipped, "permanent": sum(1 for r in recs.values() if r.get("permanent")),
+                                "held": modes.count("HELD"), "captcha": modes.count("CAPTCHA"), "failed": modes.count("FAILED")}
         summary = f"使える取得結果{usable}件（取得{modes.count('FETCHED')}・保存済みの再利用{modes.count('REUSED')}）" \
-                  f"／保留{modes.count('HELD')}・CAPTCHA{modes.count('CAPTCHA')}・失敗{modes.count('FAILED')}"
+                  f"／保留{modes.count('HELD')}・CAPTCHA{modes.count('CAPTCHA')}・失敗{modes.count('FAILED')}" \
+                  + (f"／枝のスキップ{skipped}件（除外{t.result['branches']['permanent']}・保留/期間内{skipped - t.result['branches']['permanent']}）" if skipped else "")
         pending = modes.count("HELD") + modes.count("CAPTCHA") + modes.count("FAILED")
         if not sources:
             return self._set(t, "DONE", "取得する出典がありません")
         if pending == 0:
+            if usable == 0:  # 全ての枝が除外・保留・期間内: 失敗でも完了でもない。他の候補の処理は止めない
+                return self._set(t, "SKIPPED", summary + "。この枝は処理しません（状態が変われば次の候補選択で再評価されます）")
             return self._set(t, "DONE", summary)
         if modes.count("CAPTCHA"):
             return self._set(t, "WAITING", summary + "。CAPTCHAを解いてから resume してください")
@@ -541,7 +569,7 @@ class Engine:
                 continue
             try:
                 items, files = build_items(self.factory, market, rec["run_id"], out_dir=Path(self.cfg.submission_dir),
-                                           max_per_input=self.cfg.tool_max_asins)
+                                           max_per_input=self.cfg.tool_max_asins, ledger=self.ledger)
             except SubmissionError as exc:
                 skipped.append({"run_id": rec["run_id"], "reason": str(exc)[:200]})
                 continue
@@ -561,7 +589,8 @@ class Engine:
                     self.st.tasks[tid] = Task(tid, "submit", lane, result={
                         "key": i.key, "run_id": i.collector_run_id, "direction": i.direction, "memo": i.memo, "asin_count": i.asin_count,
                         "business_market": i.business_market, "source_id": i.source_id, "reused": rec["mode"] == "REUSED",
-                        "partial": i.input_is_partial})
+                        "partial": i.input_is_partial, "repeat": i.repeat_of_earlier_cycle, "excluded_same_cycle": i.same_cycle_excluded,
+                        "also_from": len(i.also_from)})
                 made.append(i.key)
         self._set(t, "DONE", f"投入計画{len(made)}件" + (f"（見送り{len(skipped)}件）" if skipped else ""), keys=made, skipped=skipped)
 
@@ -599,6 +628,9 @@ class Engine:
                              tool_run_id=st.tool_run_id)
         item = item_from_manifest(st.manifest)
         fresh = st.state in ("PLANNED", "NOT_SUBMITTED")
+        if fresh and item.repeat_of_earlier_cycle and key not in self.st.allow_duplicates:
+            return self._set(t, "HELD", f"過去の一巡で投入済み（または投入予約済み）のASIN {item.asin_count}件だけの再投入です（重複候補）。"
+                                        f"意図した再投入なら `resume --allow-duplicate {key}`。新しいASINの投入はこれを待たずに進みます", repeat=True)
         if fresh:
             dups = [d for d in find_duplicates(self.ledger, item)]
             if dups and key not in self.st.allow_duplicates:
