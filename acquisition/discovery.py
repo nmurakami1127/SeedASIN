@@ -468,6 +468,7 @@ class CrossSelection:
     run_completed_at: datetime
     run_age_days: float
     truncated: bool
+    origin_asins: tuple[str, ...] = ()  # 元の起点ASIN（展開の対象から除く）
 
 
 class DiscoveryService:
@@ -563,9 +564,15 @@ class DiscoveryService:
                                      "再取得は collect-source（30日間隔を通ります）で行ってください")
             asins = [r[0] for r in conn.execute(
                 text("SELECT asin FROM collector_asin WHERE collector_run_id = :r ORDER BY id"), {"r": run.id})]
+            origin_asins = tuple(sorted(r[0] for r in conn.execute(
+                text("SELECT DISTINCT origin_asin FROM acquisition_path WHERE source_id = :s AND stage = 'ORIGIN_ASIN' "
+                     "AND origin_import_id = ANY(:ids)"), {"s": via_source_id, "ids": origin_import_ids})))
         picks: list[Pick] = []
         skipped: list[tuple[str, str, datetime | None]] = []
-        for a in asins:
+        for a in asins:  # 取得結果の保存順（collector_asin.id）。決定的
+            if a in origin_asins:  # 元の起点ASINは展開の対象にしない（起点の商品ページは既に調べた市場のもの）
+                skipped.append((a, "ORIGIN_ASIN", None))
+                continue
             pick, skip = self._pick(page_market, a)
             if skip:
                 skipped.append(skip)
@@ -573,11 +580,13 @@ class DiscoveryService:
             picks.append(pick)
             if len(picks) >= limits.max_cross_asins:
                 break
-        return CrossSelection(picks, skipped, run.id, run.outcome, run.completed_at, float(run.age_days), run.outcome == "SUCCESS_TRUNCATED")
+        return CrossSelection(picks, skipped, run.id, run.outcome, run.completed_at, float(run.age_days),
+                              run.outcome == "SUCCESS_TRUNCATED", origin_asins)
 
     def record_cross(self, via_market: str, via_source_id: int, via_asin: str, page_market: str, result: ProductPageResult,
                      routes: Iterable[str], own_ids: set[str], limits: DiscoveryLimits, run_id: int, origin_import_ids: list[int],
-                     check: Callable[[], None] | None = None) -> tuple[list[Registered], list[Skipped]]:
+                     check: Callable[[], None] | None = None, *, via_run_id: int | None = None,
+                     via_run_outcome: str | None = None) -> tuple[list[Registered], list[Skipped]]:
         page_url = product_url(page_market, via_asin)
         cands, skipped = build_candidates(result, routes, page_market, own_ids, limits.max_cross_sources_per_asin, page_url.split("/")[2])
         out: list[Registered] = []
@@ -586,7 +595,10 @@ class DiscoveryService:
                 check()
             note = json.dumps({"v": 1, "route": "CROSS_MARKET_PRODUCT_PAGE", "extracted_from": "PRODUCT_PAGE", "page_market": page_market,
                                "page_asin": via_asin, "page_url": page_url, "via_market": via_market, "investigation_run": run_id,
-                               "routes": sorted(set(routes)), "asin_existence_in_page_market": "FOUND", **c.meta}, ensure_ascii=False)[:900]
+                               "routes": sorted(set(routes)), "asin_existence_in_page_market": "FOUND", "via_fetch_run": via_run_id,
+                               "via_fetch_outcome": via_run_outcome,
+                               "derived_from_partial_result": via_run_outcome == "SUCCESS_TRUNCATED", **c.meta},
+                              ensure_ascii=False)[:1000]
             rp = self._registry.register_via_path(page_market, c.source_type, c.key, "", via_market=via_market,
                                                   via_source_id=via_source_id, via_asin=via_asin, note=note,
                                                   allowed_origin_import_ids=origin_import_ids)

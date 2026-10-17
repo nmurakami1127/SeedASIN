@@ -366,7 +366,10 @@ def test_cross_market_expansion_uses_the_past_fetch_records_via_paths_and_never_
     (p,) = paths(app_role_factory, "JP", sid)
     assert (p.stage, p.direction, p.origin_marketplace, p.origin_import_id, p.origin_asin, p.origin_units, p.via_source_id, p.via_asin) == (
         "VIA_SOURCE", "EXPORT", "US", rid, asin(81), 7, via_id, asin(91))
-    assert json.loads(p.note)["asin_existence_in_page_market"] == "FOUND"
+    n = json.loads(p.note)
+    assert n["asin_existence_in_page_market"] == "FOUND"
+    assert (n["via_fetch_run"], n["via_fetch_outcome"], n["derived_from_partial_result"], n["via_market"], n["page_market"]) == (
+        via_run, "SUCCESS_NONEMPTY", False, "US", "JP")  # 元の注文実績までの経路（取得run・経由ASIN・調査先市場）が残る
     jp_rid = report_with(app_role_factory, tmp_path, "JP", [("B0JPREPORT", 5, 1.0, 1)], name="jp.csv")
     plan = build_plan(app_role_factory, ReportImportService(app_role_factory, None), "JP", [rid, jp_rid])
     entry = next(e for e in plan.sections["EXPORT"] if e.facts.source_id == sid)
@@ -485,3 +488,26 @@ def test_own_account_cli_sets_ids_and_discover_dry_run_never_opens_a_browser_or_
     finally:
         with app_role_factory.get_session("JP") as conn, conn.begin():
             conn.execute(text("DELETE FROM marketplace_account_config WHERE account_id = 'AOWNCLIJP01'"))
+
+
+def test_cross_market_skips_the_original_origin_asin_picks_in_saved_order_and_marks_truncated_results(app_role_factory, tmp_path, svc, own, registry):
+    runs = make_runs(app_role_factory)
+    # 保存順: 元の起点ASIN(asin 81) → 次ページへ続く打切りの結果
+    rid, via_id, via_run, rep = _fetched_source(
+        app_role_factory, registry, runs, tmp_path, name="o.csv", asins=(81, 201),
+        outcome_pages=[results([asin(81), asin(201), asin(202)], "https://www.amazon.com/s?p=2"), results([asin(203)])])
+    sel = svc.select_cross_asins("US", via_id, "JP", DiscoveryLimits(max_cross_asins=1), [rid], max_run_age_days=30)
+    assert [p.asin for p in sel.picks] == [asin(201)]  # 起点以外を保存順で最初の1件
+    assert (asin(81), "ORIGIN_ASIN", None) in sel.skipped and sel.origin_asins == (asin(81),)
+    f = FakeFetcher(product_html(buybox="AJPCROSS0201", store=SONY))
+    item = run_cross_discovery(svc, f, "US", via_id, "JP", ["BRAND", "SELLER"], DiscoveryLimits(max_cross_asins=1, max_cross_sources_per_asin=3), [rid])[0]
+    assert (item.asin, item.kind, len(f.urls)) == (asin(201), "FOUND", 1)  # 起点ASINのページには行かない
+    assert [r.source_type for r in item.registered] == ["BRAND_STORE", "SELLER"]
+    sid = source_by_key(app_role_factory, "JP", "SELLER", "AJPCROSS0201")
+    n = json.loads(paths(app_role_factory, "JP", sid)[0].note)
+    assert n["via_fetch_run"] == via_run and n["via_fetch_outcome"] == rep.outcome
+    only_origin = _fetched_source(app_role_factory, registry, runs, tmp_path, name="o2.csv", asins=(81,))
+    with app_role_factory.get_session("US") as conn, conn.begin():
+        pass
+    sel2 = svc.select_cross_asins("US", only_origin[1], "JP", DiscoveryLimits(), [only_origin[0]])
+    assert sel2.picks == [] and sel2.skipped == [(asin(81), "ORIGIN_ASIN", None)]  # 起点以外が無ければ展開しない（理由を返す）

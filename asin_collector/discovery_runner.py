@@ -138,6 +138,6 @@ def run_cross_discovery(
 
     def make_record(pick):
         return lambda res, rid, check: svc.record_cross(via_market, via_source_id, pick.asin, page_market, res, routes, own, limits,
-                                                        rid, origin_import_ids, check)
+                                                        rid, origin_import_ids, check, via_run_id=sel.run_id, via_run_outcome=sel.run_outcome)
 
     return _run(svc, fetcher, page_market, sel.picks, make_record, sleep, stop_after_failures, heartbeat_interval)
