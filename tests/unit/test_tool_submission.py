@@ -702,7 +702,8 @@ def test_cli_evidence_validates_the_request_against_the_plan_and_reconcile_needs
     lg2, it2, asins2, led2 = _cli_setup(tmp2)
     assert claim_submission(lg2, it2, Path(it2.input_file), [100], {"バリエーション": False})[0]
     body = json.dumps({"url": ",".join(asins2), "now_page": 1, "csv_name": "none", "options": REQ_OPTS, "type": "asin_list", "country": "", "category_id": "", "repeat_cnt": 1})
-    good = {"endpoint": "https://import-tools.jp/asin/out/start_search4.php", "body": body, "status": 200, "response": "end"}
+    real_response = "start_search4asin_listrivalsuccess asin7170081 https://example.invalid/asin/csv_del.php<br>"  # 実画面の成功応答の形
+    good = {"endpoint": "https://import-tools.jp/asin/out/start_search4.php", "body": body, "status": 200, "response": real_response}
     base2 = ["--ledger", led2]
     bad = dict(good, response="no_api")
     assert main(["evidence", "--key", "kc", "--capture-json", _write_json(tmp2 / "bad.json", bad), *base2]) == 3  # 保存成功の応答ではない

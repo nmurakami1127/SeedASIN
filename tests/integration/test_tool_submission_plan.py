@@ -179,6 +179,11 @@ def _log(tmp_path, name, *rows):
     return str(p)
 
 
+def _json_file(path, obj):
+    path.write_text(json.dumps(obj, ensure_ascii=False), encoding="utf-8")
+    return str(path)
+
+
 def test_manual_flow_baseline_reconcile_memo_resolve_link_and_output_verification(app_role_factory, registry, runs, tmp_path, monkeypatch, capsys):
     from db.session import SessionFactory
 
@@ -195,23 +200,50 @@ def test_manual_flow_baseline_reconcile_memo_resolve_link_and_output_verificatio
     (k,) = ledger.all_states()
     memo = f"輸出_{key.upper()}"
     before = _log(tmp_path, "before.html", (7700001, "asin_list", "jp", memo))
+    opts = _json_file(tmp_path / "opts.json", {"CNフラグ除外": True, "バリエーション": False})
     after1 = _log(tmp_path, "after1.html", (7700001, "asin_list", "jp", memo), (7700002, "asin_list", "jp", ""))
     assert cli_main(["reconcile", "--key", k, "--log-html", after1, *base]) == 2  # 送信前の基準が無いと、過去の行と取り違えるので特定しない
-    assert cli_main(["baseline", "--key", k, "--log-html", before, *base]) == 0
+    assert cli_main(["begin", "--key", k, "--log-json", before, *base]) == 2  # 画面の設定値を読めていないと送信権を与えない
+    assert cli_main(["begin", "--key", k, "--log-json", before, "--options-json", opts, *base]) == 0
+    assert ledger.state(k).state == "SUBMITTING"
+    assert cli_main(["begin", "--key", k, "--log-json", before, "--options-json", opts, *base]) == 2  # 二重に送信権は与えない
+    asins = (out / f"run{run_id}_EXPORT_{k}.csv").read_text(encoding="utf-8").split()
+    req_opts = {"variation": "", "sellers": "on"}
+    cap = {"endpoint": "./out/start_search4.php", "body": json.dumps({"url": ",".join(asins), "options": req_opts, "type": "asin_list", "country": ""}),
+           "status": 200, "response": "start_search4asin_listrivalsuccess asin1 https://example.invalid/csv_del.php<br>"}
+    assert cli_main(["reconcile", "--key", k, "--log-html", after1, *base]) == 3  # 根拠が無いと、新規行が1件でも自分の送信と断定しない
+    assert ledger.state(k).state == "UNKNOWN"
+    # 結果不明のまま未送信へは戻さない。根拠つきの別の試行で、特定・メモ保存・対応記録の流れを確認する
+    out2, led2 = tmp_path / "o2", tmp_path / "o2" / "l.jsonl"
+    base2 = ["--ledger", str(led2)]
+    assert cli_main(["plan", "--fetch-market", "US", "--run-id", str(run_id), "--out-dir", str(out2), *base2]) == 0
+    ledger = SubmissionLedger(led2)
+    (k,) = ledger.all_states()
+    assert cli_main(["begin", "--key", k, "--log-json", before, "--options-json", opts, *base2]) == 0
+    assert cli_main(["evidence", "--key", k, "--capture-json", _json_file(tmp_path / "cap.json", cap), *base2]) == 0
+    options_row = "{cn_safe:on,variation:,sellers:on}"
+    after1 = _json_file(tmp_path / "after1.json", [{"seq": 7700001, "data_type": "asin_list", "memo": memo}, {"seq": 7700002, "data_type": "asin_list", "memo": "", "options": options_row}])
+    base = base2
+    assert cli_main(["reconcile", "--key", k, "--log-html", after1, *base]) == 3  # 行の設定値が送信リクエストの設定値と一致しないので特定しない
+    ledger.append(k, "SUBMIT_STARTED", before_run_ids=[7700001], attempt=2, options={"バリエーション": False})  # 再試行（根拠は取り直し）
+    cap2 = dict(cap, body=json.dumps({"url": ",".join(asins), "options": {"cn_safe": "on", "variation": "", "sellers": "on"}, "type": "asin_list", "country": ""}))
+    assert cli_main(["evidence", "--key", k, "--capture-json", _json_file(tmp_path / "cap2.json", cap2), *base]) == 0
     assert cli_main(["reconcile", "--key", k, "--log-html", after1, *base]) == 0
     st = ledger.state(k)
     assert (st.state, st.tool_run_id) == ("RUN_IDENTIFIED", "7700002")  # 過去の7700001（同じメモ）ではなく、基準に無い新しい行
     assert cli_main(["reconcile", "--key", k, "--log-html", after1, *base]) == 3  # メモ未保存: ASINは再投入せずメモ保存を促す
     assert "再投入しません" in capsys.readouterr().out
     after2 = _log(tmp_path, "after2.html", (7700001, "asin_list", "jp", memo), (7700002, "asin_list", "jp", memo))
+    assert cli_main(["memo-start", "--key", k, *base]) == 0
     assert cli_main(["reconcile", "--key", k, "--log-html", after2, *base]) == 0
     assert ledger.state(k).state == "MEMO_SAVED"
     assert cli_main(["link-check", "--key", k, *base]) == 3  # まだingest-logされていない
     with app_role_factory.get_session("US") as conn, conn.begin():  # 既存のingest-logが記録した状態を再現
         conn.execute(text("INSERT INTO tool_execution_link (marketplace, seller_id, tool_run_id, source) VALUES ('US', :k, '7700002', 'ASIN_LIST')"), {"k": key.upper()})
     assert cli_main(["link-check", "--key", k, *base]) == 0 and ledger.state(k).state == "LINKED"
-    asins = (out / f"run{run_id}_EXPORT_{k}.csv").read_text(encoding="utf-8").split()
     good = tmp_path / "out.csv"
+    good.write_text("ASIN,x\n" + "\n".join(f"{a},1" for a in asins) + "\n", encoding="utf-8")
+    asins = (out2 / f"run{run_id}_EXPORT_{k}.csv").read_text(encoding="utf-8").split()
     good.write_text("ASIN,x\n" + "\n".join(f"{a},1" for a in asins) + "\n", encoding="utf-8")
     assert cli_main(["verify-output", "--key", k, "--csv", str(good), *base]) == 0
     good.write_text("ASIN,x\nB0OTHER000,1\n", encoding="utf-8")
@@ -228,9 +260,10 @@ def test_manual_flow_ambiguity_stops_and_only_a_human_choice_continues(app_role_
     cli_main(["plan", "--fetch-market", "US", "--run-id", str(run_id), "--out-dir", str(out), *base])
     ledger = SubmissionLedger(led)
     (k,) = ledger.all_states()
-    assert cli_main(["baseline", "--key", k, "--log-html", _log(tmp_path, "b.html", (7800001, "asin_list", "jp", "")), *base]) == 0
+    opts = _json_file(tmp_path / "opts.json", {"バリエーション": False})
+    assert cli_main(["begin", "--key", k, "--log-json", _log(tmp_path, "b.html", (7800001, "asin_list", "jp", "")), "--options-json", opts, *base]) == 0
     two = _log(tmp_path, "two.html", (7800001, "asin_list", "jp", ""), (7800002, "asin_list", "jp", ""), (7800003, "asin_list", "us", ""))
-    assert cli_main(["reconcile", "--key", k, "--log-html", two, *base]) == 3 and ledger.state(k).state == "AMBIGUOUS"
+    assert cli_main(["reconcile", "--key", k, "--log-html", two, "--no-evidence", *base]) == 3 and ledger.state(k).state == "AMBIGUOUS"
     assert "メモを付けないでください" in capsys.readouterr().out
     assert cli_main(["resolve", "--key", k, "--run-id", "7800001", *base]) == 2  # 候補外（基準にある行）は選べない
     assert cli_main(["resolve", "--key", k, "--run-id", "7800003", *base]) == 0

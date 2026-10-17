@@ -253,12 +253,16 @@ python -m asin_collector.cli release-asin-page --page-market JP --asin <ASIN> --
 python -m tool_submission.cli plan --fetch-market US --run-id 82     # 入力ファイル（出典・業務方向・5,000件以下ごと）と投入計画。DB読み取りのみ
 python -m tool_submission.cli ledger                                 # 投入台帳（追記専用JSONL）の状態
 # 手動で投入する場合（初回は1件ずつ）
-python -m tool_submission.cli baseline  --key <キー> --log-html <送信前に保存したログ画面>   # 送信前の基準
+python -m tool_submission.cli begin --key <キー> --log-json <送信直前のログ一覧> --options-json <画面の設定値>   # 送信権の確保・送信開始の記録（ASINの入力・SAVEの前に必須）
+python -m tool_submission.cli evidence --key <キー> --capture-json <SAVE直後に得た送信リクエスト・応答>        # 実行IDの対応根拠
 python -m tool_submission.cli reconcile --key <キー> --log-html <送信後に保存したログ画面>   # 新しい行の実行IDを特定（メモ保存の確認も）
 python -m tool_submission.cli resolve   --key <キー> --run-id <実行ID>                        # 新規行が複数のとき、人が選ぶ
+python -m tool_submission.cli memo-start --key <キー>                                            # メモ保存ボタンの前に記録（ASINは再投入しない）
+python -m tool_submission.cli ingest --key <キー> --row-html <対象1行のHTML>                    # 既存のingest-logを、その1行に限定して実行
+python -m tool_submission.cli mark-not-submitted --key <キー> --log-json <ログ> --reason <理由>  # SAVEを押していないとログで確認できたときだけ
 python -m tool_submission.cli link-check --key <キー>                                         # 既存のingest-log後、対応記録済みを確認
 python -m tool_submission.cli verify-output --key <キー> --csv <出力CSV>                      # 出力ASINが入力に含まれるか
-python -m tool_submission.cli submit --key <キー> --selectors <確認済みセレクタJSON>          # 自動送信（入力画面のDOM未確認のため実行不可。実画面は未検証）
+python -m tool_submission.cli submit --key <キー> --selectors <確認済みセレクタJSON>          # 自動送信（DOMは実画面で確認済み。Playwrightアダプター自体の実画面動作は未検証）
 ```
 
 業務方向は出典の発見経路から決め（取得先市場・`data-country`からは決めない）、メモは既存の規約（`輸出_<出典キー>` / `輸入_<出典キー>`）。上限打切りの取得は「一部の取得結果」と明記される。結果不明のまま再送しない・メモ保存だけの失敗はASINを再投入せず再開する、などの仕組みと未検証事項は docs/DEVIATIONS.md #60。

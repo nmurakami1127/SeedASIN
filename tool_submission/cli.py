@@ -145,8 +145,13 @@ def _cmd_evidence(a: argparse.Namespace) -> int:
         problems.append("送信先が想定（start_search4.php）と違います")
     if body.get("type") != "asin_list" or body.get("country") not in ("", None):
         problems.append(f"種別/国指定が想定と違います（type={body.get('type')!r}, country={body.get('country')!r}）")
-    if cap.get("status") != 200 or "end" not in str(cap.get("response", "")):
-        problems.append(f"応答が保存成功ではありません（status={cap.get('status')}, 応答={str(cap.get('response', ''))[:80]!r}）")
+    resp = str(cap.get("response", ""))
+    # 実画面の応答（2026-10-17確認）: 成功時は "start_search4asin_listrivalsuccess asin<最古ID> https://…/csv_del.php<br>" のように"success"を含む。
+    # 失敗は session_expired / no_api / no_f_api / url_au / url_ca / ban / no_me / not_release / not_http（画面のスクリプトの分岐）。"end"は別の分岐。
+    failure_tokens = ("session_expired", "no_api", "no_f_api", "url_au", "url_ca", "ban", "no_me", "not_release", "not_http")
+    hit = [t for t in failure_tokens if t in resp]
+    if cap.get("status") != 200 or hit or not ("success" in resp or "end" in resp):
+        problems.append(f"応答が保存成功ではありません（status={cap.get('status')}, 失敗の目印={hit}, 応答={resp[:80]!r}）")
     if (body.get("options") or {}).get("variation"):
         problems.append("送信リクエストのバリエーションがONです")
     ev = {"ok": not problems, "problems": problems, "asin_count": len(sent), "asin_list_sha256": hashlib.sha256(",".join(sent).encode()).hexdigest(),
@@ -155,6 +160,25 @@ def _cmd_evidence(a: argparse.Namespace) -> int:
     print(("根拠を記録しました: " if ev["ok"] else "[不一致] 根拠として認められません: ")
           + json.dumps({k: ev[k] for k in ("ok", "problems", "asin_count", "response")}, ensure_ascii=False))
     return 0 if ev["ok"] else 3
+
+
+def _cmd_memo_start(a: argparse.Namespace) -> int:
+    """メモ保存ボタンを押す前に、台帳へ「メモ保存開始」を記録する（実行ID確定後。ASINは再投入しない）。"""
+    from tool_submission.ledger import MEMO_MAX_ATTEMPTS
+
+    ledger = _ledger(a)
+    st = _need(ledger, a.key)
+    if st is None:
+        return 2
+    if st.state != "RUN_IDENTIFIED" or not st.tool_run_id:
+        print(f"[中止] 状態が{st.state}です（実行ID確定・メモ未保存の計画だけがメモを保存できます）")
+        return 2
+    if st.memo_attempts >= MEMO_MAX_ATTEMPTS:
+        print(f"[中止] メモ保存の試行が上限（{MEMO_MAX_ATTEMPTS}回）に達しています。画面で確認してください")
+        return 2
+    ledger.append(a.key, "MEMO_SAVE_STARTED", tool_run_id=st.tool_run_id)
+    print(f"メモ保存を開始します: 実行ID={st.tool_run_id} メモ={st.manifest['memo']!r}（この実行IDの行だけ。ASINは再投入しません）")
+    return 0
 
 
 def _cmd_mark_not_submitted(a: argparse.Namespace) -> int:
@@ -381,6 +405,8 @@ def build_parser() -> argparse.ArgumentParser:
     sp = add("evidence", _cmd_evidence, "SAVE直後に得た送信リクエストと応答を検証して台帳に残す（実行IDの対応根拠）")
     sp.add_argument("--key", required=True)
     sp.add_argument("--capture-json", required=True)
+    sp = add("memo-start", _cmd_memo_start, "メモ保存ボタンを押す前に、台帳へメモ保存開始を記録する（実行ID確定後）")
+    sp.add_argument("--key", required=True)
     sp = add("mark-not-submitted", _cmd_mark_not_submitted, "SAVEを押していない/保存されなかったと、ログで確認できたときだけ未送信に戻す")
     sp.add_argument("--key", required=True)
     sp.add_argument("--log-json", required=True)

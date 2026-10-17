@@ -1098,3 +1098,24 @@ PERMANENTLY_EXCLUDEDは引き続き完全除外のまま変更しない。
 - **取り込みの限定（`ingest`／`single_row_html`）**: 既存の`ingest-log`は渡したHTMLの全行を取り込む（seller登録・`tool_execution_link`・禁止セラーの`storefront_blocked_seller`・出力取込）ため、**この投入の実行IDの1行だけ**を取り出した最小のHTMLに限定して呼ぶ。メモが期待どおり保存されていることを確認できた行だけが対象（メモ保存前は取り込まない）。
 - **手動手順（改訂）**: ①ログ画面を保存/スナップショット → ②`begin --key --log-json --options-json`（送信権の確保・送信開始の記録。ここで中止なら送信しない）→ ③ASINを入力しそのセクションのSAVEを1回だけ → ④`reconcile`で実行IDを特定（`baseline`は`begin`に置き換わる）→ ⑤メモ保存 → ⑥`reconcile`でMEMO_SAVED → ⑦`ingest`（対象の1行のみ）→ ⑧`link-check`。
 - **実行中の既存の自動化**: `import_tools_automation/automation.py --watch 1800`（`run_watch.bat`）が稼働中。コードを読む限り、ログ一覧から`取得完了`の行のCSVをダウンロードして判定を実行する処理で、ASINの投入（SAVE）・メモの変更はしない。そのため「別の投入処理」とはみなさず停止していない。ただし、メモ（`輸出_`/`輸入_`）が付いた行が`取得完了`になると、この自動化が出力CSVをダウンロードして出品判定（ex_primary_check/primary_check）を実行する（既存の運用どおり）。
+
+
+**#60 追記（初回の実投入の結果と、実画面で確認した事実、2026-10-17）**
+
+**実画面のDOM（利用者のログイン済みChromeで読み取り。読み取りのみで、確認のためにSAVEは押していない）**
+- 入力画面 `/asin/main.php`: 「3.ASINリストから情報取得」= `textarea#asin_list`、そのSAVE = `button#add_asin_list`（入力があるまでdisabled）。同じ画面の他のSAVE（`#add_keyword`・`#add_keyword_repeat`・`#add_store_url`）と国選択は操作していない。設定は`input#asin_cn_safe` `asin_sellers` `asin_ranking` `asin_brand` `asin_price` `asin_size` `asin_low_country` `asin_part_number` `asin_model_number` `asin_variation` `asin_f_sellers` `asin_f_ranking` `asin_f_price`。送信直前の値は全て計画どおり（バリエーションOFF、他はON）。
+- SAVE押下の処理（`js/main.js`）: `alert_2_3`（2段階目OFF＋3段階目ONなら停止）→ ASIN（10/13桁）を重複除去 → `./out/start_search4.php` へJSON（`url`=カンマ区切りASIN、`options`、`type:"asin_list"`、**`country:""`**）をPOST。応答の失敗の分岐: `session_expired`/`no_api`/`no_f_api`/`url_au`/`url_ca`/`ban`/`no_me`/`not_release`/`not_http`。**実際の成功応答は `...success asin<最古の行のID> https://…/csv_del.php<br>`**（`end`ではなかった。入力欄が空になりアラートなし）。応答に新しい実行IDは含まれない。
+- メモ保存（`js/logs.js`）: `button.save_memo` → `./db/save_log.php` へ `{text, file_name=trのid, log_seq=td.log-id}`。行の`data-options`は送信時の設定値（`{cn_safe:on,variation:,...}`、空=OFF）。
+- **保持上限**: ログ画面は300行で、新しい送信のたびに最古の行（と出力CSV。応答の`csv_del.php`）がサービス側で削除される（run 82の送信で7170081、run 83で7170085）。この2件は出力が既にDBへ取り込み済み（tool_output_asin 1,152件・3,323件）で、データ損失はない。**今後の送信でも最古の行が消える**ため、古い行の出力は先に取り込んでおくこと。
+- 実行IDはアカウントのログ上で飛び飛び（全アカウント共通の連番。run 82=7260647、run 83=7260649）。
+
+**対応根拠の確認（「新規行が1件」だけで自分の送信と断定しない）**: ①送信前のログ300件（全ID）を保存し、12秒おいた2回の読み取りで変化なしを確認 ②SAVE直前に再度、最大IDと件数が基準のままを確認 ③SAVE後、基準との**集合比較**で「増えた行が1件・消えた行が1件（最古）」のみ ④送信リクエストの`url`が計画のASIN（32件・順序とも）と一致、`country=""`、設定値がバリエーションOFFで一致 ⑤応答が成功（`success`、失敗の目印なし）、アラートなし ⑥新規行の`data-options`が送信リクエストの設定値と一致、種別`asin_list`、メモが空。これらを`evidence`として台帳に記録し、`reconcile`が根拠なしでは特定しないようにした。**限界**: ログにも応答にも新しい実行IDやASINの内容は出ないため、対応は上の状況証拠（試行中は同じアカウントへの別の投入が無いという前提を含む）による。取得完了後に`verify-output`で出力ASINと入力を照合して事後確認する。ローカルのロックは同じマシン内の別プロセスしか防げず、別PC・別ブラウザの操作は防げない。
+
+**実投入の結果**（各1回のSAVE。再クリックなし）
+| 計画 | run・出典 | 方向・メモ | ASIN | 実行ID | 状態 |
+|---|---|---|---|---|---|
+| fd4f3e05c479df5a | run 82・出典11 | 輸出 `輸出_A3AJLR7DMJUOQG` | 32 | **7260647** | メモ保存・再読込で確認・DB記録(US)・LINKED。統合ツールの処理は待機中 |
+| 42f2aaab3897a6da | run 83・出典12 | 輸入 `輸入_A1MN7UZC7MPZTE` | 32 | **7260649** | メモ保存・再読込で確認・DB記録(JP)・LINKED。統合ツールの処理は待機中 |
+- DB更新は既存の`ingest-log`を**対象1行に限定**（`ingest`/`single_row_html`）して実行: `tool_execution_link` +1ずつ、run 83で`known_seller_master`（JP A1MN7UZC7MPZTE、新規セラー）+1。禁止セラー・出力取込・他の行の更新なし。`link-check`で記録を確認。
+- 取得run→統合ツール実行IDの**対応はDB上には直接持てていない**（マニフェスト・台帳ファイルに保持。`tool_execution_link`は業務方向・文字列・実行IDのみ）。スキーマ変更案（`tool_submission`表）は上のとおり保留。
+- 既存の自動化（`import_tools_automation`、稼働中）は投入せず、`取得完了`かつメモが`輸出_`/`輸入_`の行のCSVをダウンロードして出品判定を実行する。2件が`取得完了`になれば、その処理が走る（既存の運用どおり）。
