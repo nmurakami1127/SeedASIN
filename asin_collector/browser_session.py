@@ -46,15 +46,21 @@ def open_browser(marketplace: str) -> Iterator[BrowserContext]:
             context.close()
 
 
-def is_captcha_page(page: Page) -> bool:
-    content = page.content()
+def html_is_captcha(content: str) -> bool:
     return any(marker in content for marker in _CAPTCHA_MARKERS)
+
+
+def html_is_server_error(content: str) -> bool:
+    return any(marker in content for marker in _SERVER_ERROR_MARKERS)
+
+
+def is_captcha_page(page: Page) -> bool:
+    return html_is_captcha(page.content())
 
 
 def is_server_error_page(page: Page) -> bool:
     """Amazon側の一時的な500/503エラーページかどうか判定する（CAPTCHAとは別種のエラー）。"""
-    content = page.content()
-    return any(marker in content for marker in _SERVER_ERROR_MARKERS)
+    return html_is_server_error(page.content())
 
 
 def wait_for_human_to_solve_captcha(page: Page) -> None:

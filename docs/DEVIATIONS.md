@@ -961,3 +961,17 @@ PERMANENTLY_EXCLUDEDは引き続き完全除外のまま変更しない。
 - 未分類一覧に、URLの明示的なパラメータ（`me=`、単一の`rh=p_89:`）から言える分類案の列（suggested_*）を追加。案はDBに書かない。名前・文字列の印象からは案を作らない（現在: JPのブランド絞り込みURL2件のみ案あり、他13種は案なし）。
 - 時刻（未補正）: `tool_output_asin.acquired_at`にDB時刻より未来の値（最大+7.6時間）があり、JSTのローカル時刻がUTCとして保存されている疑いがある。**事実として確認できたのは「未来の値が存在する」ことまで**で、全行がずれているかは未確認。仮にずれているなら、統合ツール実行（TOOL_RUN）由来の旧証拠の時刻は最大9時間遅く見え、再取得可能と判定される時刻が最大9時間遅くなる（安全側＝取り過ぎない方向）。collector_run・status.csv由来の証拠は対象外。今回は補正しない。
 - 再発防止: `legacy-apply`は、計画CSVで種別が確認済み(FACT)の行を同じ条件で再現できない場合（台帳指定の付け忘れ）は書き込み前に中止する。文字列列の長さ上限（60文字等）を超える観測がある場合も、全件を先に検査して1行も書かずに中止する。
+
+## 58. 出典管理に接続した取得（段階3）: `asin_collector.source_runner` / `collect-source` / `collect-next`（Phase 4, 2026-10-17）
+
+**目的**: 既知の出典を明示して取得する入口を、`acquisition`の実行制御（claim・lease・heartbeat・結果の区別）に接続した。セラーの自動発見・反対側市場への展開は含まない（残作業）。DBスキーマの変更なし。
+
+- `collect-source --market US|JP --source-id N` / `collect-next --market ... --origin-import <id> --section EXPORT|IMPORT|ALL [--max-sources 1] [--dry-run]`。**従来の`collect-brand-page`・`export-run`・`check-recommendations`・ルートの対話メニューは変更していない**（旧経路は`source_id`なしの`collector_run`のまま共存。`export-run`は新方式の実行も同じ`collector_asin`から書き出せる）。
+- 流れ: `claim`（取得間隔・除外・保留・実行中・旧証拠・未分類履歴の一致を再判定）→ ページ取得 → 1ページごとに`append_asins`（run行ロック＋トークン＋DB時刻のlease確認）→ `finish`。heartbeatは別スレッドで、CAPTCHAの人の待機中も継続（待機中はDB上`CAPTCHA_WAIT`でleaseは長め）。leaseを失ったら以後のページ取得も書き込みも終了確定もしない（`LEASE_LOST`を報告）。Ctrl+Cは`INTERRUPTED(USER)`として確定（失敗に数えない）。
+- 結果の区別: `SUCCESS_NONEMPTY` / `SUCCESS_EMPTY`（SELLERで0件ウィジェットを確認した場合のみ）/ `SUCCESS_TRUNCATED`（ページ数・ASIN数の上限。`--max-pages`既定5）/ `PARTIAL`（保存後の失敗・結果の途中の0件ページ・同一URL再訪）/ `FAILED`（1ページ目から取得できない・5xx（2回自動リトライ）・CAPTCHA未解決）/ `UNVERIFIED_EMPTY`（0件に見えるが確認できない。**成功にしない**）。確認済み0件・上限打切りを30日に数えるかは`acquisition_interval_config`の設定どおり。
+- 順位と対象: `acquire-plan`の順位（未取得優先→注文点数→セッション→獲得率）をそのまま引き継ぐ。`collect-next`は**注文0点の起点しかない出典・起点のない出典を既定で対象にしない**（経路は残る。`--include-zero-units`/`--include-no-origin`で明示）、実行件数は`--max-sources`（既定1、最大20）。連続して成功しない実行が3件続けば残りを実行しない。
+- ブラウザ: 取得先市場の永続プロファイル（`playwright_profiles/us|jp`、headed）。配送先表示の確認は**警告のみ**（郵便番号US 97005 / JP 289-1223、自動操作はしない）。
+
+**実ページで未検証（成功・正常とは説明しない）**: ①KEYWORD/BRAND_NAME/BRAND_STOREの0件判定（ウィジェットがあっても`UNVERIFIED_EMPTY`にしている。検証済みなのはSELLERのみ、#53）②KEYWORD/BRAND_NAMEのURL形式（BRAND_NAMEは旧実行に見られる`rh=p_89`）③配送先表示ブロック(`#glow-ingress-block`)の検出④CAPTCHA・5xxのマーカー（既存の#18/#19）⑤複数ページ巡回での「次へ」の挙動は既存の移植元のとおりで、新方式のURL（セラー店頭）では未確認。
+**検証方法**: 疑似ページ・疑似ブラウザ＋使い捨てtest-db（`tests/integration/test_acquisition_runner.py`、`tests/unit/test_source_runner.py`）。外部接続・ブラウザ起動なし。
+**残作業（別途）**: 起点ASINからの新規セラー発見、反対側市場（US→JPなど）への展開、統合ツールへの投入（`tool_execution_link`の対象市場）、取得したASINの`collector_asin`から統合ツール入力への接続の自動化。

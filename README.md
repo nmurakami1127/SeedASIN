@@ -216,3 +216,12 @@ pytest tests/unit
 pytest tests/integration -m integration
 ```
 - 旧証拠の投入: `legacy-select --ledger-jp <xlsx> --ledger-us <xlsx>` → `legacy-apply`（同じ台帳指定）。種別未確認の履歴は `legacy_observe_only_*.csv` を `--classify none` で観測のみ投入。
+
+### 出典管理に接続した取得（段階3、対話式・headed）
+
+```
+python -m asin_collector.cli collect-next   --market JP --origin-import 2 --section IMPORT --max-sources 1 --dry-run   # 対象の確認だけ（ブラウザ・claimなし）
+python -m asin_collector.cli collect-source --market JP --source-id <ID> --max-pages 3                                  # 登録済みの出典を明示して取得
+```
+
+claimで取得間隔・保留・実行中・旧証拠を再判定し、結果（成功/0件確認/上限打切り/部分/失敗/0件未確認/中断）を区別して記録する。詳細は docs/DEVIATIONS.md #58。

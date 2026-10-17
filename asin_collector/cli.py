@@ -39,6 +39,12 @@ asin_collector/check_recommendations.pyのモジュールdocstring参照）。CA
     # => exports/collected_asins/collected_asins_3.csv （ヘッダー無し、ASINのみ1行ずつ）
     python -m asin_collector.cli check-recommendations --marketplace=JP \\
         --csv=exports/recommend/recommend_JP_20261007_120000.csv
+
+出典管理（acquisition）に接続した取得（claimで取得間隔・保留・実行中を再判定、heartbeat、結果の区別）:
+    python -m asin_collector.cli collect-source --market=JP --source-id=12 --max-pages=3
+    python -m asin_collector.cli collect-next --market=JP --origin-import=2 --section=IMPORT --max-sources=1 --dry-run
+従来の collect-brand-page / export-run / check-recommendations は変更していない（export-run は新方式の実行も同じ
+collector_asin から書き出せる）。
 """
 from __future__ import annotations
 
@@ -157,6 +163,72 @@ def _cmd_check_recommendations(args: argparse.Namespace) -> None:
         print(f"同じCSVファイル（{args.csv}）でそのまま再実行してください。")
 
 
+def _print_batch(items) -> None:
+    for it in items:
+        if it.result == "SKIPPED":
+            print(f"  source_id={it.source_id}: 実行しませんでした（{it.reason}）")
+            continue
+        r = it.report
+        extra = f" error={r.error_code}" if r.error_code else ""
+        held = " 【連続失敗により自動保留】" if r.auto_held else ""
+        print(f"  source_id={it.source_id} run={r.run_id}: {r.outcome} ページ{r.pages} ASIN{r.asins}{extra}{held}"
+              + (f" {r.detail}" if r.detail and r.outcome != "SUCCESS_NONEMPTY" else ""))
+
+
+def _limits(args: argparse.Namespace):
+    from asin_collector.source_runner import RunLimits
+
+    return RunLimits(max_pages=args.max_pages, max_asins=args.max_asins)
+
+
+def _run_in_browser(factory: SessionFactory, marketplace: str, source_ids: list[int], args: argparse.Namespace) -> None:
+    from acquisition.lease import AcquisitionRunService
+    from asin_collector.browser_session import open_browser
+    from asin_collector.source_runner import PlaywrightFetcher, run_batch
+
+    service = AcquisitionRunService(factory)
+    with open_browser(marketplace) as context:  # 取得先市場に対応するプロファイル
+        fetcher = PlaywrightFetcher(context.new_page())
+        warning = fetcher.delivery_warning(marketplace)
+        if warning:
+            print(f"[警告] {warning}")
+        items = run_batch(service, factory, fetcher, marketplace, source_ids, limits=_limits(args))
+    _print_batch(items)
+
+
+def _cmd_collect_source(args: argparse.Namespace) -> None:
+    factory = SessionFactory.for_app_role()
+    _run_in_browser(factory, args.market, [args.source_id], args)
+
+
+def _cmd_collect_next(args: argparse.Namespace) -> None:
+    from acquisition.plan import PlanError, build_plan
+    from asin_collector.source_runner import select_targets
+    from origin_selection.report_import import ReportImportService
+
+    factory = SessionFactory.for_app_role()
+    try:
+        plan = build_plan(factory, ReportImportService(factory, None), args.market, args.origin_import)
+        targets = select_targets(plan, args.section, args.max_sources, include_zero_units=args.include_zero_units,
+                                 include_no_origin=args.include_no_origin)
+    except (PlanError, ValueError) as exc:
+        raise SystemExit(f"[中止] {exc}")
+    print(f"取得先市場={args.market} 区分={args.section} 判定時刻={plan.as_of:%Y-%m-%d %H:%M} UTC 対象{len(targets)}件")
+    for e in targets:
+        origin = f"起点{e.rep.asin} 注文{e.rep.units}点" if e.rep else "起点なし"
+        print(f"  #{e.rank} source_id={e.facts.source_id} {e.facts.source_type} {e.facts.display_primary} {e.group} ({origin})")
+    if args.dry_run or not targets:
+        print("（--dry-run: ブラウザは起動せず、claimもしていません）" if args.dry_run else "実行対象がありません")
+        return
+    _run_in_browser(factory, args.market, [e.facts.source_id for e in targets], args)
+
+
+def _add_run_options(sp: argparse.ArgumentParser) -> None:
+    sp.add_argument("--market", required=True, choices=["US", "JP"], help="取得先市場（ブラウザプロファイルもこの市場のものを使う）")
+    sp.add_argument("--max-pages", type=int, default=5, help="1出典あたりの最大ページ数（上限で打ち切ると SUCCESS_TRUNCATED。既定: 5）")
+    sp.add_argument("--max-asins", type=int, default=None, help="1出典あたりの最大ASIN数（任意）")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="python -m asin_collector.cli")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -198,6 +270,27 @@ def build_parser() -> argparse.ArgumentParser:
         "処理を中断する（既定値: 5）",
     )
     p_check.set_defaults(func=_cmd_check_recommendations)
+
+    p_src = subparsers.add_parser(
+        "collect-source",
+        help="acquisitionに登録済みの出典（source_id）を明示して取得する（対話式。claimで取得間隔・保留・実行中を再判定）",
+    )
+    _add_run_options(p_src)
+    p_src.add_argument("--source-id", required=True, type=int)
+    p_src.set_defaults(func=_cmd_collect_source)
+
+    p_next = subparsers.add_parser(
+        "collect-next",
+        help="取得計画（acquire-plan）の上位から取得する（対話式）。注文0点・起点なしは既定で対象外、件数は上限付き",
+    )
+    _add_run_options(p_next)
+    p_next.add_argument("--origin-import", required=True, type=int, action="append", help="順位に使うレポートのimport_id（明示）")
+    p_next.add_argument("--section", required=True, choices=["EXPORT", "IMPORT", "ALL"], help="どの方向の順位を使うか")
+    p_next.add_argument("--max-sources", type=int, default=1, help="実行する出典数の上限（既定: 1、最大20）")
+    p_next.add_argument("--include-zero-units", action="store_true", help="注文0点の起点しかない出典も対象にする")
+    p_next.add_argument("--include-no-origin", action="store_true", help="起点のない出典も対象にする")
+    p_next.add_argument("--dry-run", action="store_true", help="対象を表示するだけ（ブラウザ起動・claimなし）")
+    p_next.set_defaults(func=_cmd_collect_next)
 
     return parser
 

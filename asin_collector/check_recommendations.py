@@ -78,6 +78,7 @@ from tool_intake.csv_utils import column_index, read_csv_rows
 
 # Amazon内部のウィジェットID（表示言語に依存しない、JP/US双方の実ページで確認済み）。
 _NO_RESULTS_MARKER = 'data-csa-c-content-id="messaging-messages-no-results"'
+NO_RESULTS_MARKER = _NO_RESULTS_MARKER  # 他モジュール(source_runner)から参照する公開名
 
 # brand_page_collector.pyと同じ値（一時的な500/503エラーからの自動リトライ、
 # docs/DEVIATIONS.md #19参照）。
