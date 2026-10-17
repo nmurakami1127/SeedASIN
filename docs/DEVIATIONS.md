@@ -1000,3 +1000,18 @@ PERMANENTLY_EXCLUDEDは引き続き完全除外のまま変更しない。
 **実ページで未検証**: 商品ページのセレクタ（bylineInfo / po-brand / merchant-info / aod-offer-list 等）、404の挙動、出品一覧パネルが商品ページ内に出るか（出ない場合は`BUYBOX_ONLY`止まりで、全出品者の取得には別の画面が要る）、Amazon自身の出品者ID（US ATVPDKIKX0DER / JP AN1VRQENFRJN5）。
 
 **スキーマ変更案（保留。不可欠ではない）**: ①出典種別`ASIN_PAGE`の追加（acquisition_source / acquisition_interval_config / 旧証拠のCHECKとシード）で、商品ページ調査を他の出典と同じ claim・lease・間隔に乗せる ②`acquisition_path`に抽出元・セラー範囲・ページ市場・調査runの構造化列（現在はnote JSON）③展開数の上限を設定テーブル化（`processing_limit_config`のlimit_typeはCHECKで固定のため拡張が要る）。
+
+
+**#59 改訂追記（2026-10-17、実地試行前の修正。上の記述のうち、以下が置き換わる）**
+
+1. **商品ページ調査の実行管理（lease付き）**: 既存のclaimの保護は`source_id`のある行にしか効かない（保護トリガー・ユニーク索引・`AcquisitionRunService`）ため、`run_type`を付けただけでは効かない。`AsinPageGuard`がアプリ層で同等の保護を行う: 全ての書き込み（heartbeat・CAPTCHA待機・登録の直前・終了・中断）で 行ロック(FOR UPDATE)→トークン→状態→DB時刻のlease の順に検証、期限切れの回収（`begin`時と`reap-asin-pages`）、人による中断（`abort-asin-page`）、回収・終了済みの行に旧プロセスが書くと`LeaseLost`、heartbeatは別スレッド（CAPTCHA待機中も継続・待機中はDB上`CAPTCHA_WAIT`でlease長め）、二重起動は識別ロック＋有効なleaseの行で拒否。**DBが強制するものではない**（下のスキーマ変更案を参照）。
+2. **連続失敗の自動停止（出典のAUTO_HOLDと同じ意味）**: 失敗(FAILED)が連続3回で`AUTO_STOPPED`。**期限では戻らず、`release-asin-page --page-market --asin --reason`（理由必須）で解除するまで続く**。解除は履歴の行（error_code=RELEASE_HOLD）を追記し、以降それ以前の失敗は数えない。失敗後は60分の冷却。中断(Ctrl+C・手動中断)・lease失効は失敗に数えない。成功（COMPLETED）でも数え直す。停止理由は`show-asin-page`で確認できる。
+3. **Amazon自身の除外**: 以前コードに入れていたJPの`AN1VRQENFRJN5`は、リポジトリ・DBに根拠が無い未確認の値だったため**削除**。販売元IDではない**市場ID**を市場ごとに除外する（`MARKETPLACE_IDS`: US `ATVPDKIKX0DER` は利用者が実ブラウザで確認したURLの`marketplaceID=`、JP `A1VC38T7YXB528` はJPの市場ID）。両IDとも、DBの`known_seller_master`・`storefront_blocked_seller`(RETRY_LATER)にセラーとして記録されており、URLの市場IDの誤記録の疑いがある（JP台帳にも店名"toprakk"の行に同じ値）。**JPのAmazon.co.jp自身の販売元IDは確認できていないため、IDでは除外しない**。代わりに、表示名がAmazon小売と完全一致する出品者（`amazon` / `amazon.com` / `amazon.co.jp` / `amazon.com services llc`）は登録せず`NEEDS_REVIEW_AMAZON_NAME`として報告する（IDを人が確認し、販売元なら`storefront_blocked_seller`へ）。**配送元がAmazonなだけのFBA出品者は、販売元IDが別なので除外しない**（`Amazon Fan Shop`のように名前にAmazonを含むだけの出品者も除外しない）。
+4. **反対側市場への展開**: 元ASINを取る実行は`COMPLETED`かつ結果が`SUCCESS_NONEMPTY`または`SUCCESS_TRUNCATED`のものだけ（PARTIAL・UNVERIFIED_EMPTY・FAILEDは使わない）。上限打切りの結果を使うときは「ASINの一部だけ」と明示。**過去の取得結果を使うだけで、出典の再取得はしない**（再取得は`collect-source`。30日間隔を通る）。過去の結果の古さは`--max-run-age-days`（既定30日）、実行は`--run-id`で指定可。代表起点は`--origin-import`で明示した**ACTIVEのimportに属する経路だけ**から選び（`register_via_path(allowed_origin_import_ids=)`）、該当が無ければ登録しない。
+5. **同じ商品ページの再調査**: 調査を**ページ単位**にした（targetにrouteを含めない）。抽出結果（出品者・ブランド・範囲。自社・Amazon等の除外前の生の結果）を完了した行の`collector_run.error_message`にJSONで保存し、30日以内は後から別route（SELLER→BRAND）を求められても**ページへ再アクセスせず保存済みの結果から登録**する（`REUSED`）。30日を過ぎたら再取得。保存結果が壊れている場合は再取得せず止める。商品ページと確認できても出品者もブランドも抽出できない場合は成功に数えない（`FOUND_NO_DATA`）。同じrouteの再適用は冪等（出典・経路は増えない）。`--after-rank`で調査済みの上位を飛ばして進められる。
+
+**スキーマ変更案（具体案。実DBには未適用・保留）**
+- A. 商品ページ調査の実行管理をDBに強制させる（マイグレーション0017案）: ①`collector_run_guard()`を拡張し、`run_type='ASIN_PAGE'`の行も 終了済みは書き換え不可・`attempt_token`/`marketplace`は不変 にする ②`CHECK (run_type <> 'ASIN_PAGE' OR (attempt_token IS NOT NULL AND lease_expires_at IS NOT NULL AND lease_seconds IS NOT NULL))` ③部分ユニーク索引`uk_collector_run_one_active_asin_page ON collector_run (marketplace, target) WHERE run_type = 'ASIN_PAGE' AND status IN ('RUNNING','CAPTCHA_WAIT')`（二重起動をDBが拒否）。いずれも追加のみで既存行に影響しない。downgradeで制約・索引を削除しトリガーを元に戻す。
+- B. 抽出結果の保存先を`error_message`から専用列（`page_extraction JSONB`）へ。
+- C. （代替案）出典種別`ASIN_PAGE`を追加して、claim・lease・間隔を出典と完全に共通化（acquisition_source / acquisition_interval_config / 旧証拠のCHECKとシード、planの対象から除外する処理が要る）。A+Bで足りるなら不要。
+- D. `acquisition_path`の抽出元・セラー範囲・ページ市場・調査runの構造化列（現在はnote JSON）、展開数の上限の設定テーブル化。

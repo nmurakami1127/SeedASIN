@@ -153,7 +153,8 @@ class PageOutcome:
 
 def fetch_product_page(
     fetcher: PageFetcher, market: str, asin: str, *, server_error_retries: int = 2, server_error_wait: float = 5.0,
-    sleep: Callable[[float], None] = time.sleep,
+    sleep: Callable[[float], None] = time.sleep, on_captcha_start: Callable[[], None] | None = None,
+    on_captcha_end: Callable[[], None] | None = None,
 ) -> PageOutcome:
     """商品詳細ページを1ページ取得して分類する。CAPTCHAは回避せず、人の対応を1回だけ待って1回だけ再取得する。
     5xxは数回まで自動リトライ。いずれも同じ対象を繰り返し試すことはしない。"""
@@ -168,10 +169,14 @@ def fetch_product_page(
             captcha_rounds += 1
             if captcha_rounds > 1:
                 return PageOutcome("CAPTCHA_UNSOLVED", detail="CAPTCHAが解消しませんでした", url=url)
+            if on_captcha_start:
+                on_captcha_start()  # DB上でCAPTCHA待機を見える化し、leaseを長めに延ばす
             try:
                 fetcher.wait_for_captcha_solved()
             except CaptchaNotSolved as exc:
                 return PageOutcome("CAPTCHA_UNSOLVED", detail=str(exc)[:300], url=url)
+            if on_captcha_end:
+                on_captcha_end()
             continue
         if (page.status is not None and page.status >= 500) or html_is_server_error(page.html):
             attempt += 1
@@ -181,3 +186,33 @@ def fetch_product_page(
             return PageOutcome("SERVER_ERROR", detail=f"5xx/エラーページが{attempt}回続きました（status={page.status}）", url=url)
         res = extract_product_page(page.html, page.status)
         return PageOutcome(res.status, result=res, url=url)
+
+
+# ---------------------------------------------------------------------- 調査結果の保存形式（同じページの再利用用）
+
+def result_to_json(r: ProductPageResult) -> str:
+    """抽出結果（自社・Amazon等の除外前の生の結果）をJSONにする。`collector_run.error_message`に保存し、30日の間は
+    同じページへ再アクセスせずに、別のroute（SELLER→BRANDなど）の登録に再利用する。"""
+    import json
+
+    return json.dumps({
+        "v": 1, "status": r.status, "seller_scope": r.seller_scope, "notes": r.notes,
+        "sellers": [{"id": s.seller_id, "name": s.name, "region": s.region} for s in r.sellers],
+        "brands": [{"type": b.source_type, "key": b.key, "basis": b.basis} for b in r.brands],
+    }, ensure_ascii=False)
+
+
+def result_from_json(text_: str | None) -> ProductPageResult | None:
+    import json
+
+    if not text_ or not text_.startswith("{"):
+        return None
+    try:
+        d = json.loads(text_)
+        if d.get("v") != 1:
+            return None
+        return ProductPageResult(
+            d["status"], [SellerRef(s["id"], s.get("name"), s["region"]) for s in d["sellers"]],
+            [BrandRef(b["type"], b["key"], b["basis"]) for b in d["brands"]], d["seller_scope"], list(d.get("notes", [])))
+    except (ValueError, KeyError, TypeError):
+        return None

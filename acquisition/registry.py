@@ -165,21 +165,26 @@ class SourceRegistry:
         via_source_id: int,
         via_asin: str,
         note: str | None = None,
+        allowed_origin_import_ids: list[int] | None = None,
     ) -> RegisteredPath:
         """取得済みの出典(via_market, via_source_id)が持っていたASINから、別の市場`marketplace`で見つけた出典を登録する
         （VIA_SOURCE経路）。起点の指標・方向は、元の出典の代表起点（注文点数→セッション→獲得率が最良の起点）から
-        **コピー**し、順位を引き継ぐ。元の出典に起点が無ければ、起点なし（方向・指標なし）の経路になる。"""
-        source = self.register_source(marketplace, source_type, primary, qualifier)
+        **コピー**し、順位を引き継ぐ。`allowed_origin_import_ids`を指定したときは、そのimportに属する起点経路だけを代表起点にし、
+        無ければ登録しない（OriginError）。未指定で元の出典に起点が無ければ、起点なし（方向・指標なし）の経路になる。"""
         with self._app.get_session(via_market) as conn, conn.begin():
             rep = conn.execute(
                 text(
                     "SELECT direction, origin_marketplace, origin_import_id, origin_asin, origin_units, origin_sessions, "
                     "origin_buybox_max_pct FROM acquisition_path WHERE source_id = :sid AND marketplace = :mp "
-                    "AND stage = 'ORIGIN_ASIN' ORDER BY origin_units DESC, origin_sessions DESC, "
-                    "origin_buybox_max_pct DESC, origin_asin LIMIT 1"
+                    "AND stage = 'ORIGIN_ASIN' AND (CAST(:ids AS bigint[]) IS NULL OR origin_import_id = ANY(:ids)) "
+                    "ORDER BY origin_units DESC, origin_sessions DESC, origin_buybox_max_pct DESC, origin_asin LIMIT 1"
                 ),
-                {"sid": via_source_id, "mp": via_market},
+                {"sid": via_source_id, "mp": via_market, "ids": allowed_origin_import_ids},
             ).one_or_none()
+        if allowed_origin_import_ids is not None and rep is None:
+            # 指定したimport以外（過去レポート）の経路は代表起点に使わない。起点なしの経路にもしない（登録しない）。
+            raise OriginError(f"source_id={via_source_id} には指定したimport {allowed_origin_import_ids} の起点経路がありません")
+        source = self.register_source(marketplace, source_type, primary, qualifier)
         params = {"direction": None, "om": None, "oi": None, "oa": None, "ou": None, "os": None, "ob": None}
         if rep is not None:
             params = {"direction": rep.direction, "om": rep.origin_marketplace, "oi": rep.origin_import_id,

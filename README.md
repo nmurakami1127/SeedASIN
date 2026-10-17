@@ -235,7 +235,12 @@ claimで取得間隔・保留・実行中・旧証拠を再判定し、結果（
 ```
 python -m acquisition.cli own-account-add --market JP --account-id <自社セラーID>   # 自社ID（未設定の市場では発見を実行しない）
 python -m asin_collector.cli discover-origin --origin-import 2 --page-market JP --routes SELLER --dry-run   # 対象・上限の確認だけ
-python -m asin_collector.cli discover-cross --via-market US --via-source-id <ID> --page-market JP --routes SELLER --dry-run
+python -m asin_collector.cli discover-cross --via-market US --via-source-id <ID> --origin-import 1 --page-market JP --routes SELLER --dry-run
+python -m asin_collector.cli show-asin-page --page-market JP --asin <ASIN>      # 実行可/再利用可/停止中
+python -m asin_collector.cli release-asin-page --page-market JP --asin <ASIN> --reason "<理由>"   # 連続3回失敗の自動停止を解除
 ```
+
+- 商品ページの調査はlease付き（中断・期限切れ回収・旧プロセスの再開拒否）。同じページは30日間再アクセスせず、保存済みの結果から別route（SELLER→BRAND）を登録する。
+- 反対側市場への展開は、取得済みの出典の**過去の取得結果**（成功/上限打切り）を使うだけで再取得はしない。代表起点は`--origin-import`で明示したACTIVEのimportに限る。
 
 起点ASINの商品ページ（`--page-market`で市場を明示）から他セラー/ブランドを出典として登録する。登録後の取得は `collect-next`（plan・claim・30日間隔を通る）。詳細・未検証事項・スキーマ変更案は docs/DEVIATIONS.md #59。

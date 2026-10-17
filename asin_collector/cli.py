@@ -270,19 +270,22 @@ def _cmd_discover_origin(args: argparse.Namespace) -> None:
         limits = _discovery_limits(args)
         svc = DiscoveryService(factory)
         own = load_own_account_ids(factory, args.page_market)
-        sel = svc.select_origins(args.origin_import, args.page_market, routes, limits, args.include_zero_units)
+        sel = svc.select_origins(args.origin_import, args.page_market, limits, args.include_zero_units, args.after_rank)
         print(f"起点レポート import_id={args.origin_import}（市場{sel.origin_market}）→ 商品ページの市場={args.page_market} 経路={routes}")
         print(f"自社セラーID({args.page_market}): " + (f"{len(own)}件設定済み" if own else "未設定 — 実行できません"))
         print(f"上限: 起点ASIN{limits.max_origin_asins} / 起点ごとの出典{limits.max_sources_per_origin}")
-        for c in sel.selected:
-            print(f"  調査対象 #{c.rank} {c.asin} 注文{c.units_sum}点 セッション{c.sessions_sum} → https://…/dp/{c.asin}")
+        for pk in sel.selected:
+            c = pk.candidate
+            how = "ページを取得" if pk.mode == "FETCH" else f"保存済みの調査結果を再利用(run={pk.stored_run_id}。ページへはアクセスしない)"
+            print(f"  調査対象 #{c.rank} {c.asin} 注文{c.units_sum}点 セッション{c.sessions_sum} → {how}")
         for asin, state, until in sel.skipped:
             print(f"  見送り {asin}: {state}" + (f"（{until:%Y-%m-%d %H:%M} UTCまで）" if until else ""))
         if args.dry_run:
             print("（--dry-run: 取得も登録もしていません）想定: 調査ごとにcollector_run(ASIN_PAGE)1行、見つかった出典ごとにacquisition_source/pathを追加")
             return
         _discover_in_browser(factory, args.page_market, args, lambda f: run_origin_discovery(
-            svc, f, args.origin_import, args.page_market, routes, limits, include_zero_units=args.include_zero_units))
+            svc, f, args.origin_import, args.page_market, routes, limits, include_zero_units=args.include_zero_units,
+            after_rank=args.after_rank))
     except DiscoveryError as exc:
         raise SystemExit(f"[中止] {exc}")
 
@@ -297,20 +300,48 @@ def _cmd_discover_cross(args: argparse.Namespace) -> None:
         limits = _discovery_limits(args)
         svc = DiscoveryService(factory)
         own = load_own_account_ids(factory, args.page_market)
-        asins, skipped, run_id = svc.select_cross_asins(args.via_market, args.via_source_id, args.page_market, routes, limits)
-        print(f"取得済みの出典 {args.via_market}/source_id={args.via_source_id}（run={run_id}）→ 反対側市場{args.page_market}の商品ページ 経路={routes}")
+        sel = svc.select_cross_asins(args.via_market, args.via_source_id, args.page_market, limits, args.origin_import,
+                                     max_run_age_days=args.max_run_age_days, run_id=args.run_id)
+        print(f"取得済みの出典 {args.via_market}/source_id={args.via_source_id} の過去の取得結果を使用: run={sel.run_id} 結果={sel.run_outcome}"
+              f"（{sel.run_age_days:.1f}日前）。出典の再取得はしません（再取得は collect-source。30日間隔を通ります）"
+              + ("。上限打切りの結果なので、ASINの一部だけです" if sel.truncated else ""))
+        print(f"→ 反対側市場{args.page_market}の商品ページ 経路={routes} 起点は import {args.origin_import} のものに限る")
         print(f"自社セラーID({args.page_market}): " + (f"{len(own)}件設定済み" if own else "未設定 — 実行できません"))
         print(f"上限: 展開ASIN{limits.max_cross_asins} / ASINごとの出典{limits.max_cross_sources_per_asin}")
-        for a in asins:
-            print(f"  調査対象 {a}（{args.page_market}に存在するかは未確認）")
-        for a, state, until in skipped:
+        for pk in sel.picks:
+            how = "ページを取得" if pk.mode == "FETCH" else f"保存済みの調査結果を再利用(run={pk.stored_run_id})"
+            print(f"  調査対象 {pk.asin}（{args.page_market}に存在するかは未確認）{how}")
+        for a, state, until in sel.skipped:
             print(f"  見送り {a}: {state}" + (f"（{until:%Y-%m-%d %H:%M} UTCまで）" if until else ""))
         if args.dry_run:
             print("（--dry-run: 取得も登録もしていません）")
             return
         _discover_in_browser(factory, args.page_market, args, lambda f: run_cross_discovery(
-            svc, f, args.via_market, args.via_source_id, args.page_market, routes, limits))
+            svc, f, args.via_market, args.via_source_id, args.page_market, routes, limits, args.origin_import,
+            max_run_age_days=args.max_run_age_days, run_id=args.run_id))
     except DiscoveryError as exc:
+        raise SystemExit(f"[中止] {exc}")
+
+
+def _cmd_asin_page(args: argparse.Namespace) -> None:
+    from acquisition.discovery import AsinPageGuard
+
+    guard = AsinPageGuard(SessionFactory.for_app_role())
+    try:
+        if args.command == "release-asin-page":
+            guard.release(args.page_market, args.asin, args.reason)
+            print("自動停止を解除しました（以降、それ以前の失敗は連続失敗に数えません。履歴の行は残っています）")
+        elif args.command == "abort-asin-page":
+            guard.abort_run(args.page_market, args.run_id, args.reason)
+            print("中断として確定しました（USER_ABORT。失敗には数えません）")
+        elif args.command == "reap-asin-pages":
+            print(f"期限切れの調査を{len(guard.reap_expired(args.page_market))}件、INTERRUPTED(LEASE_EXPIRED)に確定しました")
+        else:
+            lk = guard.lookup(args.page_market, args.asin)
+            print(f"{args.asin} ({args.page_market}): {lk.state}" + (f" 〜{lk.until:%Y-%m-%d %H:%M} UTC" if lk.until else "")
+                  + (f" 連続失敗{lk.failures}" if lk.failures else "")
+                  + (" ／ 自動停止中: release-asin-page で解除（理由必須）" if lk.state == "AUTO_STOPPED" else ""))
+    except ValueError as exc:
         raise SystemExit(f"[中止] {exc}")
 
 
@@ -402,6 +433,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_discovery_options(p_do)
     p_do.add_argument("--origin-import", required=True, type=int, help="起点にするACTIVEレポートのimport_id（明示）")
     p_do.add_argument("--include-zero-units", action="store_true", help="注文0点の起点ASINも調べる（既定: 調べない）")
+    p_do.add_argument("--after-rank", type=int, default=0, help="このrankより後の起点ASINだけを対象にする（先に調べた上位を飛ばして進める）")
     p_do.set_defaults(func=_cmd_discover_origin)
 
     p_dc = subparsers.add_parser(
@@ -411,7 +443,25 @@ def build_parser() -> argparse.ArgumentParser:
     _add_discovery_options(p_dc)
     p_dc.add_argument("--via-market", required=True, choices=["US", "JP"], help="取得済みの出典の市場")
     p_dc.add_argument("--via-source-id", required=True, type=int, help="取得済みの出典のsource_id")
+    p_dc.add_argument("--origin-import", required=True, type=int, action="append",
+                      help="代表起点に使うACTIVEレポートのimport_id（明示。過去レポートの経路は使わない。複数指定可）")
+    p_dc.add_argument("--run-id", type=int, default=None, help="使う過去の取得結果のrun_id（省略時は成功/上限打切りの最新）")
+    p_dc.add_argument("--max-run-age-days", type=int, default=30, help="使ってよい過去の取得結果の古さ（既定30日）")
     p_dc.set_defaults(func=_cmd_discover_cross)
+
+    for name, help_ in (("release-asin-page", "商品ページ調査の自動停止（連続3回の失敗）を解除する（理由必須）"),
+                        ("abort-asin-page", "実行中の商品ページ調査を中断として確定する（プロセスが死んでいると分かっている場合。理由必須）"),
+                        ("reap-asin-pages", "期限切れの商品ページ調査を回収する"),
+                        ("show-asin-page", "商品ページ調査の状態（実行可/再利用可/停止中）を表示する")):
+        sp = subparsers.add_parser(name, help=help_)
+        sp.add_argument("--page-market", required=True, choices=["US", "JP"])
+        if name in ("release-asin-page", "show-asin-page"):
+            sp.add_argument("--asin", required=True)
+        if name == "abort-asin-page":
+            sp.add_argument("--run-id", required=True, type=int)
+        if name in ("release-asin-page", "abort-asin-page"):
+            sp.add_argument("--reason", required=True)
+        sp.set_defaults(func=_cmd_asin_page)
 
     return parser
 
