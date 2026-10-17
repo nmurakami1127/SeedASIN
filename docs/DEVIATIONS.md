@@ -981,3 +981,8 @@ PERMANENTLY_EXCLUDEDは引き続き完全除外のまま変更しない。
 - JP: source_id=9 (A2K28GPVO862U1) run=78 `SUCCESS_TRUNCATED`(PAGE_LIMIT) 1ページ16 ASIN（重複なし）。設定どおり30日に数えられ、再取得可能は2026-11-16 08:24 UTC。claim/planとも`TOO_RECENT`で拒否されることを確認。既存の`collector_run`76行はハッシュ一致で無変更。
 - **配送先の不一致**: JPプロファイルは「お届け先: 153-0064」（想定289-1223）、USプロファイルは「Deliver to Japan」（想定97005）。表示ブロック`#glow-ingress-block`のセレクタは実ページで有効と確認（上記の検出は実ページ検証済み）。プログラムでは設定しない方針のため、人が設定する。JPのrun 78は想定外の配送先で取得されている（商品一覧の見え方に影響し得る）。USは配送先確認後に実行するため未実行（source_id=10 登録のみ、ELIGIBLE_NEVER）。
 - 追加: 標準入力が使えない実行でのCAPTCHAは、画面で人が解くのをポーリングして待つ（回避しない。時間切れは`CAPTCHA_UNSOLVED`）。`--require-delivery-match`（配送先が確認できなければclaim前に中止。既定は警告のみ）。
+
+**#58 追記2: 配送先を手動設定した後のUS実地確認（2026-10-17）**
+- 人が手動でお届け先を設定（US: Beaverton 97005 / JP: 山武市埴谷 289-1223）し、表示の一致を確認してから実行（自動変更なし）。US: source_id=10 (AB49KC99NVKLD) run=79 `SUCCESS_TRUNCATED`(PAGE_LIMIT) 1ページ16 ASIN（重複なし・JPのrun 78との重複0）、`--require-delivery-match`付きで警告なし。claim/planとも`TOO_RECENT`、再取得可能は2026-11-16 08:37 UTC。
+- **JP run 78 は配送先153-0064（想定外）で取得した結果**。削除・補正・再取得はしていない。接続確認としては有効だが、想定配送先（289-1223）での取得品質は**未検証**のまま（30日制限により当面再取得しない）。
+- 既存の`collector_run`（id<=77）はハッシュ一致で無変更。旧RUNNING(33/38)・保留・レポートも無変更。

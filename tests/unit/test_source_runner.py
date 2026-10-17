@@ -57,3 +57,56 @@ def test_browser_profile_is_per_target_market_and_headed(market, monkeypatch, tm
     with browser_session.open_browser(market):
         pass
     assert calls["dir"] == tmp_path / market.lower() and calls["headless"] is False and calls["closed"]
+
+
+def test_require_delivery_match_stops_before_claim_and_default_only_warns(monkeypatch, capsys):
+    import argparse
+
+    from asin_collector import cli, source_runner
+
+    events = []
+
+    class FakeCtx:
+        def new_page(self):
+            return object()
+
+    @contextmanager
+    def fake_open(market):
+        events.append(("open", market))
+        yield FakeCtx()
+
+    class FakeFetcher:
+        def __init__(self, page):
+            pass
+
+        def delivery_warning(self, market):
+            return "配送先が確認できません"
+
+    monkeypatch.setattr(browser_session, "open_browser", fake_open)
+    monkeypatch.setattr(source_runner, "PlaywrightFetcher", FakeFetcher)
+    monkeypatch.setattr(source_runner, "run_batch", lambda *a, **k: events.append(("run_batch",)) or [])
+    monkeypatch.setattr(cli, "_print_batch", lambda items: None)
+    base = dict(max_pages=1, max_asins=None)
+    cli._run_in_browser(object(), "US", [10], argparse.Namespace(require_delivery_match=True, **base))
+    assert ("run_batch",) not in events  # claim/取得の前に止まる（取得履歴・失敗回数を増やさない）
+    assert "中止" in capsys.readouterr().out
+    cli._run_in_browser(object(), "US", [10], argparse.Namespace(require_delivery_match=False, **base))
+    assert ("run_batch",) in events  # 既定は警告のみで続行
+
+
+def test_captcha_polling_waits_for_a_human_without_stdin_and_times_out(monkeypatch):
+    import sys
+
+    from asin_collector import source_runner
+    from asin_collector.source_runner import CaptchaNotSolved, PlaywrightFetcher
+
+    monkeypatch.setattr(sys, "stdin", None)  # 端末なし
+    monkeypatch.setattr(source_runner.time, "sleep", lambda s: None)
+    states = iter([True, True, False])  # 2回はCAPTCHAのまま、人が解いて消える
+    monkeypatch.setattr(browser_session, "is_captcha_page", lambda page: next(states))
+    PlaywrightFetcher(object(), captcha_timeout=60).wait_for_captcha_solved()  # 解かれれば戻る
+    monkeypatch.setattr(browser_session, "is_captcha_page", lambda page: True)
+    clock = iter(range(0, 1000, 20))
+    monkeypatch.setattr(source_runner.time, "monotonic", lambda: next(clock))
+    with pytest.raises(CaptchaNotSolved):
+        PlaywrightFetcher(object(), captcha_timeout=60).wait_for_captcha_solved()
