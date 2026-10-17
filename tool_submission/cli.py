@@ -3,7 +3,7 @@
     python -m tool_submission.cli plan --fetch-market US --run-id 82 [--dry-run]
     python -m tool_submission.cli ledger
     # 手動で投入する場合（画面の手順は docs/DEVIATIONS.md #60）
-    python -m tool_submission.cli baseline  --key <投入キー> --log-html <送信前に保存したログ画面.html>
+    python -m tool_submission.cli begin     --key <投入キー> --log-json <送信直前のログ一覧> --options-json <画面の設定値>   # 送信権の確保・送信開始の記録（SAVEの前）
     python -m tool_submission.cli reconcile --key <投入キー> --log-html <送信後に保存したログ画面.html>
     python -m tool_submission.cli resolve   --key <投入キー> --run-id <実行ID>        # 新規行が複数のとき、人が選ぶ
     python -m tool_submission.cli link-check --key <投入キー>                        # ingest-log後、対応記録済みを確認（DB読み取りのみ）
@@ -26,7 +26,7 @@ from tool_intake.csv_utils import open_text_auto
 from tool_submission.ledger import SubmissionLedger
 from tool_submission.model import SubmissionError
 from tool_submission.planner import build_items, write_plan
-from tool_submission.reconcile import identify_new_entry, parse_log_entries, verify_output
+from tool_submission.reconcile import identify_new_entry, load_log_entries, single_row_html, verify_output
 
 DEFAULT_DIR = Path("exports") / "tool_submission"
 
@@ -92,10 +92,56 @@ def _cmd_baseline(a: argparse.Namespace) -> int:
     if st.state != "PLANNED":
         print(f"[中止] 状態が{st.state}です（基準は送信前の計画段階でだけ記録します）")
         return 2
-    ids = sorted(e.seq for e in parse_log_entries(open_text_auto(Path(a.log_html))))
+    ids = sorted(e.seq for e in load_log_entries(a.log_html))
     ledger.append(a.key, "BASELINE_RECORDED", before_run_ids=ids, manual=True)
     print(f"送信前の基準を記録しました（ログの実行ID {len(ids)}件、最大{max(ids) if ids else '-'}）。続けて統合ツールへ手動で投入してください")
     return 0
+
+
+def _cmd_begin(a: argparse.Namespace) -> int:
+    """送信権の確保と送信開始の記録（自動・手動・外部ブラウザ操作の全てで、ASINの入力・SAVEの前に必須）。"""
+    from tool_submission.model import item_from_manifest
+    from tool_submission.runner import claim_submission
+
+    ledger = _ledger(a)
+    st = _need(ledger, a.key)
+    if st is None:
+        return 2
+    item = item_from_manifest(st.manifest)
+    ids = [e.seq for e in load_log_entries(a.log_json)]
+    options = json.loads(Path(a.options_json).read_text(encoding="utf-8")) if a.options_json else None
+    ok, msg = claim_submission(ledger, item, Path(item.input_file), ids, options)
+    print(("[確保] " if ok else "[中止] ") + msg)
+    if ok:
+        print(f"対象: 取得run={item.collector_run_id} 業務方向={item.direction} ASIN{item.asin_count}件 sha256={item.input_sha256[:16]}… メモ（後付け）={item.memo!r}")
+    return 0 if ok else 2
+
+
+def _cmd_ingest(a: argparse.Namespace) -> int:
+    """既存のingest-logを、この投入の実行IDの1行だけに限定して実行する（DB更新: seller登録・tool_execution_link・取得完了なら出力取込）。"""
+    import tempfile
+
+    from tool_intake.log_ingest import ingest_log
+
+    ledger = _ledger(a)
+    st = _need(ledger, a.key)
+    if st is None:
+        return 2
+    if st.state not in ("MEMO_SAVED", "LINKED") or not st.tool_run_id:
+        print(f"[中止] 状態が{st.state}です（メモ保存の確認後に取り込みます）")
+        return 2
+    try:
+        html = single_row_html(Path(a.row_html).read_text(encoding="utf-8"), int(st.tool_run_id), st.manifest["memo"])
+    except ValueError as exc:
+        print(f"[中止] {exc}")
+        return 2
+    with tempfile.TemporaryDirectory() as td:
+        p = Path(td) / "one_row.html"
+        p.write_text(html, encoding="utf-8")
+        factory = SessionFactory.for_app_role()
+        summary = ingest_log(factory, p, Path(a.output_dir)) if a.output_dir else ingest_log(factory, p)
+    print(summary.format())
+    return 0 if summary.other_errors == 0 and summary.parse_errors == 0 else 3
 
 
 def _cmd_reconcile(a: argparse.Namespace) -> int:
@@ -104,7 +150,7 @@ def _cmd_reconcile(a: argparse.Namespace) -> int:
     if st is None:
         return 2
     m = st.manifest
-    entries = parse_log_entries(open_text_auto(Path(a.log_html)))
+    entries = load_log_entries(a.log_html)
     if st.state in ("MEMO_SAVED", "LINKED"):
         print(f"対応済みです: ツール実行ID={st.tool_run_id}")
         return 0
@@ -254,6 +300,14 @@ def build_parser() -> argparse.ArgumentParser:
     sp = add("baseline", _cmd_baseline, "手動投入の前に、送信前のログ画面（保存HTML）から基準のID一覧を記録する")
     sp.add_argument("--key", required=True)
     sp.add_argument("--log-html", required=True)
+    sp = add("begin", _cmd_begin, "送信権を確保して送信開始を記録する（ASINの入力・SAVEの前に必須。自動・手動・外部ブラウザ操作の全て）")
+    sp.add_argument("--key", required=True)
+    sp.add_argument("--log-json", required=True, help="送信直前のログ一覧のスナップショット（JSONまたは保存HTML）")
+    sp.add_argument("--options-json", default=None, help="画面の設定値（表示名→ON/OFFのJSON。バリエーションを含むこと）")
+    sp = add("ingest", _cmd_ingest, "既存のingest-logを、この投入の実行IDの1行だけに限定して実行する（メモ保存の確認後）")
+    sp.add_argument("--key", required=True)
+    sp.add_argument("--row-html", required=True, help="その実行IDの行（またはログ画面）のHTML")
+    sp.add_argument("--output-dir", default=None, help="統合ツールの出力CSVのフォルダー（既定は既存のingest-logと同じ）")
     sp = add("reconcile", _cmd_reconcile, "送信後に保存したログ画面HTMLから、新しい行の実行IDを特定する（メモ保存の確認も）")
     sp.add_argument("--key", required=True)
     sp.add_argument("--log-html", required=True)

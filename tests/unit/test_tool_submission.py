@@ -395,6 +395,7 @@ def test_crash_after_the_record_is_unknown_not_unexecuted_and_baseline_is_kept(l
 def test_rows_identified_for_another_submission_are_never_adopted(ledger):
     ledger.append("k2", "PLANNED", manifest={})
     ledger.append("k2", "RUN_IDENTIFIED", tool_run_id=7300001)
+    ledger.append("k2", "MEMO_SAVED", tool_run_id=7300001)
     page = FakePage(next_seq=7300002)
     page.rows.append(entry(7300001))  # 他の投入に割り当て済みの、メモがまだ空の行
     r = run(ledger, page)
@@ -547,3 +548,84 @@ def test_adapter_reads_option_values_without_changing_them():
     pg.toggles = {"#v": False, "#cn": True}
     assert ImportToolPage(pg, sel).read_options() == {"バリエーション": False, "CNフラグ除外": True}
     assert [c[0] for c in pg.calls] == ["goto"]  # 読み取りだけ（fill/clickしない）
+
+
+# ---------------------------------------------------------------- 送信権の確保（自動・手動・外部ブラウザ操作の共通の入口）
+
+def _plan_item(tmp_path, ledger, key="kb", n=3):
+    import hashlib
+    from dataclasses import asdict
+
+    asins = [f"B0TEST{i:04d}" for i in range(n)]
+    data = asin_file_bytes(asins)
+    f = tmp_path / f"{key}.csv"
+    f.write_bytes(data)
+    it = item(key=key, n=n)
+    it.input_file, it.input_sha256 = str(f), hashlib.sha256(data).hexdigest()
+    ledger.append(key, "PLANNED", manifest=asdict(it))
+    return it, f
+
+
+OPTS_OK = {"CNフラグ除外": True, "バリエーション": False}
+
+
+def test_claim_submission_records_the_start_atomically_and_only_once(ledger, tmp_path):
+    from tool_submission.runner import claim_submission
+
+    it, f = _plan_item(tmp_path, ledger)
+    ok, msg = claim_submission(ledger, it, f, [3, 1, 2], OPTS_OK)
+    assert ok and "SAVEを1回だけ" in msg
+    st = ledger.state("kb")
+    assert (st.state, st.attempts, st.before_run_ids, st.options) == ("SUBMITTING", 1, [1, 2, 3], OPTS_OK)
+    ok2, msg2 = claim_submission(ledger, it, f, [1], OPTS_OK)
+    assert not ok2 and "再送しません" in msg2 and ledger.state("kb").attempts == 1  # 送信済みの計画には送信権を与えない
+
+
+def test_claim_submission_refuses_on_hash_count_memo_options_or_other_pending(ledger, tmp_path):
+    from tool_submission.runner import claim_submission, pending_others
+
+    it, f = _plan_item(tmp_path, ledger)
+    assert claim_submission(ledger, it, f, [], None)[0] is False  # 設定値を読めていない
+    assert "バリエーション" in claim_submission(ledger, it, f, [], {"バリエーション": True})[1]
+    assert "判定不能" in claim_submission(ledger, it, f, [], {"CNフラグ除外": True})[1]  # バリエーションの値が無い
+    f.write_bytes(f.read_bytes() + b"B0EXTRA000\n")
+    assert "ハッシュ" in claim_submission(ledger, it, f, [], OPTS_OK)[1]
+    f.write_bytes(asin_file_bytes([f"B0TEST{i:04d}" for i in range(3)]))
+    bad = item(key="kb", n=3, memo="輸入_A3AJLR7DMJUOQG")  # 業務方向とメモが食い違う
+    bad.input_file, bad.input_sha256 = str(f), it.input_sha256
+    assert "メモ" in claim_submission(ledger, bad, f, [], OPTS_OK)[1]
+    ledger.append("k1", "SUBMIT_STARTED", before_run_ids=[], attempt=1)  # 別の計画が送信中（未完了）
+    assert pending_others(ledger, "kb") == ["k1"]
+    assert "別の投入が未完了" in claim_submission(ledger, it, f, [], OPTS_OK)[1]
+    ledger.append("k1", "RUN_IDENTIFIED", tool_run_id=7300001)
+    assert pending_others(ledger, "kb") == ["k1"]  # 実行ID確定でもメモ未保存の間は次へ進まない
+    ledger.append("k1", "MEMO_SAVED", tool_run_id=7300001)
+    assert pending_others(ledger, "kb") == [] and claim_submission(ledger, it, f, [], OPTS_OK)[0]
+    assert ledger.state("kb").state == "SUBMITTING"
+    with ledger.key_lock("GLOBAL-SUBMIT"):  # ロック中は確保できない（同じマシン内の別プロセスだけ。別PC・別ブラウザは防げない）
+        it2, f2 = _plan_item(tmp_path, ledger, key="kc")
+        assert "処理中" in claim_submission(ledger, it2, f2, [], OPTS_OK)[1]
+
+
+def test_runner_refuses_while_another_submission_is_unfinished(ledger):
+    ledger.append("k9", "PLANNED", manifest={})
+    ledger.append("k9", "SUBMIT_STARTED", before_run_ids=[], attempt=1)
+    page = FakePage()
+    r = run(ledger, page)
+    assert r.kind == "REFUSED" and "k9" in r.detail and page.clicks == 0
+
+
+def test_log_snapshot_json_and_single_row_html_limit_the_ingest_to_the_target_row(tmp_path):
+    import json
+
+    from tool_submission.reconcile import load_log_entries, single_row_html
+
+    p = tmp_path / "log.json"
+    p.write_text(json.dumps([{"seq": 7300001, "data_type": "asin_list", "country": "JP", "memo": " ", "status": "待機中", "csv": None}]), encoding="utf-8")
+    assert load_log_entries(p) == [LogEntry(7300001, "asin_list", "jp", "", "待機中", None)]
+    html = single_row_html(LOG_HTML, 7300005, MEMO)
+    assert html.count("<tr") == 1 and "7300005" in html and "7300006" not in html  # 無関係な行（禁止セラー等を含む他の行）を取り込まない
+    with pytest.raises(ValueError, match="メモ"):
+        single_row_html(LOG_HTML, 7300005, "輸入_X")  # メモ保存の確認前は取り込まない
+    with pytest.raises(ValueError, match="0件"):
+        single_row_html(LOG_HTML, 1, MEMO)

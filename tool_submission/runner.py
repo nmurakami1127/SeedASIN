@@ -80,6 +80,58 @@ def submit_item(ledger: SubmissionLedger, page: ToolPage, item: SubmissionItem, 
         return SubmitResult("REFUSED", detail=str(exc))
 
 
+PENDING_STATES = ("SUBMITTING", "UNKNOWN", "AMBIGUOUS", "RUN_IDENTIFIED")
+
+
+def pending_others(ledger: SubmissionLedger, key: str) -> list[str]:
+    """別の投入計画で、結果不明・曖昧・実行ID確定でメモ未保存のものがあれば、そのキー（初回は1件ずつ。完了するまで次へ進まない）。"""
+    return [k for k, s in ledger.all_states().items() if k != key and s.state in PENDING_STATES]
+
+
+def claim_submission(ledger: SubmissionLedger, item: SubmissionItem, input_path: Path, before_run_ids: list[int],
+                     options: dict[str, bool] | None) -> tuple[bool, str]:
+    """送信権を**原子的に**確保して送信開始を台帳に記録する（自動・手動の両方で、SAVEの前に必ず通す）。
+    確認: 計画の存在と状態・入力ファイルのハッシュと件数・メモの規約・画面の設定値（バリエーションOFF）・他の投入が未完了でないこと。
+    確保できたら True（SUBMIT_STARTEDを記録済み）。呼び出し側は、その後にだけASINを入力しSAVEを1回押す。"""
+    import hashlib
+
+    try:
+        with ledger.key_lock(GLOBAL_LOCK):
+            with ledger.key_lock(item.key):
+                st = ledger.state(item.key)
+                if st.state == "NONE":
+                    return False, "投入計画が台帳にありません"
+                if st.state not in ("PLANNED", "NOT_SUBMITTED"):
+                    return False, f"状態が{st.state}です（送信済み・結果不明・対応済みのため再送しません。照合から再開してください）"
+                if st.attempts >= MAX_ATTEMPTS:
+                    return False, f"送信の試行が上限（{MAX_ATTEMPTS}回）に達しています"
+                others = pending_others(ledger, item.key)
+                if others:
+                    return False, f"別の投入が未完了です: {others}（完了するまで次の投入に進みません）"
+                data = Path(input_path).read_bytes()
+                if hashlib.sha256(data).hexdigest() != item.input_sha256:
+                    return False, "入力ファイルのハッシュが計画と違います（改変・取り違えの疑い）"
+                lines = [x for x in data.decode("utf-8").splitlines() if x.strip()]
+                if len(lines) != item.asin_count or len(set(lines)) != len(lines):
+                    return False, f"入力のASIN数({len(lines)})が計画({item.asin_count})と違う、または重複があります"
+                from tool_submission.model import build_memo
+
+                if item.memo != build_memo(item.direction, item.source_key):
+                    return False, "メモが業務方向・出典と一致しません"
+                if options is None:
+                    return False, "画面の設定値を読み取れていません（バリエーションがOFFと確認できないため送信しません）"
+                blockers = option_blockers(options)
+                if blockers:
+                    return False, "; ".join(blockers)
+                if not any("バリエーション" in k or "variation" in k.lower() for k in options):
+                    return False, "バリエーションの設定値が含まれていません（判定不能のため送信しません）"
+                ledger.append(item.key, "SUBMIT_STARTED", before_run_ids=sorted(before_run_ids), attempt=st.attempts + 1, options=options,
+                              input_sha256=item.input_sha256, asin_count=item.asin_count, driver="manual_or_external")
+                return True, "送信権を確保し、送信開始を記録しました。この後にだけ、ASINを入力してSAVEを1回だけ押してください"
+    except LedgerBusy as exc:
+        return False, str(exc)
+
+
 def _identify(ledger, page, item, before: set[int], response_run_id, retries, sleep, wait_seconds: float = 3.0):
     """ログ画面を（複数回）読んで新しい行を特定する。確定・曖昧は台帳に残す。見つからなければNone。LogUnreadableを送出し得る。"""
     exclude = ledger.identified_run_ids(item.key)
@@ -165,6 +217,9 @@ def _locked(ledger, page, item, input_path, log_retries, sleep) -> SubmitResult:
         return SubmitResult("UNKNOWN", detail="結果が不明のままです（該当する新規行がありません）。再送しません")
     if st.attempts >= MAX_ATTEMPTS:
         return SubmitResult("REFUSED", detail=f"送信の試行が上限（{MAX_ATTEMPTS}回）に達しています")
+    others = pending_others(ledger, item.key)
+    if others:
+        return SubmitResult("REFUSED", detail=f"別の投入が未完了です: {others}（完了するまで次の投入に進みません）")
 
     problems = page.preflight()
     if problems:

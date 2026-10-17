@@ -29,6 +29,39 @@ class LogEntry:
     csv: str | None
 
 
+def entries_from_json(rows: list[dict]) -> list[LogEntry]:
+    """実画面から読み取った行（seq/data_type/country/memo/status/csv）のスナップショット。"""
+    return [LogEntry(int(r["seq"]), str(r.get("data_type", "")).lower(), str(r.get("country", "")).lower(), str(r.get("memo", "")).strip(),
+                     str(r.get("status", "")), r.get("csv") or None) for r in rows]
+
+
+def load_log_entries(path) -> list[LogEntry]:
+    """.jsonならスナップショット、それ以外は保存HTMLを読む。"""
+    import json
+    from pathlib import Path as _P
+
+    from tool_intake.csv_utils import open_text_auto
+
+    p = _P(path)
+    if p.suffix.lower() == ".json":
+        return entries_from_json(json.loads(p.read_text(encoding="utf-8")))
+    return parse_log_entries(open_text_auto(p))
+
+
+def single_row_html(html: str, run_id: int, expected_memo: str) -> str:
+    """ログ画面のHTMLから、対象の実行IDの行**だけ**を取り出した最小のHTMLを作る（既存のingest-logが無関係な実行や保留状態まで
+    更新しないため）。行が1件に決まらない・メモが期待と違うなら ValueError。"""
+    tree = HTMLParser(html)
+    rows = [tr for tr in tree.css("tr[data-seq]") if (tr.attributes.get("data-seq") or "").strip() == str(run_id)]
+    if len(rows) != 1:
+        raise ValueError(f"実行ID{run_id}の行が{len(rows)}件あります（1件に決まりません）")
+    memo_node = rows[0].css_first("textarea.memo")
+    memo = memo_node.text().strip() if memo_node else ""
+    if memo != expected_memo:
+        raise ValueError(f"実行ID{run_id}のメモが{memo!r}で、期待の{expected_memo!r}と違います（メモ保存の確認前は取り込みません）")
+    return "<table>" + rows[0].html + "</table>"
+
+
 class LogUnreadable(Exception):
     """ログ画面を読めない（未ログイン・構造変化・通信失敗）。結果が分からない間は再送しない。"""
 

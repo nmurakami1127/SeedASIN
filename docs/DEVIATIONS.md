@@ -1092,3 +1092,9 @@ PERMANENTLY_EXCLUDEDは引き続き完全除外のまま変更しない。
 6. `python -m tool_intake.cli ingest-log --file <保存HTML>`（既存手順。DB書き込み）→ `link-check --key fd4f3e05c479df5a`でLINKED。
 7. 取得完了後、出力CSVで`verify-output`。
 8. 82がMEMO_SAVED以降になってから、83（`42f2aaab3897a6da`、メモ`輸入_A1MN7UZC7MPZTE`）を同様に。
+
+**#60 追記（初回の実投入に向けた追加、2026-10-17）**
+- **送信権の確保（`begin`／`claim_submission`）**: 自動・手動・外部ブラウザ操作のどれでも、ASINの入力・SAVEの**前**に必ず通す。確認: 計画の存在と状態（PLANNED/NOT_SUBMITTEDのみ）・試行の上限・**他の計画が未完了でないこと**（結果不明/曖昧/実行ID確定でメモ未保存/送信中がある間は次へ進まない＝1件ずつ）・入力ファイルのsha256と件数と重複なし・メモの規約・画面の設定値（バリエーションがOFFと確認できること。値が無い/読めないなら送信しない）。全体の送信ロックと投入キーのロックの下で、SUBMIT_STARTED（送信直前のログID一覧・設定値・入力ハッシュ）を記録して初めて送信可。**ローカルのロックが防げるのは同じマシン内の別プロセスだけで、別PC・別ブラウザの操作は防げない**（試行中は同じアカウントへの別の手動・自動投入を止める前提）。
+- **取り込みの限定（`ingest`／`single_row_html`）**: 既存の`ingest-log`は渡したHTMLの全行を取り込む（seller登録・`tool_execution_link`・禁止セラーの`storefront_blocked_seller`・出力取込）ため、**この投入の実行IDの1行だけ**を取り出した最小のHTMLに限定して呼ぶ。メモが期待どおり保存されていることを確認できた行だけが対象（メモ保存前は取り込まない）。
+- **手動手順（改訂）**: ①ログ画面を保存/スナップショット → ②`begin --key --log-json --options-json`（送信権の確保・送信開始の記録。ここで中止なら送信しない）→ ③ASINを入力しそのセクションのSAVEを1回だけ → ④`reconcile`で実行IDを特定（`baseline`は`begin`に置き換わる）→ ⑤メモ保存 → ⑥`reconcile`でMEMO_SAVED → ⑦`ingest`（対象の1行のみ）→ ⑧`link-check`。
+- **実行中の既存の自動化**: `import_tools_automation/automation.py --watch 1800`（`run_watch.bat`）が稼働中。コードを読む限り、ログ一覧から`取得完了`の行のCSVをダウンロードして判定を実行する処理で、ASINの投入（SAVE）・メモの変更はしない。そのため「別の投入処理」とはみなさず停止していない。ただし、メモ（`輸出_`/`輸入_`）が付いた行が`取得完了`になると、この自動化が出力CSVをダウンロードして出品判定（ex_primary_check/primary_check）を実行する（既存の運用どおり）。
