@@ -1,13 +1,14 @@
-"""取得済みの`collector_run`から、統合ツール用の入力ファイル（出典ごと・業務方向ごと）と投入計画を作る。
+"""取得済みの`collector_run`から、統合ツール用の入力ファイル（出典ごと・業務方向ごと・5,000件以下ごと）と投入計画を作る。
 
 **DBは読み取りだけ**（実DBへの対応記録はスキーマが無い。台帳はファイル）。入力にできる取得は、`COMPLETED`で結果が
 `SUCCESS_NONEMPTY` / `SUCCESS_TRUNCATED` のものだけ（PARTIAL・失敗・未確認の0件は使わない）。上限打切りの取得は
 `input_is_partial=true`（一部の取得結果からの入力）と理由を計画に明記する。
 
-出典ごとに入力を分け、混合投入しない。業務方向は**出典の発見経路**(`acquisition_path.direction`)から決め、取得先市場からは
-決めない。1つの取得runに複数の方向の経路があれば、方向ごとに別の入力・別のメモにして、それぞれの対応を残す（同じASINの
-重複は入力ファイルの中で1回にするが、出典・経路の証拠はマニフェストに全部残す）。方向が決まらない出典（経路が手動・起点なし）は、
-利用者が`--direction`で明示するまで計画しない。
+出典ごとに入力を分け、混合投入しない。業務方向は**出典の発見経路**(`acquisition_path.direction`)から決め、取得先市場や
+ログの`data-country`からは決めない。**ASINリスト入力に国指定は無い**ので、国設定は計画の条件にしない。1つの取得runに複数の方向の
+経路があれば、方向ごとに別の入力・別のメモにして、それぞれの対応を残す（同じASINの重複は入力ファイルの中で1回にするが、出典・経路の
+証拠はマニフェストに全部残す）。方向が決まらない出典（経路が手動・起点なし）は、利用者が`--direction`で明示するまで計画しない。
+画面の案内（1回5,000件まで）を超える場合は、保存順のまま5,000件以下に分割し、分割ごとに別の入力・ハッシュ・投入キー・実行IDにする。
 """
 from __future__ import annotations
 
@@ -21,7 +22,7 @@ from sqlalchemy import text
 from db.session import SessionFactory
 from tool_submission.ledger import SubmissionLedger
 from tool_submission.model import (
-    BUSINESS_MARKET, SubmissionError, SubmissionItem, asin_file_bytes, build_memo, submission_key,
+    BUSINESS_MARKET, MAX_ASINS_PER_INPUT, SubmissionError, SubmissionItem, asin_file_bytes, build_memo, split_asins, submission_key,
 )
 
 USABLE_OUTCOMES = ("SUCCESS_NONEMPTY", "SUCCESS_TRUNCATED")
@@ -33,11 +34,9 @@ def _path_dict(p) -> dict:
             "origin_asin": p.origin_asin, "origin_units": p.origin_units, "via_source_id": p.via_source_id, "via_asin": p.via_asin}
 
 
-def build_items(app: SessionFactory, fetch_market: str, run_id: int, *, tool_country: str | None, out_dir: Path,
-                direction_override: str | None = None) -> tuple[list[SubmissionItem], list[bytes]]:
-    """計画（DRAFT/READY）と、各入力ファイルの内容を返す。書き込みはしない。"""
-    if tool_country is not None and tool_country.lower() not in ("jp", "us"):
-        raise SubmissionError("tool_country は jp / us で指定してください")
+def build_items(app: SessionFactory, fetch_market: str, run_id: int, *, out_dir: Path, direction_override: str | None = None,
+                max_per_input: int = MAX_ASINS_PER_INPUT) -> tuple[list[SubmissionItem], list[bytes]]:
+    """計画と、各入力ファイルの内容を返す。書き込みはしない。"""
     with app.get_session(fetch_market) as conn, conn.begin():
         run = conn.execute(
             text("SELECT id, marketplace, source_id, status, outcome, truncation_reason, pages_fetched, completed_at "
@@ -65,12 +64,11 @@ def build_items(app: SessionFactory, fetch_market: str, run_id: int, *, tool_cou
         directions = [direction_override]
     if not directions:
         raise SubmissionError(f"出典{src.source_id}の経路に業務方向がありません（手動登録・起点なし）。--direction で明示してください")
-    content = asin_file_bytes(asins)
-    sha = hashlib.sha256(content).hexdigest()
     key_name = src.key_primary if src.source_type == "SELLER" else src.display_primary
     partial = run.outcome == "SUCCESS_TRUNCATED"
+    chunks = split_asins(asins, max_per_input)
     prior: dict[str, list[str]] = {}
-    for d in directions:
+    for d in directions:  # 情報のみ（照合の除外には使わない。除外は送信前のログ一覧の基準）
         with app.get_session(BUSINESS_MARKET[d]) as conn, conn.begin():
             prior[d] = sorted((r[0] for r in conn.execute(
                 text("SELECT tool_run_id FROM tool_execution_link WHERE marketplace = :m AND seller_id = :k"),
@@ -79,24 +77,29 @@ def build_items(app: SessionFactory, fetch_market: str, run_id: int, *, tool_cou
     for d in directions:
         dpaths = [p for p in paths if p.direction == d] or []
         best = max((p for p in dpaths if p.origin_units is not None), key=lambda p: (p.origin_units, p.origin_asin or ""), default=None)
-        key = submission_key(run_id, d, sha)
-        items.append(SubmissionItem(
-            key=key, collector_run_id=run_id, fetch_market=fetch_market, source_id=src.source_id, source_type=src.source_type,
-            source_key=key_name, direction=d, business_market=BUSINESS_MARKET[d], memo=build_memo(d, key_name),
-            tool_country=tool_country.lower() if tool_country else None, run_outcome=run.outcome, input_is_partial=partial,
-            partial_reason=PARTIAL_REASON.get(run.outcome), run_completed_at=run.completed_at.strftime("%Y-%m-%d %H:%M:%S UTC"),
-            run_pages=run.pages_fetched, asin_count=len(asins), total_rows=len(raw), duplicate_rows_removed=len(raw) - len(asins),
-            input_file=str(Path(out_dir) / f"run{run_id}_{d}_{key}.csv"), input_sha256=sha,
-            origin=None if best is None else {"market": best.origin_marketplace, "import_id": best.origin_import_id,
-                                              "asin": best.origin_asin, "units": best.origin_units},
-            paths=[_path_dict(p) for p in dpaths], other_directions=[x for x in directions if x != d], prior_tool_runs=prior[d],
-        ))
-        files.append(content)
+        for idx, chunk in enumerate(chunks, start=1):
+            content = asin_file_bytes(chunk)
+            sha = hashlib.sha256(content).hexdigest()
+            key = submission_key(run_id, d, sha)
+            suffix = f"_p{idx}of{len(chunks)}" if len(chunks) > 1 else ""
+            items.append(SubmissionItem(
+                key=key, collector_run_id=run_id, fetch_market=fetch_market, source_id=src.source_id, source_type=src.source_type,
+                source_key=key_name, direction=d, business_market=BUSINESS_MARKET[d], memo=build_memo(d, key_name),
+                run_outcome=run.outcome, input_is_partial=partial, partial_reason=PARTIAL_REASON.get(run.outcome),
+                run_completed_at=run.completed_at.strftime("%Y-%m-%d %H:%M:%S UTC"), run_pages=run.pages_fetched,
+                asin_count=len(chunk), total_rows=len(raw), duplicate_rows_removed=len(raw) - len(asins),
+                input_file=str(Path(out_dir) / f"run{run_id}_{d}{suffix}_{key}.csv"), input_sha256=sha,
+                origin=None if best is None else {"market": best.origin_marketplace, "import_id": best.origin_import_id,
+                                                  "asin": best.origin_asin, "units": best.origin_units},
+                paths=[_path_dict(p) for p in dpaths], other_directions=[x for x in directions if x != d],
+                chunk_index=idx, chunk_count=len(chunks), run_asin_total=len(asins), prior_tool_runs=prior[d],
+            ))
+            files.append(content)
     return items, files
 
 
 def write_plan(items: list[SubmissionItem], files: list[bytes], ledger: SubmissionLedger) -> list[tuple[SubmissionItem, str]]:
-    """入力ファイルとマニフェストを書き、台帳にPLANNEDを残す（冪等: 同じ内容の再実行は何も増やさない）。"""
+    """入力ファイルとマニフェストを書き、台帳にPLANNEDを残す（冪等: 同じ内容の再実行は何も増やさない。既存の状態は消さない）。"""
     results = []
     for item, content in zip(items, files):
         path = Path(item.input_file)
@@ -110,11 +113,13 @@ def write_plan(items: list[SubmissionItem], files: list[bytes], ledger: Submissi
             tmp.replace(path)
         manifest = asdict(item)
         manifest["status"] = item.status
-        (path.parent / f"manifest_{item.key}.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+        mpath = path.parent / f"manifest_{item.key}.json"
         st = ledger.state(item.key)
+        if st.state in ("NONE", "PLANNED"):
+            mpath.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
         if st.state in ("NONE", "PLANNED") and st.manifest != manifest:
             ledger.append(item.key, "PLANNED", manifest=manifest)
             results.append((item, "新規" if st.state == "NONE" else "更新"))
         else:
-            results.append((item, "変更なし" if st.state in ("PLANNED",) else f"台帳の状態={st.state}（計画は変更しません）"))
+            results.append((item, "変更なし" if st.state == "PLANNED" else f"台帳の状態={st.state}（計画は変更しません）"))
     return results

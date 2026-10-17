@@ -1,16 +1,23 @@
-"""統合ツールへの投入の状態機械（画面操作は`ToolPage`の背後。実画面のアダプターは未実装）。
+"""統合ツールへの投入の状態機械（画面操作は`ToolPage`の背後）。
 
-**クリック後に待機だけが失敗しても、未実行とは決めつけない**（以前の自動操作で「DLクリックは完了したが、その後の遷移待ちが
-タイムアウト」があった）。手順:
-1. 投入キーの排他ロックを取り、台帳の状態を確認する。確定済み・結果不明・投入中・二重投入の疑いなら**クリックしない**
-   （ログの照合だけを試みる）。投入計画が未確定（ツールの国設定なし）でも投入しない。
-2. 投入前にログ画面を読み、既存の実行IDを控える（読めなければ投入しない）。
-3. **クリックの前に**台帳へSUBMIT_STARTEDを記録する。
-4. 投入する。例外が出ても（クリック前/後/不明を問わず）**再クリックせず、ログ画面を読み直して照合する**。
-5. 新しい行が1件に決まれば確定（CONFIRMED）。複数ならAMBIGUOUS（二重投入の疑い）。
-6. 見つからないとき: アダプターが「クリック前に失敗（何も送っていない）」と明示した場合だけ、ログを読めたことを条件に
-   NOT_SUBMITTED（再試行は合計2回まで）。それ以外（クリック後の失敗・原因不明・成功したのに見つからない）は結果不明(UNKNOWN)のままで、
-   再投入しない。後からログ画面を照合し直して確定する。
+画面仕様（利用者が確認済み）: 「3.ASINリストから情報取得」のテキスト欄にASINを改行区切りで入力→そのセクションのSAVE→ログ画面で
+メモを記録。**ASINリスト入力に国指定は無い**。メモは**投入の後**に付けるので、順序は次のとおり（途中で止まっても、どの段階かを
+台帳で区別する）:
+
+1. 排他ロック（全体の送信ロックと、投入キーのロック）を取り、台帳の状態を確認する
+2. 送信直前のログID一覧（基準）を保存し、画面の設定値を読み取る（読めなければ送信しない。**バリエーションがONなら送信しない**。
+   設定は切り替えない）
+3. **SAVEの前に**台帳へSUBMIT_STARTED（基準・設定値）を記録して送信権を確保する
+4. ASINを入力し、SAVEを**1回だけ**押す（タイムアウトしても**再クリックしない**）
+5. 直後の画面応答・新規ログ行から実行IDを特定する（基準に無い・asin_list・メモが空の行がちょうど1件。複数なら対応を一意に
+   確認できないので、**適当な行にメモを付けず停止**＝AMBIGUOUS。特定できなければ結果不明＝UNKNOWN）
+6. 特定した実行IDの行にだけ、対応するメモを設定して保存する（別のメモが既にあれば上書きしない）
+7. 再読込して実行IDとメモが保存されたことを確認する（MEMO_SAVED）。**メモ保存だけが失敗してもASINは再投入せず**、特定済みの実行IDの
+   メモ保存から再開する（同じ文字列の保存なので繰り返しても安全。上限あり）
+8. その後、既存の`ingest-log`が`tool_execution_link`へ記録し、確認できたらLINKED（`link-check`）
+
+見つからないとき: アダプターが「クリック前の失敗（何も送っていない）」と明示した場合だけ、ログを読めたことを条件にNOT_SUBMITTED
+（再試行は合計2回まで）。それ以外（クリック後の失敗・原因不明）は結果不明のままで再送しない。後からログ画面を照合し直して確定する。
 """
 from __future__ import annotations
 
@@ -19,13 +26,15 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Protocol
 
-from tool_submission.ledger import MAX_ATTEMPTS, LedgerBusy, SubmissionLedger
-from tool_submission.model import SubmissionItem
-from tool_submission.reconcile import LogEntry, LogUnreadable, match_new_entries
+from tool_submission.ledger import MAX_ATTEMPTS, MEMO_MAX_ATTEMPTS, LedgerBusy, SubmissionLedger
+from tool_submission.model import SubmissionItem, option_blockers
+from tool_submission.reconcile import LogEntry, LogUnreadable, identify_new_entry
+
+GLOBAL_LOCK = "GLOBAL-SUBMIT"
 
 
 class SubmitFailed(Exception):
-    """投入操作の失敗。phase: BEFORE_CLICK（何も送っていないと確認済み）/ AFTER_CLICK（クリックは行った）/ UNKNOWN。"""
+    """送信操作の失敗。phase: BEFORE_CLICK（何も送っていないと確認済み）/ AFTER_CLICK（クリックは行った）/ UNKNOWN。"""
 
     def __init__(self, phase: str, detail: str = "") -> None:
         if phase not in ("BEFORE_CLICK", "AFTER_CLICK", "UNKNOWN"):
@@ -34,103 +43,179 @@ class SubmitFailed(Exception):
         super().__init__(f"{phase}: {detail}")
 
 
+@dataclass
+class SubmitResponse:
+    """送信直後の画面応答から得られた情報（得られなければ None）。"""
+    run_id: int | None = None
+    detail: str | None = None
+
+
 class ToolPage(Protocol):
+    def preflight(self) -> list[str]: ...  # 実行できない理由（セレクタ未設定等）。空なら実行できる
+
     def read_log(self) -> list[LogEntry]: ...  # LogUnreadable
 
-    def submit(self, item: SubmissionItem, input_path: Path) -> None: ...  # SubmitFailed など
+    def read_options(self) -> dict[str, bool]: ...  # 画面の設定値（読み取りのみ。切り替えない）
+
+    def submit(self, item: SubmissionItem, input_path: Path) -> SubmitResponse | None: ...  # テキスト入力＋SAVE1回
+
+    def set_memo(self, run_id: int, memo: str) -> None: ...  # 指定した実行IDの行のメモ欄に入力して保存
 
 
 @dataclass
 class SubmitResult:
-    kind: str  # CONFIRMED / ALREADY_CONFIRMED / UNKNOWN / AMBIGUOUS / NOT_SUBMITTED / REFUSED
+    kind: str  # MEMO_SAVED / ALREADY_DONE / MEMO_UNSAVED / MEMO_CONFLICT / UNKNOWN / AMBIGUOUS / NOT_SUBMITTED / REFUSED
     tool_run_id: str | None = None
     detail: str | None = None
-    clicked: bool = False  # このプロセスが投入操作を実行したか
+    clicked: bool = False  # このプロセスがSAVE（ASIN投入）を押したか
 
 
-def _confirmed_elsewhere(ledger: SubmissionLedger, key: str) -> set[int]:
-    return {int(s.tool_run_id) for k, s in ledger.all_states().items() if k != key and s.state == "CONFIRMED" and s.tool_run_id}
+def submit_item(ledger: SubmissionLedger, page: ToolPage, item: SubmissionItem, input_path: Path, *, log_retries: int = 3,
+                sleep: Callable[[float], None] = time.sleep) -> SubmitResult:
+    try:
+        with ledger.key_lock(GLOBAL_LOCK):  # 実行IDの特定を一意にするため、自動の送信は同時に1件だけ
+            with ledger.key_lock(item.key):
+                return _locked(ledger, page, item, input_path, log_retries, sleep)
+    except LedgerBusy as exc:
+        return SubmitResult("REFUSED", detail=str(exc))
 
 
-def reconcile_with_log(ledger: SubmissionLedger, page: ToolPage, item: SubmissionItem, before: set[int] | None,
-                       retries: int, sleep: Callable[[float], None], wait_seconds: float = 3.0) -> SubmitResult | None:
-    """ログ画面を（複数回）読んで照合する。確定・曖昧なら台帳に残してその結果を返す。見つからなければNone。
-    ログを読めなければ LogUnreadable。"""
-    exclude = _confirmed_elsewhere(ledger, item.key)
+def _identify(ledger, page, item, before: set[int], response_run_id, retries, sleep, wait_seconds: float = 3.0):
+    """ログ画面を（複数回）読んで新しい行を特定する。確定・曖昧は台帳に残す。見つからなければNone。LogUnreadableを送出し得る。"""
+    exclude = ledger.identified_run_ids(item.key)
     for i in range(max(1, retries)):
-        entries = page.read_log()
-        d = match_new_entries(entries, item.memo, item.tool_country, before_run_ids=before, exclude_run_ids=exclude)
-        if d.kind == "CONFIRMED":
-            ledger.append(item.key, "CONFIRMED", tool_run_id=d.tool_run_id, via="log_match")
-            return SubmitResult("CONFIRMED", d.tool_run_id)
+        d = identify_new_entry(page.read_log(), before, expected_memo=item.memo, exclude_run_ids=exclude, response_run_id=response_run_id)
+        if d.kind == "IDENTIFIED":
+            ledger.append(item.key, "RUN_IDENTIFIED", tool_run_id=d.tool_run_id, observed_country=d.country,
+                          via="response" if response_run_id is not None else "log_new_row")
+            return d
         if d.kind == "AMBIGUOUS":
             ledger.append(item.key, "AMBIGUOUS", candidates=list(d.candidates))
-            return SubmitResult("AMBIGUOUS", detail=f"該当しそうな実行が複数あります: {list(d.candidates)}（二重投入の疑い。人が確認してください）")
+            return d
         if i + 1 < retries:
             sleep(wait_seconds)  # 一覧の反映が遅れている可能性があるので待って読み直す
     return None
 
 
-def submit_item(ledger: SubmissionLedger, page: ToolPage, item: SubmissionItem, input_path: Path, *,
-                log_retries: int = 3, sleep: Callable[[float], None] = time.sleep) -> SubmitResult:
+def _memo_phase(ledger, page, item, run_id: str, retries, sleep, wait_seconds: float = 3.0, *, clicked: bool = False) -> SubmitResult:
+    """特定済みの実行IDの行にメモを保存して確認する。ASINは再投入しない。"""
+    rid = int(run_id)
+
+    def find():
+        for e in page.read_log():
+            if e.seq == rid:
+                return e
+        return None
+
     try:
-        with ledger.key_lock(item.key):
-            return _submit_locked(ledger, page, item, input_path, log_retries, sleep)
-    except LedgerBusy as exc:
-        return SubmitResult("REFUSED", detail=str(exc))
+        row = find()
+    except LogUnreadable as exc:
+        return SubmitResult("MEMO_UNSAVED", run_id, f"実行IDは確定済みですがメモ未保存です。ログ画面を読めません: {exc}", clicked)
+    if row is None:
+        return SubmitResult("MEMO_UNSAVED", run_id, "実行IDは確定済みですが、ログ画面にその行が見えません（反映待ち）。メモ未保存", clicked)
+    if row.memo == item.memo:
+        ledger.append(item.key, "MEMO_SAVED", tool_run_id=run_id, via="already_set")
+        return SubmitResult("MEMO_SAVED", run_id, None, clicked)
+    if row.memo.strip():
+        return SubmitResult("MEMO_CONFLICT", run_id, f"実行ID{run_id}には既に別のメモ{row.memo!r}があります（上書きしません）", clicked)
+    if ledger.state(item.key).memo_attempts >= MEMO_MAX_ATTEMPTS:
+        return SubmitResult("REFUSED", run_id, f"メモ保存の試行が上限（{MEMO_MAX_ATTEMPTS}回）に達しています。画面で確認してください", clicked)
+    ledger.append(item.key, "MEMO_SAVE_STARTED", tool_run_id=run_id)  # 保存ボタンの前に記録する
+    try:
+        page.set_memo(rid, item.memo)
+    except Exception as exc:  # noqa: BLE001 - 失敗しても、再読込で保存済みか確認する（ASINは再投入しない）
+        ledger.append(item.key, "MEMO_ERROR", detail=f"{type(exc).__name__}: {exc}"[:300])
+    for i in range(max(1, retries)):
+        try:
+            row = find()
+        except LogUnreadable as exc:
+            return SubmitResult("MEMO_UNSAVED", run_id, f"メモ保存後の再読込ができません: {exc}", clicked)
+        if row is not None and row.memo == item.memo:
+            ledger.append(item.key, "MEMO_SAVED", tool_run_id=run_id, via="saved_and_reloaded")
+            return SubmitResult("MEMO_SAVED", run_id, None, clicked)
+        if i + 1 < retries:
+            sleep(wait_seconds)
+    return SubmitResult("MEMO_UNSAVED", run_id, "メモ保存を確認できません。ASINは再投入せず、メモ保存から再開してください", clicked)
 
 
-def _submit_locked(ledger, page, item, input_path, log_retries, sleep) -> SubmitResult:
+def _locked(ledger, page, item, input_path, log_retries, sleep) -> SubmitResult:
     st = ledger.state(item.key)
     if st.state == "NONE":
         return SubmitResult("REFUSED", detail="投入計画が台帳にありません（先にplanを実行してください）")
-    if st.state == "CONFIRMED":
-        return SubmitResult("ALREADY_CONFIRMED", st.tool_run_id, "確定済みです（再投入しません）")
-    if st.state in ("SUBMITTING", "UNKNOWN", "AMBIGUOUS"):
-        # 結果が不明・曖昧な間は絶対にクリックしない。ログの照合だけを試みる。
+    if st.state in ("MEMO_SAVED", "LINKED"):
+        return SubmitResult("ALREADY_DONE", st.tool_run_id, "対応済みです（再投入しません）")
+    if st.state == "RUN_IDENTIFIED":  # 実行ID確定・メモ未保存: ASINは再投入せず、メモ保存から再開する
+        return _memo_phase(ledger, page, item, st.tool_run_id, log_retries, sleep)
+    if st.state == "AMBIGUOUS":
+        return SubmitResult("AMBIGUOUS", detail="対応を一意に確認できない状態です。resolveで人が実行IDを選ぶまで、送信もメモ保存もしません")
+    if st.state in ("SUBMITTING", "UNKNOWN"):
+        # 結果が不明な間は絶対にSAVEを押さない。ログの照合だけを試みる。
+        if not st.before_run_ids and not any(e["event"] == "SUBMIT_STARTED" for e in st.events):
+            return SubmitResult("UNKNOWN", detail="送信前の基準がありません")
         try:
-            r = reconcile_with_log(ledger, page, item, set(st.before_run_ids) if st.before_run_ids else None, log_retries, sleep)
+            d = _identify(ledger, page, item, set(st.before_run_ids), None, log_retries, sleep)
         except LogUnreadable as exc:
             return SubmitResult("UNKNOWN", detail=f"結果が不明のままです。ログ画面を読めません: {exc}")
-        if r:
-            return r
+        if d is not None and d.kind == "IDENTIFIED":
+            return _memo_phase(ledger, page, item, d.tool_run_id, log_retries, sleep)
+        if d is not None:
+            return SubmitResult("AMBIGUOUS", detail=f"新規行が複数あります: {list(d.candidates)}（対応を一意に確認できません）")
         if st.state == "SUBMITTING":
-            ledger.append(item.key, "OUTCOME_UNKNOWN", reason="前回の投入が完了の記録なしで終了")
-        return SubmitResult("UNKNOWN", detail="結果が不明のままです（ログ画面に該当の実行がありません）。再投入しません")
+            ledger.append(item.key, "OUTCOME_UNKNOWN", reason="前回の送信が完了の記録なしで終了")
+        return SubmitResult("UNKNOWN", detail="結果が不明のままです（該当する新規行がありません）。再送しません")
     if st.attempts >= MAX_ATTEMPTS:
-        return SubmitResult("REFUSED", detail=f"投入の試行が上限（{MAX_ATTEMPTS}回）に達しています")
-    if item.status != "READY" or not item.tool_country:
-        return SubmitResult("REFUSED", detail="ツールの国設定が未確定です（DRAFT）。利用者が確認してから計画をREADYにしてください")
+        return SubmitResult("REFUSED", detail=f"送信の試行が上限（{MAX_ATTEMPTS}回）に達しています")
 
+    problems = page.preflight()
+    if problems:
+        return SubmitResult("REFUSED", detail="画面アダプターが実行できません: " + "; ".join(problems))
     try:
         before_entries = page.read_log()
     except LogUnreadable as exc:
-        return SubmitResult("REFUSED", detail=f"投入前にログ画面を読めません（基準を控えられないため投入しません）: {exc}")
+        return SubmitResult("REFUSED", detail=f"送信前にログ画面を読めません（基準を保存できないため送信しません）: {exc}")
+    try:
+        options = page.read_options()
+    except Exception as exc:  # noqa: BLE001
+        return SubmitResult("REFUSED", detail=f"画面の設定値を読み取れません（バリエーションの状態を確認できないため送信しません）: {exc}")
+    blockers = option_blockers(options)
+    if blockers:
+        return SubmitResult("REFUSED", detail="; ".join(blockers))
     before = {e.seq for e in before_entries}
-    ledger.append(item.key, "SUBMIT_STARTED", before_run_ids=sorted(before), attempt=st.attempts + 1)  # クリックの前に記録する
+    ledger.append(item.key, "SUBMIT_STARTED", before_run_ids=sorted(before), attempt=st.attempts + 1, options=options,
+                  input_sha256=item.input_sha256, asin_count=item.asin_count)  # SAVEの前に送信権を確保して記録する
 
     phase: str | None = None
+    resp: SubmitResponse | None = None
     try:
-        page.submit(item, input_path)
+        resp = page.submit(item, input_path)
     except SubmitFailed as exc:
         phase = exc.phase
         ledger.append(item.key, "CLICK_ERROR", phase=exc.phase, detail=exc.detail[:300])
-    except Exception as exc:  # noqa: BLE001 - 原因不明の失敗は「クリックしたかもしれない」として扱う
+    except Exception as exc:  # noqa: BLE001 - 原因不明の失敗は「SAVEを押したかもしれない」として扱う（再クリックしない）
         phase = "UNKNOWN"
         ledger.append(item.key, "CLICK_ERROR", phase="UNKNOWN", detail=f"{type(exc).__name__}: {exc}"[:300])
 
-    # クリックの成否を問わず、再クリックせずにログ画面で照合する
+    if phase == "BEFORE_CLICK":
+        # SAVEを押していないと確認できた: 新規行が現れても、それは別の投入（手動・別プロセス・既存の自動化）によるもの。採用しない。
+        try:
+            others = [e.seq for e in page.read_log() if e.seq not in before]
+        except LogUnreadable as exc:
+            ledger.append(item.key, "OUTCOME_UNKNOWN", reason=f"ログ画面を読めない: {exc}"[:300])
+            return SubmitResult("UNKNOWN", detail="クリック前の失敗ですが、ログ画面を読めないため送信されていないことを確認できません。再送しません")
+        ledger.append(item.key, "NOT_SUBMITTED_VERIFIED", reason="クリック前の失敗", other_new_rows=others)
+        note = f"（別の投入による新規行{others}があるが、採用しません）" if others else ""
+        return SubmitResult("NOT_SUBMITTED", detail="送信されていないことを確認しました（再試行は1回まで）" + note, clicked=False)
+
     try:
-        r = reconcile_with_log(ledger, page, item, before, log_retries, sleep)
+        d = _identify(ledger, page, item, before, resp.run_id if resp else None, log_retries, sleep)
     except LogUnreadable as exc:
         ledger.append(item.key, "OUTCOME_UNKNOWN", reason=f"ログ画面を読めない: {exc}"[:300])
-        return SubmitResult("UNKNOWN", detail="投入の結果を照合できません。再投入しません", clicked=True)
-    if r:
-        r.clicked = True
-        return r
-    if phase == "BEFORE_CLICK":
-        ledger.append(item.key, "NOT_SUBMITTED_VERIFIED", reason="クリック前の失敗＋ログに該当の実行なし")
-        return SubmitResult("NOT_SUBMITTED", detail="投入されていないことを確認しました（再試行は1回まで）", clicked=False)
-    ledger.append(item.key, "OUTCOME_UNKNOWN", reason=f"phase={phase or 'なし'}、ログに該当の実行が見つからない")
-    return SubmitResult("UNKNOWN", detail="クリック後（または原因不明）で、ログに該当の実行が見つかりません。再投入しません。"
-                                          "ログ画面を後で照合し直してください", clicked=True)
+        return SubmitResult("UNKNOWN", detail="送信の結果を照合できません。再送しません", clicked=True)
+    if d is not None and d.kind == "IDENTIFIED":
+        return _memo_phase(ledger, page, item, d.tool_run_id, log_retries, sleep, clicked=True)
+    if d is not None:
+        return SubmitResult("AMBIGUOUS", detail=f"新規行が複数あり、送信結果との対応を一意に確認できません: {list(d.candidates)}。"
+                                                  "適当な行にメモを付けず停止します", clicked=True)
+    ledger.append(item.key, "OUTCOME_UNKNOWN", reason=f"phase={phase or 'なし'}、新規行が見つからない")
+    return SubmitResult("UNKNOWN", detail="SAVE後（または原因不明）で、新規行が見つかりません。再送しません。ログ画面を後で照合し直してください",
+                        clicked=True)

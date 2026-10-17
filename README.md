@@ -247,10 +247,18 @@ python -m asin_collector.cli release-asin-page --page-market JP --asin <ASIN> --
 
 ### 取得ASINを統合ツールへ渡す準備（統合ツールには接続しない）
 
+使うのは統合ツールの「3.ASINリストから情報取得」（**国指定なし**。上部の国選択は触らない）。メモはログ画面で**投入の後に**付ける。
+
 ```
-python -m tool_submission.cli plan --fetch-market US --run-id 82 [--tool-country jp|us]   # 入力ファイル（出典ごと・業務方向ごと）と投入計画。国設定なしはDRAFT
-python -m tool_submission.cli ledger                                                       # 投入台帳（追記専用JSONL）の状態
-python -m tool_submission.cli reconcile --key <投入キー> --log-html <保存したログ画面.html>  # 統合ツールの実行IDを確定
+python -m tool_submission.cli plan --fetch-market US --run-id 82     # 入力ファイル（出典・業務方向・5,000件以下ごと）と投入計画。DB読み取りのみ
+python -m tool_submission.cli ledger                                 # 投入台帳（追記専用JSONL）の状態
+# 手動で投入する場合（初回は1件ずつ）
+python -m tool_submission.cli baseline  --key <キー> --log-html <送信前に保存したログ画面>   # 送信前の基準
+python -m tool_submission.cli reconcile --key <キー> --log-html <送信後に保存したログ画面>   # 新しい行の実行IDを特定（メモ保存の確認も）
+python -m tool_submission.cli resolve   --key <キー> --run-id <実行ID>                        # 新規行が複数のとき、人が選ぶ
+python -m tool_submission.cli link-check --key <キー>                                         # 既存のingest-log後、対応記録済みを確認
+python -m tool_submission.cli verify-output --key <キー> --csv <出力CSV>                      # 出力ASINが入力に含まれるか
+python -m tool_submission.cli submit --key <キー> --selectors <確認済みセレクタJSON>          # 自動送信（入力画面のDOM未確認のため実行不可。実画面は未検証）
 ```
 
-業務方向は出典の発見経路から決め（取得先市場からは決めない）、メモは既存の規約（`輸出_<出典キー>` / `輸入_<出典キー>`）。上限打切りの取得は「一部の取得結果」と明記される。結果が不明なときに再投入しない仕組みと未確認事項は docs/DEVIATIONS.md #60。
+業務方向は出典の発見経路から決め（取得先市場・`data-country`からは決めない）、メモは既存の規約（`輸出_<出典キー>` / `輸入_<出典キー>`）。上限打切りの取得は「一部の取得結果」と明記される。結果不明のまま再送しない・メモ保存だけの失敗はASINを再投入せず再開する、などの仕組みと未検証事項は docs/DEVIATIONS.md #60。
