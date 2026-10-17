@@ -197,7 +197,7 @@ SeedASINが**本体**です。2つの既存ASIN取得ツールは、移植・検
 | `seller_performance` | 実績評価・再取得候補の選定 | 既存 |
 | `discovery` | 探索元セラーID・キーワードの生成 | 未実装 |
 | `asin_collector` | セラー・キーワード・ブランド等からのASIN取得 | 既存（ブランド/検索ページ）、セラー・キーワード起点は未移植 |
-| `tool_submission` | 統合ツールへの投入・実行ID取得 | 未実装 |
+| `tool_submission` | 統合ツールへの投入・実行ID取得 | 一部実装（入力ファイル・投入計画・台帳・実行ID照合。画面操作は未実装。docs/DEVIATIONS.md #60） |
 | `workflow` | 工程連携、進捗・再開・二重投入防止 | 未実装 |
 | `seller_ledger` | 探索元と統合ツール実行IDの対応記録 | 既存（拡張予定） |
 
@@ -244,3 +244,13 @@ python -m asin_collector.cli release-asin-page --page-market JP --asin <ASIN> --
 - 反対側市場への展開は、取得済みの出典の**過去の取得結果**（成功/上限打切り）を使うだけで再取得はしない。代表起点は`--origin-import`で明示したACTIVEのimportに限る。
 
 起点ASINの商品ページ（`--page-market`で市場を明示）から他セラー/ブランドを出典として登録する。登録後の取得は `collect-next`（plan・claim・30日間隔を通る）。詳細・未検証事項・スキーマ変更案は docs/DEVIATIONS.md #59。
+
+### 取得ASINを統合ツールへ渡す準備（統合ツールには接続しない）
+
+```
+python -m tool_submission.cli plan --fetch-market US --run-id 82 [--tool-country jp|us]   # 入力ファイル（出典ごと・業務方向ごと）と投入計画。国設定なしはDRAFT
+python -m tool_submission.cli ledger                                                       # 投入台帳（追記専用JSONL）の状態
+python -m tool_submission.cli reconcile --key <投入キー> --log-html <保存したログ画面.html>  # 統合ツールの実行IDを確定
+```
+
+業務方向は出典の発見経路から決め（取得先市場からは決めない）、メモは既存の規約（`輸出_<出典キー>` / `輸入_<出典キー>`）。上限打切りの取得は「一部の取得結果」と明記される。結果が不明なときに再投入しない仕組みと未確認事項は docs/DEVIATIONS.md #60。

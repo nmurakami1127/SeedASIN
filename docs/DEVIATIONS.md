@@ -1035,3 +1035,30 @@ PERMANENTLY_EXCLUDEDは引き続き完全除外のまま変更しない。
 - 経路: VIA_SOURCE。13 = 起点 US import=1 B0076AZHC8（注文9点, EXPORT）→ 経由出典 11 の取得 run=82 → 経由ASIN B09DGF5WCD → 調査先 JP。14 = 起点 JP import=2 B0B46VP7NS（注文1点, IMPORT）→ 経由出典 12 の取得 run=83 → 経由ASIN B0058BDP80 → 調査先 US。planでは両方「未取得」で、起点の注文実績を引き継いで並ぶ。反対側で見つけた出典（13・14）の取扱ASINは**取得していない**。
 - 実ページで確認できたこと（追加）: 複数ページ巡回（「次へ」リンク）、配送元の表示（`SHIPS_FROM`）を販売元と区別して出典にしない動作（JP: A26YONAZMFTVSE、US: AGM3OIPIW0FJG を配送元として検出、登録せず）。**ブランドは反対側の2ページでは抽出0件**（HTMLを保存していないため原因は特定できない。ブランド行が無い商品か、マークアップ差か不明）。今後に備え、ブランド未抽出時はbylineInfo／po-brandの有無を抽出結果のnotesに残すようにした。自社除外・Amazon小売の保留は該当なし。
 - 既存データ: collector_run id<=77のハッシュ一致、保留・旧RUNNING・レポート・storefront_blocked_seller無変更。
+
+
+## 60. 取得ASINを統合ツールへ渡す接続（入力ファイル・投入計画・投入台帳・実行ID確定）（Phase 4, 2026-10-17）
+
+**範囲**: 統合ツールへのログイン・アクセス・投入は**していない**。実DBへの新規記録もしていない（DBは読み取りのみ）。新パッケージ`tool_submission`（`python -m tool_submission.cli plan / ledger / reconcile`）。実画面を操作するアダプターは未実装（画面構造が未確認のため）。
+
+**既存の統合ツールの規約（調査で確認）**
+- ログ画面(`logs.php`)の`<tr data-seq>`が**統合ツールの実行ID**。メモ欄の接頭辞`輸出_`/`輸入_`が業務方向（US/JP）で、残りが`tool_execution_link.seller_id`になる（`tool_intake/log_ingest.py`）。同じメモ接頭辞が出品判定の振り分けにも使われる（`輸入_`→primary_check、`輸出_`→ex_primary_check。ローカルの`import_tools_automation/automation.py`）。投入後の確定済みCSVは`取得完了`の行から取得される。
+- ログ画面の`data-country`（jp/us）は**統合ツールがASINを調べる国**で、メモの業務方向とは別の属性。サンプルでは`ASINリスト`+`輸出_`がjpだったが、1例では決められないため**自動では決めない**（計画はDRAFTで、利用者の確認後にREADY）。
+- `data-text`にASINの内容は出ない（ASINリストは`asin`のみ）。そのため、ログからは入力内容の一致を確認できない（メモと「投入前に無かった行」が根拠）。
+
+**設計**
+- 出典ごと・業務方向ごとに入力ファイルを分ける（混合投入しない）。ファイルは1行1ASIN・ヘッダー無し・UTF-8（`export-run`と同じ形式）。業務方向は**出典の発見経路**(`acquisition_path.direction`)から決め、取得先市場からは決めない。経路に方向が無い出典は`--direction`の明示が必要（経路と矛盾する指定は拒否）。1つの取得runに複数方向の経路があれば方向ごとに別の入力・別のメモ・別の投入キー（それぞれの起点・経路を保存）。
+- 入力にできる取得は`COMPLETED`かつ`SUCCESS_NONEMPTY`/`SUCCESS_TRUNCATED`のみ。上限打切りは`input_is_partial=true`＋理由を計画に明記。ASINの重複はファイル内で1回にするが、取得行数・除去数を計画に残す（証拠の保持とは別）。
+- 追跡項目（`exports/tool_submission/manifest_<キー>.json`と台帳）: 取得run・取得先市場・出典・業務方向・メモ・起点import/ASIN/注文点数・全経路（経由出典・経由ASIN）・入力ファイルのsha256・ASIN数・部分取得・ツールの国設定・統合ツール実行ID。投入キー＝sha256(run, 方向, 入力のsha256)の先頭16桁（同じ内容の再実行は同じキー→二重投入・二重記録にならない）。
+- 台帳は追記専用のJSONL（`ledger.jsonl`）。状態: PLANNED → SUBMITTING（クリックの前に記録）→ UNKNOWN / CONFIRMED(実行ID) / NOT_SUBMITTED / AMBIGUOUS。同じキーの同時実行はロックファイルで拒否。
+- **実行IDの確定**: 投入前にログ画面の既存の実行IDを控え、投入後に「メモ・種別asin_list・国設定が一致する、投入前に無かった、他の投入で確定済みでない行」がちょうど1件のときだけ確定。複数ならAMBIGUOUS（二重投入の疑い）。手動で投入した場合は`reconcile --log-html`（保存したログ画面）で同じ判定を行い、続けて既存の`tool_intake.cli ingest-log`が`tool_execution_link`へ記録する。
+- **結果不明の扱い（クリック後に待機だけ失敗する場合を含む）**: 例外の種類にかかわらず**再クリックしない**。ログ画面を読み直して（反映遅れを考慮して複数回）照合する。見つからない場合、アダプターが「クリック前の失敗（何も送っていない）」と明示したときだけ、ログを読めたことを条件にNOT_SUBMITTED（再試行は合計2回まで）。それ以外は結果不明(UNKNOWN)のまま再投入せず、後から照合し直す。ログを読めないときは投入しない。クリックの途中でプロセスが死んでも（SUBMITTING）未実行と決めつけない。
+- 疑似画面のテスト（`tests/unit/test_tool_submission.py`）: 正常、クリック完了後の遷移待ちタイムアウト（2種）、反映遅れ、ログ読取不可、原因不明の失敗、クリック前の失敗＋再試行1回、上限、二重投入の疑い、DRAFT・基準なし・ロックの拒否、クラッシュ後の再開、他の投入で確定済みの行を採用しない。
+
+**出典13・14（反対側で発見・未取得）**: 取得後に`plan --fetch-market JP|US --run-id <取得run>`で同じ経路（VIA_SOURCE。起点→経由出典→経由ASIN）から業務方向を決めて接続できる（`tests/integration/test_tool_submission_plan.py`で検証）。今回は新しい外部取得をしていない。
+
+**生成した入力（実DBのrun 82・83。DRAFT）**: `exports/tool_submission/`（Git対象外）。run 82 → 出典11 A3AJLR7DMJUOQG・EXPORT・メモ`輸出_A3AJLR7DMJUOQG`・32 ASIN・部分取得（起点 US import=1 B0076AZHC8 注文9点）／ run 83 → 出典12 A1MN7UZC7MPZTE・IMPORT・メモ`輸入_A1MN7UZC7MPZTE`・32 ASIN・部分取得（起点 JP import=2 B0B46VP7NS 注文1点）。
+
+**不足しているもの（スキーマ変更案。保留）**: `collector_run` ↔ 統合ツール実行IDの対応はDBに無く、台帳（ファイル）は暫定。最小案: 表`tool_submission`（submission_key UNIQUE、collector_run_id、source_id、fetch_marketplace、direction、business_marketplace、memo、tool_country、origin_import_id/origin_asin、input_sha256、asin_count、input_is_partial、status、tool_run_id、attempts、各時刻、UNIQUE(business_marketplace, tool_run_id)）＋追記専用の履歴表`tool_submission_event`。RLSは業務方向の市場（tool_execution_linkと同じ）で、app_roleはINSERT・状態列のUPDATEのみ。`tool_execution_link`へ(business_marketplace, tool_run_id)で結ぶ。適用前に実装方針とマイグレーション構成案を提示して確認を得る（CLAUDE.md）。
+
+**未確認（利用者の確認が必要）**: ①統合ツールの投入画面の構造（入力欄・国設定・メモ欄の有無・送信ボタン）—ログ画面ではメモ欄に「保存」ボタンがあり、投入後にメモを付ける運用の可能性があるため、投入時にメモを入力できるか ②ASINリスト投入時の`data-country`（ツールの国設定）の決め方 ③投入の際のその他のオプション（カテゴリ・繰り返し等）④投入の1回あたりのASIN上限。
