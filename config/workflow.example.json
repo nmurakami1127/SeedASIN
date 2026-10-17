@@ -1,0 +1,25 @@
+{
+  "lanes": {
+    "US": {"origin_import": 1, "routes": ["SELLER"]},
+    "JP": {"origin_import": 2, "routes": ["SELLER"]}
+  },
+  "limits": {
+    "origin_asins": 1,
+    "sources_per_origin": 3,
+    "pages_per_source": 2,
+    "max_asins_per_source": null,
+    "cross_asins": 1,
+    "cross_sources_per_asin": 3
+  },
+  "totals": {
+    "max_total_pages": 24,
+    "max_new_sources": 12,
+    "max_submit_asins": 5000
+  },
+  "cross": {"enabled": true, "fetch_discovered": false},
+  "brand_enabled": false,
+  "tool_max_asins": 5000,
+  "result_max_age_days": 30,
+  "state_dir": "exports/workflow",
+  "submission_dir": "exports/tool_submission"
+}

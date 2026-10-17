@@ -266,3 +266,23 @@ python -m tool_submission.cli submit --key <キー> --selectors <確認済みセ
 ```
 
 業務方向は出典の発見経路から決め（取得先市場・`data-country`からは決めない）、メモは既存の規約（`輸出_<出典キー>` / `輸入_<出典キー>`）。上限打切りの取得は「一部の取得結果」と明記される。結果不明のまま再送しない・メモ保存だけの失敗はASINを再投入せず再開する、などの仕組みと未検証事項は docs/DEVIATIONS.md #60。
+
+## ひとつの実行入口（`workflow`、通常運用）
+
+既存の各工程（起点選定→発見→取得→反対側展開→投入計画→統合ツール投入→メモ保存→既存DBへの対応記録）を、内部コマンドを順に実行せずに動かします。新しい探索機能・対応表は作らず、既存機能の接続だけです（docs/DEVIATIONS.md #61）。
+
+```
+python -m workflow.cli init-config                 # config/workflow.example.json を config/workflow.json へコピー（import_idを書き換える。Git管理外）
+python -m workflow.cli plan   --config config/workflow.json    # 外部アクセス・DB更新なし。対象・予定・上限を表示（見積りは確定値と区別）
+python -m workflow.cli run    --config config/workflow.json    # 実行（ログイン・CAPTCHA等、人の操作が必要な所で待機/保留）
+python -m workflow.cli status [--id wf-…]          # 工程別の完了・待機・保留・失敗・結果不明、再開方法
+python -m workflow.cli resume [--id wf-…] [--allow-duplicate <投入キー>]
+python -m workflow.cli backup  --out backups/wf.zip   /   restore --zip backups/wf.zip [--force]
+```
+
+- **設定**: 市場ごとに**明示したACTIVEレポート**（`lanes.US.origin_import` / `lanes.JP.origin_import`）。初期値は小さい（起点1ASIN/市場・発見出典3/起点・取得2ページ/出典・反対側展開1ASIN/市場・反対側で発見した出典の自動取得OFF・ブランドOFF）。実行全体の上限（取得ページ・新規出典・投入ASIN）も設定。安全な範囲（ハード上限）の中でだけ変更でき、範囲外は拒否。再帰的な無制限探索はしない。
+- **再取得と再投入は別管理**: 取得は出典ごとの30日間隔に従う。間隔内でも、利用可能な保存済みの取得結果（成功/上限打切り・鮮度内）があれば投入計画に使う。成功済みの投入（同じrun・方向・入力ハッシュ、投入台帳が対応済み）は繰り返さない。**別のrunから同じ方向に同じASIN集合**を投入しようとすると「重複候補」として保留し、理由を表示（意図した再投入なら `resume --allow-duplicate <投入キー>`）。設定に無い過去のimportは混ぜない。
+- **完了条件**: 投入→実行ID特定→メモ保存→既存DB（`tool_execution_link`）への対応記録まで。統合ツールが待機中・取得中でも完了。処理完了待ち・出力CSVの検証/取込は含まない（既存の後続自動化のまま）。
+- **再開**: 状態は `exports/workflow/<id>/state.json`（原子的保存・`.bak`・排他ロック）。投入の状態は既存の投入台帳が持つ。SAVE後に状態保存で失敗しても、投入台帳がSAVEの前に送信開始を記録しているため再送しない。結果不明は照合から、メモ未保存はメモ保存から、DB記録失敗は記録だけやり直す。同じworkflowの同時resumeは拒否。
+- **ログ300件の保全チェック**: 送信前に必ず通る（削除される最古行の元CSVがローカルに保全されていなければ新規送信を止める）。これは今回投入したタスクの処理完了待ちとは別。
+- **前提・注意**: 別PC・別ブラウザからの投入はローカルロックでは防げない（同時投入が無いことが運用上の前提）。バックアップ（zip）と実データ・台帳はGitに入れない。

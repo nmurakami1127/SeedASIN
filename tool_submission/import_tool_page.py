@@ -78,6 +78,10 @@ class ImportToolPage:
             raise LogUnreadable("ログ一覧の構造が想定と違います（未ログインまたは画面の変更）")
         return parse_log_entries(html)
 
+    def log_html(self) -> str:
+        """直前に読んだログ画面のHTML（既存のingest-logを1行に限定して実行するために使う）。"""
+        return self._p.content()
+
     def set_memo(self, run_id: int, memo: str) -> None:
         row = self._p.locator(self._s.row_by_seq.format(seq=run_id))
         row.locator(self._s.memo_textarea).fill(memo)
@@ -111,8 +115,35 @@ class ImportToolPage:
             raise
         except Exception as exc:  # noqa: BLE001 - クリック前の失敗（何も送っていない）
             raise SubmitFailed("BEFORE_CLICK", f"{type(exc).__name__}: {exc}") from exc
+        cap: dict = {"alerts": []}
+
+        def on_request(req) -> None:  # 送信リクエストの本文（実行IDの対応根拠）。認証情報・Cookieは読まない・残さない
+            if str(req.url).split("?")[0].endswith("start_search4.php") and req.method == "POST":
+                cap["endpoint"], cap["body"] = req.url.split("?")[0], req.post_data or ""
+
+        def on_response(resp) -> None:
+            if str(resp.url).split("?")[0].endswith("start_search4.php"):
+                cap["status"] = resp.status
+                try:
+                    cap["response"] = resp.text()
+                except Exception:  # noqa: BLE001
+                    cap["response"] = ""
+
+        try:
+            self._p.on("request", on_request)
+            self._p.on("response", on_response)
+            self._p.on("dialog", lambda d: (cap["alerts"].append(d.message[:80]), d.dismiss()))
+        except Exception:  # noqa: BLE001 - 疑似ページ等で購読できない場合は根拠なし（呼び出し側が断定しない）
+            pass
         try:
             self._p.locator(s.asin_save_button).click(no_wait_after=True)  # SAVEは1回だけ。待機のタイムアウトで再クリックしない
         except Exception as exc:  # noqa: BLE001 - クリックしたかもしれない
             raise SubmitFailed("UNKNOWN", f"{type(exc).__name__}: {exc}") from exc
-        return None
+        try:  # 応答を最大15秒待つ（待つだけ。再クリックしない）
+            for _ in range(30):
+                if "response" in cap:
+                    break
+                self._p.wait_for_timeout(500)
+        except Exception:  # noqa: BLE001
+            pass
+        return SubmitResponse(evidence=cap if "body" in cap and "response" in cap else None)

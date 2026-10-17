@@ -49,6 +49,7 @@ class SubmitResponse:
     """送信直後の画面応答から得られた情報（得られなければ None）。"""
     run_id: int | None = None
     detail: str | None = None
+    evidence: dict | None = None  # 送信リクエスト・応答の記録（check_captureの入力）。取れなければNone
 
 
 class ToolPage(Protocol):
@@ -72,11 +73,13 @@ class SubmitResult:
 
 
 def submit_item(ledger: SubmissionLedger, page: ToolPage, item: SubmissionItem, input_path: Path, *, log_retries: int = 3,
-                sleep: Callable[[float], None] = time.sleep) -> SubmitResult:
+                sleep: Callable[[float], None] = time.sleep, require_evidence: bool = False) -> SubmitResult:
+    """require_evidence=True（実画面向け）: 送信リクエスト・応答の根拠と、新規行の設定値の一致が無ければ、新規行が1件でも自分の送信と
+    断定しない（結果不明として止める）。"""
     try:
         with ledger.key_lock(GLOBAL_LOCK):  # 実行IDの特定を一意にするため、自動の送信は同時に1件だけ
             with ledger.key_lock(item.key):
-                return _locked(ledger, page, item, input_path, log_retries, sleep)
+                return _locked(ledger, page, item, input_path, log_retries, sleep, require_evidence)
     except LedgerBusy as exc:
         return SubmitResult("REFUSED", detail=str(exc))
 
@@ -150,11 +153,24 @@ def claim_submission(ledger: SubmissionLedger, item: SubmissionItem, input_path:
         return False, str(exc)
 
 
-def _identify(ledger, page, item, before: set[int], response_run_id, retries, sleep, wait_seconds: float = 3.0):
+def _identify(ledger, page, item, before: set[int], response_run_id, retries, sleep, wait_seconds: float = 3.0,
+              require_evidence: bool = False):
     """ログ画面を（複数回）読んで新しい行を特定する。確定・曖昧は台帳に残す。見つからなければNone。LogUnreadableを送出し得る。"""
     exclude = ledger.identified_run_ids(item.key)
     for i in range(max(1, retries)):
-        d = identify_new_entry(page.read_log(), before, expected_memo=item.memo, exclude_run_ids=exclude, response_run_id=response_run_id)
+        entries = page.read_log()
+        d = identify_new_entry(entries, before, expected_memo=item.memo, exclude_run_ids=exclude, response_run_id=response_run_id)
+        if d.kind == "IDENTIFIED" and require_evidence:
+            from tool_submission.reconcile import corroborate
+
+            row = next(e for e in entries if e.seq == int(d.tool_run_id))
+            problems = corroborate(row, ledger.state(item.key).evidence)
+            if problems:  # 新規行が1件でも、自分の送信と対応する根拠が無ければ断定しない（メモも付けない）
+                ledger.append(item.key, "OUTCOME_UNKNOWN", reason=("対応根拠を確認できない: " + "; ".join(problems))[:300],
+                              candidate=d.tool_run_id)
+                from tool_submission.reconcile import IdentifyDecision
+
+                return IdentifyDecision("UNCORROBORATED", d.candidates)
         if d.kind == "IDENTIFIED":
             ledger.append(item.key, "RUN_IDENTIFIED", tool_run_id=d.tool_run_id, observed_country=d.country,
                           via="response" if response_run_id is not None else "log_new_row")
@@ -208,7 +224,7 @@ def _memo_phase(ledger, page, item, run_id: str, retries, sleep, wait_seconds: f
     return SubmitResult("MEMO_UNSAVED", run_id, "メモ保存を確認できません。ASINは再投入せず、メモ保存から再開してください", clicked)
 
 
-def _locked(ledger, page, item, input_path, log_retries, sleep) -> SubmitResult:
+def _locked(ledger, page, item, input_path, log_retries, sleep, require_evidence: bool = False) -> SubmitResult:
     st = ledger.state(item.key)
     if st.state == "NONE":
         return SubmitResult("REFUSED", detail="投入計画が台帳にありません（先にplanを実行してください）")
@@ -223,9 +239,11 @@ def _locked(ledger, page, item, input_path, log_retries, sleep) -> SubmitResult:
         if not st.before_run_ids and not any(e["event"] == "SUBMIT_STARTED" for e in st.events):
             return SubmitResult("UNKNOWN", detail="送信前の基準がありません")
         try:
-            d = _identify(ledger, page, item, set(st.before_run_ids), None, log_retries, sleep)
+            d = _identify(ledger, page, item, set(st.before_run_ids), None, log_retries, sleep, require_evidence=require_evidence)
         except LogUnreadable as exc:
             return SubmitResult("UNKNOWN", detail=f"結果が不明のままです。ログ画面を読めません: {exc}")
+        if d is not None and d.kind == "UNCORROBORATED":
+            return SubmitResult("UNKNOWN", detail=f"新規行{list(d.candidates)}がありますが、自分の送信と対応する根拠がありません。メモを付けずに止めます")
         if d is not None and d.kind == "IDENTIFIED":
             return _memo_phase(ledger, page, item, d.tool_run_id, log_retries, sleep)
         if d is not None:
@@ -284,10 +302,18 @@ def _locked(ledger, page, item, input_path, log_retries, sleep) -> SubmitResult:
         return SubmitResult("NOT_SUBMITTED", detail="送信されていないことを確認しました（再試行は1回まで）" + note, clicked=False)
 
     try:
-        d = _identify(ledger, page, item, before, resp.run_id if resp else None, log_retries, sleep)
+        if resp is not None and resp.evidence is not None:
+            from tool_submission.evidence import check_capture
+
+            plan_asins = [x for x in Path(input_path).read_text(encoding="utf-8").splitlines() if x.strip()]
+            ledger.append(item.key, "EVIDENCE", evidence=check_capture(plan_asins, resp.evidence))
+        d = _identify(ledger, page, item, before, resp.run_id if resp else None, log_retries, sleep, require_evidence=require_evidence)
     except LogUnreadable as exc:
         ledger.append(item.key, "OUTCOME_UNKNOWN", reason=f"ログ画面を読めない: {exc}"[:300])
         return SubmitResult("UNKNOWN", detail="送信の結果を照合できません。再送しません", clicked=True)
+    if d is not None and d.kind == "UNCORROBORATED":
+        return SubmitResult("UNKNOWN", detail=f"新規行{list(d.candidates)}がありますが、自分の送信と対応する根拠がありません。メモを付けずに止めます",
+                            clicked=True)
     if d is not None and d.kind == "IDENTIFIED":
         return _memo_phase(ledger, page, item, d.tool_run_id, log_retries, sleep, clicked=True)
     if d is not None:

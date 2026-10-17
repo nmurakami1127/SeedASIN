@@ -52,3 +52,6 @@ amazon_asin_worker.zip
 collect_asins_worker.py
 setup_ai_worker.sh
 run_ai_worker.sh
+
+# workflow: 運用値(import_id等)を含む実設定はGit管理しない（例は config/workflow.example.json）
+config/workflow.json

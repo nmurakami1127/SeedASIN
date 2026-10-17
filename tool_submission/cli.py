@@ -168,32 +168,11 @@ def _cmd_evidence(a: argparse.Namespace) -> int:
         print(f"[中止] 状態が{st.state}です（evidenceは送信開始の記録後・実行ID特定の前に残します）")
         return 2
     cap = json.loads(Path(a.capture_json).read_text(encoding="utf-8"))
+    from tool_submission.evidence import check_capture
+
     m = st.manifest
     plan_asins = [x for x in Path(m["input_file"]).read_text(encoding="utf-8").splitlines() if x.strip()]
-    problems = []
-    try:
-        body = json.loads(cap["body"])
-    except (KeyError, ValueError):
-        body = {}
-        problems.append("送信リクエストの本文を読めません")
-    sent = [x for x in str(body.get("url", "")).split(",") if x]
-    if sent != plan_asins:
-        problems.append(f"送信したASIN（{len(sent)}件）が計画（{len(plan_asins)}件）と一致しません")
-    if not str(cap.get("endpoint", "")).endswith("start_search4.php"):
-        problems.append("送信先が想定（start_search4.php）と違います")
-    if body.get("type") != "asin_list" or body.get("country") not in ("", None):
-        problems.append(f"種別/国指定が想定と違います（type={body.get('type')!r}, country={body.get('country')!r}）")
-    resp = str(cap.get("response", ""))
-    # 実画面の応答（2026-10-17確認）: 成功時は "start_search4asin_listrivalsuccess asin<最古ID> https://…/csv_del.php<br>" のように"success"を含む。
-    # 失敗は session_expired / no_api / no_f_api / url_au / url_ca / ban / no_me / not_release / not_http（画面のスクリプトの分岐）。"end"は別の分岐。
-    failure_tokens = ("session_expired", "no_api", "no_f_api", "url_au", "url_ca", "ban", "no_me", "not_release", "not_http")
-    hit = [t for t in failure_tokens if t in resp]
-    if cap.get("status") != 200 or hit or not ("success" in resp or "end" in resp):
-        problems.append(f"応答が保存成功ではありません（status={cap.get('status')}, 失敗の目印={hit}, 応答={resp[:80]!r}）")
-    if (body.get("options") or {}).get("variation"):
-        problems.append("送信リクエストのバリエーションがONです")
-    ev = {"ok": not problems, "problems": problems, "asin_count": len(sent), "asin_list_sha256": hashlib.sha256(",".join(sent).encode()).hexdigest(),
-          "request_options": body.get("options"), "response": str(cap.get("response", ""))[:120], "alerts": cap.get("alerts", [])}
+    ev = check_capture(plan_asins, cap)
     ledger.append(a.key, "EVIDENCE", evidence=ev)
     print(("根拠を記録しました: " if ev["ok"] else "[不一致] 根拠として認められません: ")
           + json.dumps({k: ev[k] for k in ("ok", "problems", "asin_count", "response")}, ensure_ascii=False))
