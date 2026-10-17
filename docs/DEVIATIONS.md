@@ -975,3 +975,9 @@ PERMANENTLY_EXCLUDEDは引き続き完全除外のまま変更しない。
 **実ページで未検証（成功・正常とは説明しない）**: ①KEYWORD/BRAND_NAME/BRAND_STOREの0件判定（ウィジェットがあっても`UNVERIFIED_EMPTY`にしている。検証済みなのはSELLERのみ、#53）②KEYWORD/BRAND_NAMEのURL形式（BRAND_NAMEは旧実行に見られる`rh=p_89`）③配送先表示ブロック(`#glow-ingress-block`)の検出④CAPTCHA・5xxのマーカー（既存の#18/#19）⑤複数ページ巡回での「次へ」の挙動は既存の移植元のとおりで、新方式のURL（セラー店頭）では未確認。
 **検証方法**: 疑似ページ・疑似ブラウザ＋使い捨てtest-db（`tests/integration/test_acquisition_runner.py`、`tests/unit/test_source_runner.py`）。外部接続・ブラウザ起動なし。
 **残作業（別途）**: 起点ASINからの新規セラー発見、反対側市場（US→JPなど）への展開、統合ツールへの投入（`tool_execution_link`の対象市場）、取得したASINの`collector_asin`から統合ツール入力への接続の自動化。
+
+**#58 追記: 初回の実地確認（2026-10-17、JP 1出典・最大1ページ）**
+- 対象は接続確認用の**手動登録**（起点ASINからの発見ではない。経路は「起点なし」）。取得先市場の根拠は、過去の`collector_run`に残る`me=`付きURLのドメイン（JP: run 5 / US: run 6）。`known_seller_master`/`tool_execution_link`の市場は業務方向なので根拠にしなかった（先に提案したA14MFQBNVE95KO・A1G9JTQNOH85WUはページの市場を示す記録がなく不採用）。
+- JP: source_id=9 (A2K28GPVO862U1) run=78 `SUCCESS_TRUNCATED`(PAGE_LIMIT) 1ページ16 ASIN（重複なし）。設定どおり30日に数えられ、再取得可能は2026-11-16 08:24 UTC。claim/planとも`TOO_RECENT`で拒否されることを確認。既存の`collector_run`76行はハッシュ一致で無変更。
+- **配送先の不一致**: JPプロファイルは「お届け先: 153-0064」（想定289-1223）、USプロファイルは「Deliver to Japan」（想定97005）。表示ブロック`#glow-ingress-block`のセレクタは実ページで有効と確認（上記の検出は実ページ検証済み）。プログラムでは設定しない方針のため、人が設定する。JPのrun 78は想定外の配送先で取得されている（商品一覧の見え方に影響し得る）。USは配送先確認後に実行するため未実行（source_id=10 登録のみ、ELIGIBLE_NEVER）。
+- 追加: 標準入力が使えない実行でのCAPTCHAは、画面で人が解くのをポーリングして待つ（回避しない。時間切れは`CAPTCHA_UNSOLVED`）。`--require-delivery-match`（配送先が確認できなければclaim前に中止。既定は警告のみ）。

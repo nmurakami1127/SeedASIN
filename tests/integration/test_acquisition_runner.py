@@ -428,3 +428,18 @@ def test_load_source_rejects_other_market_ids(app_role_factory, registry):
     src = new_source(registry, "US")
     with pytest.raises(ValueError):
         load_source(app_role_factory, "JP", src.source_id)
+
+
+def test_captcha_not_solved_in_time_ends_the_run_as_failed_without_evading(app_role_factory, registry, runs):
+    from asin_collector.source_runner import CaptchaNotSolved
+
+    class Waiting(FakeFetcher):
+        def wait_for_captcha_solved(self):
+            self.captcha_waits += 1
+            raise CaptchaNotSolved("待機時間切れ")
+
+    src = new_source(registry, "JP")
+    f = Waiting(CAPTCHA)
+    claim, rep = go(runs, app_role_factory, f, "JP", src.source_id)
+    assert (rep.outcome, rep.error_code, len(f.urls)) == ("FAILED", "CAPTCHA_UNSOLVED", 1)  # 同じ対象を再取得しない
+    assert run_row(app_role_factory, "JP", claim.run_id).status == "FAILED"

@@ -192,6 +192,10 @@ def _run_in_browser(factory: SessionFactory, marketplace: str, source_ids: list[
         warning = fetcher.delivery_warning(marketplace)
         if warning:
             print(f"[警告] {warning}")
+            if getattr(args, "require_delivery_match", False):
+                # claimする前に止める（配送先が違うまま取得して、その出典の取得間隔を消費しないため）
+                print("[中止] --require-delivery-match が指定されているため、取得しません（プロファイルのお届け先地域を手動で設定してください）")
+                return
         items = run_batch(service, factory, fetcher, marketplace, source_ids, limits=_limits(args))
     _print_batch(items)
 
@@ -227,6 +231,8 @@ def _add_run_options(sp: argparse.ArgumentParser) -> None:
     sp.add_argument("--market", required=True, choices=["US", "JP"], help="取得先市場（ブラウザプロファイルもこの市場のものを使う）")
     sp.add_argument("--max-pages", type=int, default=5, help="1出典あたりの最大ページ数（上限で打ち切ると SUCCESS_TRUNCATED。既定: 5）")
     sp.add_argument("--max-asins", type=int, default=None, help="1出典あたりの最大ASIN数（任意）")
+    sp.add_argument("--require-delivery-match", action="store_true",
+                    help="配送先表示が想定の郵便番号と確認できない場合は、claimせずに中止する（既定は警告のみ）")
 
 
 def build_parser() -> argparse.ArgumentParser:

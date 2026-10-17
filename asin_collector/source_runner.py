@@ -48,6 +48,10 @@ class PageLoadError(Exception):
     """ページを読み込めなかった（ネットワーク・タイムアウト等）。"""
 
 
+class CaptchaNotSolved(Exception):
+    """CAPTCHAが待機時間内に解かれなかった（回避はしない。人の手動対応が必要）。"""
+
+
 @dataclass
 class FetchedPage:
     html: str
@@ -231,7 +235,10 @@ def _get(service, fetcher, claim, url, limits, sleep, hb, pages_saved: int) -> F
             if captcha_rounds > limits.max_captcha_rounds:
                 raise _Stop(fail_outcome, "CAPTCHA_UNSOLVED", f"CAPTCHAが{limits.max_captcha_rounds}回解消しませんでした")
             service.enter_captcha_wait(claim)  # leaseを長めに延ばしてDB上でも見える化
-            fetcher.wait_for_captcha_solved()
+            try:
+                fetcher.wait_for_captcha_solved()
+            except CaptchaNotSolved as exc:
+                raise _Stop(fail_outcome, "CAPTCHA_UNSOLVED", str(exc)[:300]) from exc
             service.leave_captcha_wait(claim)
             continue
         if (page.status is not None and page.status >= 500) or html_is_server_error(page.html):
@@ -296,8 +303,9 @@ def delivery_region_warning(html: str, marketplace: str) -> str | None:
 class PlaywrightFetcher:
     """実ブラウザ（市場別の永続プロファイル）で取得する。対話式のため headed。"""
 
-    def __init__(self, page) -> None:
+    def __init__(self, page, captcha_timeout: float = 300.0) -> None:
         self._page = page
+        self._captcha_timeout = captcha_timeout
 
     def fetch(self, url: str) -> FetchedPage:
         try:
@@ -307,9 +315,22 @@ class PlaywrightFetcher:
         return FetchedPage(self._page.content(), self._page.url, resp.status if resp is not None else None)
 
     def wait_for_captcha_solved(self) -> None:
-        from asin_collector.browser_session import wait_for_human_to_solve_captcha
+        """CAPTCHAは回避しない。対話端末ならEnter待ち、端末が無い（標準入力が使えない）実行では、ブラウザ画面で
+        人が解くのを一定時間ポーリングして待つ（解けなければ CaptchaNotSolved）。"""
+        import sys
 
-        wait_for_human_to_solve_captcha(self._page)
+        from asin_collector.browser_session import is_captcha_page, wait_for_human_to_solve_captcha
+
+        print("【手動対応が必要】CAPTCHAが表示されています。ブラウザ画面で解いてください（自動では回避しません）。", flush=True)
+        if sys.stdin is not None and sys.stdin.isatty():
+            wait_for_human_to_solve_captcha(self._page)
+            return
+        deadline = time.monotonic() + self._captcha_timeout
+        while time.monotonic() < deadline:
+            time.sleep(5)
+            if not is_captcha_page(self._page):
+                return
+        raise CaptchaNotSolved(f"CAPTCHAが{int(self._captcha_timeout)}秒以内に解かれませんでした")
 
     def delivery_warning(self, marketplace: str) -> str | None:
         try:
