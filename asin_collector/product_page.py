@@ -164,7 +164,12 @@ def extract_product_page(html: str, status: int | None = None) -> ProductPageRes
     notes = []
     if scope == "BUYBOX_ONLY":
         notes.append("購入ボックスの出品者のみ（全出品者の取得とは扱わない）")
-    return ProductPageResult("FOUND", sellers=sellers, brands=_brands(tree), seller_scope=scope, notes=notes, shippers=shippers)
+    brands = _brands(tree)
+    if not brands:  # ブランドを認識できなかった理由を切り分けられるよう、目印の有無だけを残す（HTMLは保存しない）
+        byline = tree.css_first("#bylineInfo")
+        notes.append("ブランド未抽出: bylineInfo=" + ("なし" if byline is None else f"あり(href={'あり' if byline.attributes.get('href') else 'なし'})")
+                     + ", po-brand=" + ("あり" if tree.css_first(".po-brand") is not None else "なし"))
+    return ProductPageResult("FOUND", sellers=sellers, brands=brands, seller_scope=scope, notes=notes, shippers=shippers)
 
 
 # ---------------------------------------------------------------------- 取得（ブラウザ非依存）

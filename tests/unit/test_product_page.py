@@ -229,3 +229,12 @@ def test_fba_sellers_shipped_by_amazon_are_kept_and_only_exact_amazon_names_are_
     assert [c.key for c in cands] == ["AFBA00000001", "AFBA00000002"]  # 配送元がAmazonなだけ／名前に「Amazon」を含むだけは除外しない
     assert {(s.key, s.reason) for s in skipped} == {("ARETAIL00001", HELD_AMAZON), ("ARETAIL00002", HELD_AMAZON)}
     assert all("表示名がAmazon小売と完全一致" in s.detail for s in skipped)
+
+
+def test_missing_brand_leaves_a_diagnostic_note_about_which_markers_were_present():
+    plain = extract_product_page(product_html(buybox="A1BUYBOX0001"))
+    assert any("ブランド未抽出: bylineInfo=なし, po-brand=なし" in n for n in plain.notes)
+    odd = extract_product_page('<div id="dp-container"><span id="productTitle">T</span><a id="bylineInfo">text only</a></div>')
+    assert any("bylineInfo=あり(href=なし)" in n for n in odd.notes)
+    ok = extract_product_page(product_html(po_brand="Panasonic"))
+    assert not any("ブランド未抽出" in n for n in ok.notes)

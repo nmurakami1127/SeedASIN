@@ -1027,3 +1027,11 @@ PERMANENTLY_EXCLUDEDは引き続き完全除外のまま変更しない。
 - JP: 起点B0B46VP7NS（注文1点）→ run=81 `SUCCESS_NONEMPTY` / `BUYBOX_ONLY` → SELLER A1MN7UZC7MPZTE（TOPSWING2、SOLD_BY）を source_id=12 に登録（IMPORT）。ブランド名「HD Ridez」（詳細表）を保存。自社除外・保留・配送元: 該当なし。再探索可能: 2026-11-16 09:47 UTC。
 - 実ページで確認できたこと: 商品ページの判定マーカー、購入ボックスの販売元リンク（seller=）、販売元表示の役割目印（SOLD_BY）、詳細表のブランド行（po-brand）、bylineのブランドストアリンク。**出品一覧パネル（VISIBLE_OFFERS）は商品ページ内に出なかった**（購入ボックスの1件のみ）ため、他セラーの網羅は別の画面が要る。配送元（SHIPS_FROM）の目印は、この2ページには該当がなく未検証。
 - 出典の取得（セラー取扱ASIN）、反対側展開、統合ツール投入、既存データの変更は行っていない（collector_run id<=77のハッシュ一致、保留・旧RUNNING・レポート無変更）。
+
+**#59 追記4: 取扱ASINの少量取得と反対側市場への展開（2026-10-17）**
+- 開始時にID・市場・経路を照合: US source_id=11 A3AJLR7DMJUOQG（ORIGIN_ASIN/EXPORT/import=1 B0076AZHC8 注文9点）、JP source_id=12 A1MN7UZC7MPZTE（ORIGIN_ASIN/IMPORT/import=2 B0B46VP7NS 注文1点）。planでは両方「未取得」の1位、claimで可。
+- 取得（配送先一致必須・最大2ページ）: US run=82 2ページ32 ASIN `SUCCESS_TRUNCATED`(PAGE_LIMIT) 再取得可能 2026-11-16 10:08 UTC / JP run=83 2ページ32 ASIN `SUCCESS_TRUNCATED` 再取得可能 2026-11-16 10:09 UTC。いずれも**2ページ目への巡回を確認**（次ページがあり上限で打切り）。ASINは重複なし。元の起点ASINは取得結果に含まれていなかった。
+- 反対側展開（取得結果の保存順で、元の起点ASIN以外の最初の1件。決定的）: US→JP は B09DGF5WCD を **JPの商品ページ**で調査（run=84、FOUND、`BUYBOX_ONLY`）→ source_id=13 SELLER A3RXLX7WSXLBCF（【迅速発送】くるみ商店、SOLD_BY）を登録。JP→US は B0058BDP80 を **USの商品ページ**で調査（run=85、FOUND、`BUYBOX_ONLY`）→ source_id=14 SELLER A1G9JTQNOH85WU（Harutan【Japan Import】、SOLD_BY）を登録。いずれも「上限打切りの一部の結果からの展開」（`derived_from_partial_result=true`）。
+- 経路: VIA_SOURCE。13 = 起点 US import=1 B0076AZHC8（注文9点, EXPORT）→ 経由出典 11 の取得 run=82 → 経由ASIN B09DGF5WCD → 調査先 JP。14 = 起点 JP import=2 B0B46VP7NS（注文1点, IMPORT）→ 経由出典 12 の取得 run=83 → 経由ASIN B0058BDP80 → 調査先 US。planでは両方「未取得」で、起点の注文実績を引き継いで並ぶ。反対側で見つけた出典（13・14）の取扱ASINは**取得していない**。
+- 実ページで確認できたこと（追加）: 複数ページ巡回（「次へ」リンク）、配送元の表示（`SHIPS_FROM`）を販売元と区別して出典にしない動作（JP: A26YONAZMFTVSE、US: AGM3OIPIW0FJG を配送元として検出、登録せず）。**ブランドは反対側の2ページでは抽出0件**（HTMLを保存していないため原因は特定できない。ブランド行が無い商品か、マークアップ差か不明）。今後に備え、ブランド未抽出時はbylineInfo／po-brandの有無を抽出結果のnotesに残すようにした。自社除外・Amazon小売の保留は該当なし。
+- 既存データ: collector_run id<=77のハッシュ一致、保留・旧RUNNING・レポート・storefront_blocked_seller無変更。
