@@ -60,6 +60,32 @@ def read_selected_groups(csv_path: Path) -> set[str]:
     return selected
 
 
+def read_plan_type_grades(csv_path: Path) -> dict[str, str]:
+    """apply列がYの行の {グループID: 種別の確度(FACT/ESTIMATE/UNCONFIRMED)}。計画作成時の確認結果と、適用時に再現した
+    確認結果が一致するかの検査に使う（台帳指定の付け忘れなどを、書き込み前に検出する）。"""
+    out: dict[str, str] = {}
+    with csv_path.open(encoding="utf-8-sig", newline="") as fh:
+        for r in csv.DictReader(fh):
+            if (r.get("apply") or "").strip().lower() in ("y", "yes", "1", "true"):
+                out[r["group"].strip()] = (r.get("type_grade") or "").split("(")[0].strip()
+    return out
+
+
+# acquisition_legacy_evidence の文字列列の上限（スキーマに合わせる）。超過は書き込み前に検出する。
+_VARCHAR_LIMITS = {"evidence_at_basis": 60, "market_hint_basis": 60, "type_hint_basis": 60, "type_hint": 20, "evidence_kind": 20}
+
+
+def validate_observation_fields(observations: Iterable[Observation]) -> list[str]:
+    """列の長さ超過を検出する（途中で失敗して中途半端に書き込まれるのを防ぐため、書き込み前に全件を検査）。"""
+    problems = []
+    for o in observations:
+        for field_name, limit in _VARCHAR_LIMITS.items():
+            v = getattr(o, field_name, None)
+            if isinstance(v, str) and len(v) > limit:
+                problems.append(f"{o.ref}: {field_name} が{len(v)}文字（上限{limit}）")
+    return problems
+
+
 class LegacyService:
     def __init__(self, app_factory: SessionFactory, actor: str | None = None,
                  hook: Callable[[str, str], None] | None = None) -> None:
@@ -214,6 +240,10 @@ class LegacyService:
         if classify not in ("none", "fact", "all"):
             raise ValueError("classify must be none/fact/all")
         stats = {"selected": 0, "skipped_unconfirmed": 0, "observations": 0, "classified": 0, "confirmed": 0}
+        observations = list(observations)
+        problems = validate_observation_fields(o for o in observations if o.group in selected_groups)
+        if problems:
+            raise ValueError("列の長さの上限を超える観測があります（書き込みはしていません）: " + "; ".join(problems[:5]))
         for o in observations:
             if o.group not in selected_groups:
                 continue
@@ -328,6 +358,10 @@ class LegacyService:
         return done
 
     # ------------------------------------------------------------------ 一覧
+
+    def unclassified_count(self, market: str) -> int:
+        """種別が未確定で、却下もされていない旧証拠の群の数（その市場の区画）。これらは出典を保留にしない。"""
+        return sum(1 for s in self._states(market) if not s.classified and s.market_state != "DISMISSED")
 
     def list_groups(self) -> list[dict]:
         merged: dict[str, dict] = {}

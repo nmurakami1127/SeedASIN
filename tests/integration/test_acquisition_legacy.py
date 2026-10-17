@@ -94,12 +94,19 @@ def test_other_type_same_string_and_unclassified_evidence_hold_nothing(registry,
     kw = registry.register_source("US", "KEYWORD", word)
     with pytest.raises(NotEligible):
         runs.claim("US", kw.source_id)
-    # 未分類の証拠は、分類されるまでどの出典も保留しない（一覧では分かる）
+    # 未分類の証拠は種別を推測しない。値が一致しない出典は保留せず、一致する出典（種別を問わない）だけ確認対象として止める
     word2 = unique_key("unclassified ")
     u = obs(word2, typ=None, days_ago=3)
     apply(legacy, u)
     assert any(g["group"] == u.group and not g["state"].classified for g in legacy.list_groups())
-    runs.claim("US", registry.register_source("US", "KEYWORD", word2).source_id)
+    runs.claim("US", registry.register_source("US", "KEYWORD", unique_key("unrelated ")).source_id)
+    for typ in ("KEYWORD", "BRAND_NAME"):
+        src = registry.register_source("US", typ, word2.upper())  # 表記違い（大文字）でも正規化後に一致
+        with pytest.raises(NotEligible) as e:
+            runs.claim("US", src.source_id)
+        assert e.value.decision.state == "REVIEW_LEGACY" and "種別が未確定" in e.value.decision.blockers[0].detail
+    legacy.dismiss(u.group, reason="取得の証拠ではない")
+    runs.claim("US", registry.register_source("US", "KEYWORD", word2).source_id)  # 人が却下すれば止まらない
 
 
 def test_hold_expires_after_the_interval_but_the_evidence_is_kept(app_role_factory, registry, runs, legacy):
@@ -452,3 +459,80 @@ def test_latest_state_is_deterministic_for_decisions_with_the_same_timestamp(app
     assert len(stamps) == 1  # 全て同時刻
     for _ in range(3):  # 何度読み直しても同じ最新状態
         assert legacy.group_states(o.group)["US"].market_state == "DISMISSED"
+
+
+def test_applying_a_selection_writes_exactly_the_planned_rows_and_unknown_market_holds_both(app_role_factory, registry, runs, legacy):
+    """選択結果の予定行数（SELECT_BOTH=4行、SELECT_RECORDED_MARKET=3行）が、実際の適用で書かれる行数と一致する。"""
+    from acquisition.legacy_scan import select_for_migration
+
+    both = obs(unique_key("SELBOTH"), typ="KEYWORD", type_grade="FACT", days_ago=4)
+    rec = obs(unique_key("ASELREC"), kind="COLLECTOR_RUN", typ="SELLER", type_grade="FACT", market_grade="FACT", market_hint="JP", days_ago=4)
+    heur = obs(unique_key("ASELHEUR"), typ="SELLER", type_grade="ESTIMATE", days_ago=4)
+    rows = select_for_migration([both, rec, heur], lambda t, m: 30, datetime.now(timezone.utc))
+    assert [r.decision for r in rows] == ["SELECT_BOTH", "SELECT_RECORDED_MARKET", "EXCLUDE"]
+    planned = sum(r.planned_rows for r in rows)
+    selected = {r.obs.group for r in rows if r.selected}
+
+    def evidence_rows(group):
+        total = 0
+        for m in ("US", "JP"):
+            with app_role_factory.get_session(m) as conn, conn.begin():
+                total += conn.execute(text("SELECT count(*) FROM acquisition_legacy_evidence WHERE evidence_group = CAST(:g AS uuid)"),
+                                      {"g": group}).scalar_one()
+        return total
+
+    legacy.apply([both, rec, heur], selected, classify="fact", confirm_recorded_market=True, reason="選択結果の適用", batch_id="t")
+    assert evidence_rows(both.group) == 4 and evidence_rows(rec.group) == 3 and evidence_rows(heur.group) == 0
+    assert evidence_rows(both.group) + evidence_rows(rec.group) == planned  # 予定行数と実際の行数が一致
+    # 市場不明・種別確認済みの証拠は、両市場でREVIEW_LEGACY。成功も取得先市場も確定していない
+    assert states(legacy, both) == {"US": "UNKNOWN", "JP": "UNKNOWN"}
+    kw_us, kw_jp = (registry.register_source(m, "KEYWORD", both.raw_value) for m in ("US", "JP"))
+    for m, s in (("US", kw_us), ("JP", kw_jp)):
+        with pytest.raises(NotEligible) as e:
+            runs.claim(m, s.source_id)
+        assert e.value.decision.state == "REVIEW_LEGACY"
+    # 記録で市場が分かる参考証拠は、その市場でだけ取得間隔に数える（新方式の成功ではない）。他方の市場には影響しない
+    sel_jp, sel_us = (registry.register_source(m, "SELLER", rec.raw_value) for m in ("JP", "US"))
+    with pytest.raises(NotEligible) as e:
+        runs.claim("JP", sel_jp.source_id)
+    d = e.value.decision
+    assert d.state == "TOO_RECENT" and d.gate_basis == "LEGACY" and d.last_success_at is None
+    runs.claim("US", sel_us.source_id)
+    # 推定のみの証拠は適用されていないので、どの出典も保留しない
+    runs.claim("US", registry.register_source("US", "SELLER", heur.raw_value).source_id)
+
+
+def test_observe_only_history_is_counted_as_unconfirmed_and_holds_nothing_and_rerun_is_safe(registry, runs, legacy):
+    key = unique_key("AOBSERVE")
+    o = obs(key, days_ago=3, type_grade="ESTIMATE")  # ID形式の推定のみ: 分類せず観測として残す
+    before = {m: legacy.unclassified_count(m) for m in ("US", "JP")}
+    first = legacy.apply([o], {o.group}, classify="fact", confirm_recorded_market=False, reason="r", batch_id="t")
+    assert (first["observations"], first["classified"]) == (2, 0)
+    assert {m: legacy.unclassified_count(m) for m in ("US", "JP")} == {m: before[m] + 1 for m in before}
+    src = registry.register_source("US", "SELLER", key)
+    with pytest.raises(NotEligible) as e:  # 同じ値の未確認履歴がある出典は、人が分類/却下するまで自動選択しない
+        runs.claim("US", src.source_id)
+    assert "種別が未確定" in e.value.decision.blockers[0].detail
+    again = legacy.apply([o], {o.group}, classify="fact", confirm_recorded_market=False, reason="r", batch_id="t")
+    assert again["observations"] == 0  # 再実行しても重複しない
+    legacy.classify(o.group, "SELLER", key, "", reason="人が確認")
+    assert legacy.unclassified_count("US") == before["US"]  # 人が分類すると未確認から外れる
+    with pytest.raises(NotEligible) as e2:  # 分類後は市場未確定の旧証拠として両市場REVIEW_LEGACY
+        runs.claim("US", src.source_id)
+    assert "取得先市場が未確定" in e2.value.decision.blockers[0].detail
+
+
+def test_apply_rejects_overlong_fields_before_writing_anything(legacy):
+    ok, bad = obs(unique_key("AOK")), obs(unique_key("ABAD"))
+    bad.type_hint_basis = "x" * 61  # 実DB投入中に起きた「列長超過」の再発防止: 全件を先に検査して1行も書かない
+    with pytest.raises(ValueError, match="列の長さ"):
+        legacy.apply([ok, bad], {ok.group, bad.group}, classify="all", confirm_recorded_market=False, reason="r", batch_id="t")
+    assert legacy.group_states(ok.group) == {} and legacy.group_states(bad.group) == {}
+
+
+def test_apply_cli_refuses_when_planned_fact_cannot_be_reproduced(tmp_path, monkeypatch):
+    from acquisition.legacy import read_plan_type_grades
+
+    plan = tmp_path / "plan.csv"
+    plan.write_text("apply,group,type_grade\nY,g1,FACT(確認済み)\nY,g2,ESTIMATE(推定)\n,g3,FACT(確認済み)\n", encoding="utf-8-sig")
+    assert read_plan_type_grades(plan) == {"g1": "FACT", "g2": "ESTIMATE"}  # 台帳指定の付け忘れ検出に使う（選択行のみ）

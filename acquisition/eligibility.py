@@ -25,6 +25,7 @@ from typing import Iterable
 from sqlalchemy import Connection, text
 
 from acquisition.legacy_state import LegacyGroupState, fold_legacy
+from acquisition.normalize import normalize_key
 
 COUNTED_FAILURE_OUTCOMES = ("FAILED", "PARTIAL", "UNVERIFIED_EMPTY")
 EXCLUDING_BLOCK_REASON = "PERMANENTLY_EXCLUDED"
@@ -70,6 +71,7 @@ class SourceFacts:
     failure_streak_reset_at: datetime | None
     runs: list[RunFact] = field(default_factory=list)
     legacy: list[LegacyGroupState] = field(default_factory=list)
+    legacy_unclassified: list[LegacyGroupState] = field(default_factory=list)  # 種別未確定・未却下の旧証拠（推測しない）
     blocked_reason: str | None = None
 
 
@@ -158,6 +160,27 @@ def decide(facts: SourceFacts, cfg: Config, as_of: datetime) -> Decision:
                 latest.evidence_at + interval,
             )
         )
+
+    # --- 種別が未確定の旧証拠: 識別情報（この出典の種別で正規化した値）が一致するものは、人が分類/却下するまで止める ---
+    # 種別を推測して確定はしない。件数の表示だけでは個別の誤取得を防げないため、一致した出典だけを確認対象にする。
+    for u in facts.legacy_unclassified:
+        if u.evidence_at + interval <= as_of:
+            continue
+        try:
+            same = normalize_key(facts.source_type, u.raw_value, "")[0] == facts.key_primary
+        except ValueError:
+            same = False
+        if same:
+            blockers.append(
+                Blocker(
+                    "REVIEW_LEGACY",
+                    f"種別が未確定の旧履歴に同じ値があります（{u.evidence_kind} {u.evidence_ref} / 値「{u.raw_value}」 / "
+                    f"証拠時刻{u.evidence_at:%Y-%m-%d %H:%M} UTC）。この出典として扱ってよいか legacy-classify で分類するか、"
+                    "legacy-dismiss で却下するまで自動選択しません",
+                    u.evidence_at + interval,
+                )
+            )
+            break
 
     # --- 取得間隔 ---
     counted = [r for r in facts.runs if _counts_as_success(r, cfg)]
@@ -288,8 +311,10 @@ def load_facts(conn: Connection, marketplace: str, source_ids: Iterable[int] | N
             f.blocked_reason = blocked.get(f.key_primary)
     legacy_rows = conn.execute(text("SELECT * FROM acquisition_legacy_evidence ORDER BY evidence_id")).all()
     legacy_states = fold_legacy(legacy_rows, marketplace)
+    unclassified = [s for s in legacy_states if not s.classified and s.market_state != "DISMISSED"]
     for f in facts.values():
         f.legacy = [
             s for s in legacy_states if s.classified and s.source_type == f.source_type and s.key_hash == f.key_hash
         ]
+        f.legacy_unclassified = unclassified
     return list(facts.values())

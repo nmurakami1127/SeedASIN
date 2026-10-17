@@ -151,6 +151,7 @@ reap-expired --market JP                          # 期限切れの実行を回�
 legacy-dry-run                      # DBは変更しません。事実/推定/未確認を分けたCSVを exports\acquisition\ に出力
 # CSVの apply 列に Y を付けた行だけが対象になります
 legacy-apply --plan <CSV> --reason "..." [--classify none|fact|all] [--confirm-recorded-market]
+legacy-select                       # 最新のDB時刻でdry-runを再生成し、移行対象案（選択結果CSV）・誤分類候補・未分類の一覧・要約(sha256つき)を作る（読み取り専用）
 legacy-unclassified [--all]         # 種別が自動で決まらなかった旧証拠の確認用一覧（元表記・記録された種別・参照元・日時。種別は推測しない）
 legacy-list [--unclassified] [--state UNKNOWN]
 legacy-classify --group <UUID> --type SELLER --key A... --reason "..."   # 未分類の種別を人が決める
@@ -214,3 +215,4 @@ pytest tests/unit
 # 結合テストは使い捨てPostgreSQL 16が必要（SEEDASIN_TEST_SUPERUSER_DATABASE_URL、docker compose の test-db）
 pytest tests/integration -m integration
 ```
+- 旧証拠の投入: `legacy-select --ledger-jp <xlsx> --ledger-us <xlsx>` → `legacy-apply`（同じ台帳指定）。種別未確認の履歴は `legacy_observe_only_*.csv` を `--classify none` で観測のみ投入。

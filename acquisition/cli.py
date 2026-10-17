@@ -26,7 +26,7 @@ from typing import Callable
 
 from acquisition.eligibility import db_now, decide, load_configs, load_facts
 from acquisition.lease import AcquisitionRunService
-from acquisition.legacy import LegacyError, LegacyService, read_selected_groups
+from acquisition.legacy import LegacyError, LegacyService, read_plan_type_grades, read_selected_groups
 from acquisition.legacy_scan import (
     DEFAULT_DONE_DIR,
     DEFAULT_SELLER_OUTPUT_ROOT,
@@ -192,6 +192,10 @@ def _cmd_acquire_plan(a, ctx: Context) -> int:
         print(f"[中止] {exc}")
         return EXIT_REFUSED
     print(format_plan(plan))
+    n_uncl = ctx.legacy.unclassified_count(a.market)
+    if n_uncl:
+        print(f"\n[参考] 種別が未確定の旧履歴 {n_uncl}件（取得済みとも未取得とも確定していない。この計画には影響しない。"
+              f"`legacy-list --unclassified` で確認し、人が分類するまで保留にも除外にも使わない）")
     if a.csv:
         print(f"\nCSV: {write_plan_csv(plan, Path(a.csv))}")
     return EXIT_OK
@@ -264,6 +268,21 @@ def _cmd_legacy_apply(a, ctx: Context) -> int:
         print("[中止] apply列がYの行がありません")
         return EXIT_REFUSED
     obs, _ = _scan(a, ctx)
+    if a.ledger_jp or a.ledger_us:  # legacy-select と同じ台帳指定で、種別の確認を再現する
+        from acquisition.legacy_scan import apply_ledger_corroboration, enrich_heuristics, load_ledger_seller_ids
+
+        enrich_heuristics(ctx.app_factory, obs)
+        ids = {m: load_ledger_seller_ids(Path(path), sheet)
+               for m, path, sheet in (("JP", a.ledger_jp, a.ledger_jp_sheet), ("US", a.ledger_us, a.ledger_us_sheet)) if path}
+        print(f"台帳の根拠で種別を確認済みにした観測: {apply_ledger_corroboration(obs, ids)}件")
+    if a.classify != "none":  # 計画作成時にFACTだった行を、同じ条件で再現できていなければ書き込み前に止める
+        planned = read_plan_type_grades(Path(a.plan))
+        now_grade = {o.group: o.type_grade for o in obs}
+        lost = [g for g, grade in planned.items() if grade == "FACT" and now_grade.get(g) != "FACT"]
+        if lost:
+            print(f"[中止] 計画では種別が確認済み(FACT)の{len(lost)}件が、今回の読み取りでは確認できません。"
+                  "legacy-select と同じ --ledger-jp/--ledger-us を指定してください（書き込みはしていません）")
+            return EXIT_REFUSED
     try:
         stats = ctx.legacy.apply(obs, selected, classify=a.classify, confirm_recorded_market=a.confirm_recorded_market,
                                  reason=a.reason, batch_id=a.batch_id or f"{datetime.now():%Y%m%d%H%M%S}")
@@ -288,6 +307,106 @@ def _cmd_legacy_unclassified(a, ctx: Context) -> int:
     print(f"  確認用の一覧（値ごと）: {s}")
     print(f"  明細（参照元・日時）: {d}")
     print("種別は推測していません。decided_type / decided_key 列は空欄です。分類は legacy-classify で人が決めます。")
+    return EXIT_OK
+
+
+def _sha256(path: Path) -> str:
+    import hashlib
+
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _load_intervals(ctx: Context) -> tuple[datetime, dict[tuple[str, str], int], list[str]]:
+    """DB時刻と、取得先市場×種別の取得間隔(日)を読む（読み取り専用）。"""
+    from sqlalchemy import text
+
+    notes: list[str] = []
+    table: dict[tuple[str, str], int] = {}
+    as_of = None
+    for m in MARKETS:
+        with ctx.app_factory.get_session(m) as conn, conn.begin():
+            conn.execute(text("SET TRANSACTION READ ONLY"))
+            if as_of is None:
+                as_of = conn.execute(text("SELECT clock_timestamp()")).scalar_one()
+            try:
+                for r in conn.execute(text("SELECT source_type, min_interval_days FROM acquisition_interval_config")):
+                    table[(m, r.source_type)] = r.min_interval_days
+            except Exception as exc:  # 0016未適用のDBなど
+                notes.append(f"取得間隔の設定を読めないため既定30日を使います: {type(exc).__name__}")
+    return as_of, table, notes
+
+
+def _cmd_legacy_select(a, ctx: Context) -> int:
+    from acquisition.legacy_scan import (
+        EXCLUSION_ORDER, REASON_LABEL, apply_ledger_corroboration, enrich_heuristics, load_ledger_seller_ids,
+        select_for_migration, summarize_selection, write_heuristic_csv, write_selection_csv,
+    )
+
+    as_of, table, notes = _load_intervals(ctx)
+
+    def interval_days(source_type, market):
+        markets = [market] if market else MARKETS
+        types = [source_type] if source_type else list(SOURCE_TYPES)
+        vals = [table.get((m, t), 30) for m in markets for t in types]
+        return max(vals)
+
+    obs, stats = _scan(a, ctx)
+    enrich_heuristics(ctx.app_factory, obs)
+    ledger_ids = {}
+    for m, path, sheet in (("JP", a.ledger_jp, a.ledger_jp_sheet), ("US", a.ledger_us, a.ledger_us_sheet)):
+        if path:
+            ledger_ids[m] = load_ledger_seller_ids(Path(path), sheet)
+    promoted = apply_ledger_corroboration(obs, ledger_ids) if ledger_ids else 0
+    rows = select_for_migration(obs, interval_days, as_of)
+    out_dir = Path(a.out_dir) if a.out_dir else DEFAULT_OUT_DIR
+    stamp = f"{as_of.astimezone(timezone.utc):%Y%m%d_%H%M%S}UTC"
+    dry = write_dry_run_csv(obs, out_dir / f"legacy_dry_run_{stamp}.csv", now=as_of)  # 元のdry-run（apply列は全行未選択）
+    sel = write_selection_csv(rows, out_dir / f"legacy_selection_{stamp}.csv", as_of)  # 選択結果（別ファイル）
+    obs_only = write_selection_csv(rows, out_dir / f"legacy_observe_only_{stamp}.csv", as_of, observe_only=True)
+    heur, hs = write_heuristic_csv(rows, out_dir / f"legacy_heuristic_candidates_{stamp}.csv")
+    groups = unclassified_review(obs, recent_only=True, now=as_of)
+    us, ud = write_unclassified_review(groups, out_dir / f"legacy_unclassified_summary_{stamp}.csv",
+                                       out_dir / f"legacy_unclassified_detail_{stamp}.csv", now=as_of)
+    s = summarize_selection(rows)
+
+    lines = [
+        f"基準時刻(DB時刻): {as_of.astimezone(timezone.utc):%Y-%m-%d %H:%M:%S} UTC",
+        "選択条件（すべて満たすもの）: (1)種別・出典キーを確認できる(記録/URL由来。ID形式の推定は含めない) "
+        "(2)証拠時刻が取得間隔内 (3)取得成功の承認済み参考証拠(推定)がある",
+        "取得間隔(日): " + ", ".join(f"{m}/{t}={d}" for (m, t), d in sorted(table.items())) if table else "取得間隔: 既定30日",
+        f"観測の合計: {s['observations_total']}件 → 選択: {s['selected_observations']}件 / 除外: {s['excluded_total']}件",
+        "参照元別の選択件数（証拠数）: " + (", ".join(f"{k}={v}" for k, v in sorted(s['selected_by_kind'].items())) or "なし"),
+        "扱い別: " + (", ".join(f"{k}={v}" for k, v in sorted(s['selected_by_decision'].items())) or "なし")
+        + "（SELECT_BOTH=取得先市場不明→US・JP双方のREVIEW_LEGACY用 / SELECT_RECORDED_MARKET=記録で市場が分かる参考証拠）",
+        f"対象出典数: {s['sources_total']}（うち、両市場で保留になる出典={s['sources_held_in_both_markets']}、"
+        f"記録の市場で参考証拠として保持=US {s['sources_confirmed_by_market']['US']} / JP {s['sources_confirmed_by_market']['JP']}）",
+        f"予定のDB行数: {s['planned_rows']}行（" + ", ".join(f"{k}={v}" for k, v in s['planned_rows_breakdown'].items()) + "）",
+        "除外理由別件数（順に最初に該当した1つ）:",
+    ]
+    for code, label in EXCLUSION_ORDER:
+        by_kind = s["excluded_by_reason_and_kind"][code]
+        lines.append(f"  {s['excluded_by_reason'][code]:>5}件  {label}  " + (str(by_kind) if by_kind else ""))
+    if ledger_ids:
+        lines.append("セラー台帳の根拠で種別を確認済みにした観測: %d件（台帳ID数 %s）" % (promoted, ", ".join(f"{m}={len(v)}" for m, v in sorted(ledger_ids.items()))))
+    lines.append(f"誤分類候補（ID形式の推定のみ・選択しない）: 観測{hs['observations']}件、異なる値{hs['distinct_values']}件")
+    for lab, n in sorted(hs["by_label"].items()):
+        lines.append(f"    {n:>4}件（異なる値{hs['distinct_by_label'][lab]}） {lab}")
+    lines.append(f"未分類（直近の取得間隔内）: 異なる値{len(groups)}件、観測{sum(len(g) for g in groups)}件 — 推測しない")
+    for m, st in stats.items():
+        lines.append(f"旧collector_run(市場{m}): {st['total']}件、うち旧RUNNING/CAPTCHA_WAIT {st['legacy_running_untouched']}件（選択しない）")
+    done = Path(a.done_dir) if a.done_dir else DEFAULT_DONE_DIR
+    if done.exists():
+        d = scan_done_dir(done)
+        lines.append(f"done/: {d['files']}ファイル（一覧のみ・選択しない）")
+    lines += notes
+    files = {"dry-run(元・apply列は全行未選択)": dry, "選択結果": sel, "観測のみ(種別未確認・分類しない)": obs_only, "誤分類候補": heur, "未分類(要約)": us, "未分類(明細)": ud}
+    lines.append("ファイルとsha256:")
+    for label, p in files.items():
+        lines.append(f"  {label}: {p}  sha256={_sha256(p)}")
+    summary = out_dir / f"legacy_selection_summary_{stamp}.txt"
+    summary.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    print("\n".join(lines))
+    print(f"要約: {summary}\nDBは一切変更していません。適用は legacy-apply --plan <選択結果CSV> --classify fact --confirm-recorded-market（別途指示）。")
     return EXIT_OK
 
 
@@ -365,6 +484,14 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--out", default=None)
     sp.add_argument("--seller-output-root", default=None)
     sp.add_argument("--done-dir", default=None)
+    sp = add("legacy-select", _cmd_legacy_select, "最新のDB時刻でdry-runを再生成し、移行対象案（選択結果CSV）と誤分類候補・未分類の一覧を作る（読み取り専用）", market=False)
+    sp.add_argument("--out-dir", default=None)
+    sp.add_argument("--seller-output-root", default=None)
+    sp.add_argument("--done-dir", default=None)
+    sp.add_argument("--ledger-jp", default=None, help="JPセラー台帳(xlsx)。seller id列でID形式の推定を確認済みにする")
+    sp.add_argument("--ledger-jp-sheet", default="セラーリスト")
+    sp.add_argument("--ledger-us", default=None, help="USセラー台帳(xlsx)")
+    sp.add_argument("--ledger-us-sheet", default="セラー台帳")
     sp = add("legacy-unclassified", _cmd_legacy_unclassified, "種別が自動で決まらなかった旧証拠の確認用一覧を出力する（推測しない・読み取り専用）", market=False)
     sp.add_argument("--all", action="store_true", help="直近30日に限らず全期間")
     sp.add_argument("--out-dir", default=None)
@@ -376,6 +503,10 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--confirm-recorded-market", action="store_true", help="記録(URLドメイン)で市場が事実の行を、その市場で確定する")
     sp.add_argument("--batch-id", default=None)
     sp.add_argument("--seller-output-root", default=None)
+    sp.add_argument("--ledger-jp", default=None, help="legacy-select と同じJP台帳(xlsx)")
+    sp.add_argument("--ledger-jp-sheet", default="セラーリスト")
+    sp.add_argument("--ledger-us", default=None, help="legacy-select と同じUS台帳(xlsx)")
+    sp.add_argument("--ledger-us-sheet", default="セラー台帳")
     sp = add("legacy-list", _cmd_legacy_list, "適用済みの旧証拠と状態", market=False)
     sp.add_argument("--unclassified", action="store_true")
     sp.add_argument("--state", choices=["UNKNOWN", "CONFIRMED_THIS", "CONFIRMED_OTHER", "DISMISSED"], default=None)

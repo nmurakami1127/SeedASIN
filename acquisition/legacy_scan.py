@@ -18,7 +18,7 @@ import glob
 import os
 import re
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import parse_qs, unquote_plus, urlparse
@@ -64,6 +64,8 @@ class Observation:
     recorded_source: str | None = None  # tool_execution_link.source（ログのdata-type）。無ければNone
     recorded_at: datetime | None = None  # requested_at（依頼日）またはcollector_runの開始日時
     ref_detail: str = ""  # 参照元の補足（run_type/status/URL等）
+    run_status: str | None = None  # 旧collector_runのstatus（RUNNING/CAPTCHA_WAITの判別用）
+    flags: dict = field(default_factory=dict)  # 誤分類候補の裏付け/矛盾の確認用（enrich_heuristics）
 
     def proposed_key(self) -> tuple[str, str] | None:
         if not self.type_hint or not self.proposed_primary:
@@ -185,7 +187,7 @@ def collect_collector_runs(app_factory: SessionFactory, marketplace: str) -> tup
                 market_hint=market, market_hint_basis="URLドメイン(marketplace_from_url)" if market else None,
                 type_hint=typ, type_hint_basis=("URLの" + ("me=" if typ == "SELLER" else "k=")) if typ else None,
                 proposed_primary=primary, proposed_qualifier=qual,
-                note=f"status={r.status} run_type={r.run_type}", recorded_source=r.run_type, recorded_at=r.started_at,
+                note=f"status={r.status} run_type={r.run_type}", recorded_source=r.run_type, recorded_at=r.started_at, run_status=r.status,
                 ref_detail=f"collector_run id={r.id} status={r.status} URL={r.target}",
             )
         )
@@ -327,12 +329,37 @@ def summarize(observations: list[Observation], now: datetime | None = None) -> d
 UNCLASSIFIED_SUMMARY_COLUMNS = [
     "no", "original_values", "n_observations", "recorded_types", "business_directions_or_markets", "refs",
     "evidence_at_first_utc", "evidence_at_last_utc", "requested_at_first_utc", "requested_at_last_utc",
-    "asin_counts", "within_30d", "decided_type", "decided_key", "decided_qualifier", "decided_note",
+    "asin_counts", "within_30d", "suggested_type", "suggested_key", "suggestion_basis",
+    "decided_type", "decided_key", "decided_qualifier", "decided_note",
 ]
 UNCLASSIFIED_DETAIL_COLUMNS = [
     "no", "group", "kind", "original_value", "recorded_source", "ref", "ref_detail", "data_market", "evidence_at_utc",
     "evidence_at_basis", "requested_or_started_at_utc", "asin_count", "success_grade", "within_30d",
 ]
+
+
+def suggest_from_url(raw: str) -> tuple[str, str, str] | None:
+    """URLの**明示的なクエリパラメータ**から客観的に言える分類案 (種別, キー, 根拠)。案であり、DBには書かない。
+    me=<セラーID> → SELLER / rh=...p_89:<ブランド名>（ブランド絞り込み）→ BRAND_NAME。
+    k= (検索語) は、同じURLにブランド絞り込みがあれば案にしない（キーワードかブランドか決められないため）。
+    名前や文字列の印象からは案を作らない。"""
+    from urllib.parse import parse_qs, unquote, urlparse
+
+    if not raw.lower().startswith(("http://", "https://")):
+        return None
+    q = parse_qs(urlparse(raw).query)
+    me = (q.get("me") or [""])[0].strip()
+    if me:
+        return "SELLER", me.upper(), "URLのme=（出品者指定）"
+    brands = []
+    for rh in q.get("rh", []):
+        for part in unquote(rh).split(","):
+            if part.startswith("p_89:"):
+                brands += [b for b in part[len("p_89:"):].split("|") if b]
+    brands = sorted(set(brands))
+    if len(brands) == 1:
+        return "BRAND_NAME", brands[0].replace("+", " "), "URLのrh=p_89（ブランド絞り込み）"
+    return None
 
 
 def unclassified_review(observations: list[Observation], *, recent_only: bool = True, now: datetime | None = None
@@ -353,6 +380,14 @@ def unclassified_review(observations: list[Observation], *, recent_only: bool = 
     return [sorted(v, key=lambda o: (o.evidence_at, o.ref)) for _, v in sorted(groups.items())]
 
 
+def _suggestion_cells(group: list[Observation]) -> tuple[str, str, str]:
+    sugg = {suggest_from_url(o.raw_value) for o in group}
+    if len(sugg) == 1 and None not in sugg:
+        t, k, b = next(iter(sugg))
+        return t, k, b
+    return "", "", ""
+
+
 def write_unclassified_review(groups: list[list[Observation]], summary_path: Path, detail_path: Path,
                               now: datetime | None = None) -> tuple[Path, Path]:
     now = now or datetime.now(timezone.utc)
@@ -371,6 +406,7 @@ def write_unclassified_review(groups: list[list[Observation]], summary_path: Pat
                 fmt(min(at)), fmt(max(at)), fmt(min(req)) if req else "", fmt(max(req)) if req else "",
                 " | ".join(str(o.asin_count) for o in g),
                 "Y" if any(now - o.evidence_at.astimezone(timezone.utc) <= timedelta(days=30) for o in g) else "",
+                *_suggestion_cells(g),
                 "", "", "", "",
             ])
     with detail_path.open("w", newline="", encoding="utf-8-sig") as fh:
@@ -385,3 +421,249 @@ def write_unclassified_review(groups: list[list[Observation]], summary_path: Pat
                     "Y" if now - o.evidence_at.astimezone(timezone.utc) <= timedelta(days=30) else "",
                 ])
     return summary_path, detail_path
+
+
+# ---------------------------------------------------------------------- 移行対象の選択（legacy-select）
+#
+# 選択条件（すべてを満たす観測だけを選ぶ。基準時刻はDB時刻）:
+#   (1) 種別・出典キーを**確認できる**（type_grade=FACT: 記録されたdata-typeやURLの me=/k= による。
+#       セラーID形式の正規表現に一致するだけの推定は「確認」に含めず、誤分類候補として別の一覧に分ける）
+#   (2) 証拠時刻が、その出典の取得間隔内（as_of < 証拠時刻 + 間隔）。間隔は acquisition_interval_config から。
+#       取得先市場が不明な証拠は、両市場の間隔の長い方
+#   (3) 取得成功について承認済みの参考証拠がある（success_grade=ESTIMATE）
+# 選択しないもの: 未分類文字列、done/、取得成功の根拠がないもの、旧RUNNING/CAPTCHA_WAIT。
+#
+# 扱い:
+#   - 取得先市場が不明: US・JP双方のREVIEW_LEGACY用として選択（SELECT_BOTH）。成功も取得先市場も確定しない。
+#   - 取得先市場が記録(URLドメイン)で分かる: 旧方式の取得成功は「参考証拠」として保持（SELECT_RECORDED_MARKET。
+#     取得先市場だけを記録に基づき確定し、成功日時の断定はしない）。
+# 除外理由は、次の順で最初に該当したものを1つだけ付ける（件数が重複しない）。
+
+EXCLUSION_ORDER = [
+    ("LEGACY_RUNNING", "旧RUNNING/CAPTCHA_WAIT（変更も証拠化もしない）"),
+    ("NO_SUCCESS_BASIS", "取得成功の根拠がない（取込なし・件数0・失敗・NGを含む日など）"),
+    ("OUTSIDE_INTERVAL", "証拠時刻が取得間隔の外（履歴としては今回選択しない）"),
+    ("TYPE_HEURISTIC_ONLY", "種別がID形式等の推定のみ（誤分類候補として別の一覧）"),
+    ("TYPE_UNCLASSIFIED", "種別を確認できない（未分類）"),
+    ("KEY_UNUSABLE", "種別は確認できるが出典キーを生成できない"),
+]
+REASON_LABEL = dict(EXCLUSION_ORDER)
+
+
+@dataclass
+class SelectionRow:
+    obs: Observation
+    decision: str  # SELECT_BOTH / SELECT_RECORDED_MARKET / EXCLUDE
+    reason: str | None
+    interval_days: int
+    key: tuple[str, str] | None
+
+    @property
+    def selected(self) -> bool:
+        return self.decision != "EXCLUDE"
+
+    @property
+    def planned_rows(self) -> int:
+        # SELECT_BOTH: 観測×2区画 + CLASSIFY×2区画。SELECT_RECORDED_MARKET: 観測 + CLASSIFY + CONFIRM（1区画）
+        return {"SELECT_BOTH": 4, "SELECT_RECORDED_MARKET": 3}.get(self.decision, 0)
+
+
+def select_for_migration(observations: list[Observation], interval_days, as_of: datetime) -> list[SelectionRow]:
+    """interval_days(source_type|None, market|None) -> 日数。as_of=DB時刻。"""
+    out: list[SelectionRow] = []
+    for o in observations:
+        known_market = o.market_grade == "FACT" and o.market_hint in ("US", "JP")
+        days = interval_days(o.type_hint, o.market_hint if known_market else None)
+        key = o.proposed_key() if o.type_grade == "FACT" else None
+        reason = None
+        if o.run_status in ("RUNNING", "CAPTCHA_WAIT"):
+            reason = "LEGACY_RUNNING"
+        elif o.success_grade != "ESTIMATE":
+            reason = "NO_SUCCESS_BASIS"
+        elif not (as_of < o.evidence_at + timedelta(days=days)):
+            reason = "OUTSIDE_INTERVAL"
+        elif o.type_hint and o.type_grade != "FACT":
+            reason = "TYPE_HEURISTIC_ONLY"
+        elif not o.type_hint:
+            reason = "TYPE_UNCLASSIFIED"
+        elif key is None:
+            reason = "KEY_UNUSABLE"
+        decision = "EXCLUDE" if reason else ("SELECT_RECORDED_MARKET" if known_market else "SELECT_BOTH")
+        out.append(SelectionRow(o, decision, reason, days, key))
+    return out
+
+
+def summarize_selection(rows: list[SelectionRow]) -> dict:
+    """証拠数・出典数・予定行数を区別して集計する。"""
+    from collections import Counter
+
+    sel = [r for r in rows if r.selected]
+    both = [r for r in sel if r.decision == "SELECT_BOTH"]
+    rec = [r for r in sel if r.decision == "SELECT_RECORDED_MARKET"]
+    src = lambda rs: {(r.obs.type_hint, r.key) for r in rs}
+    held_both = src(both)
+    return {
+        "observations_total": len(rows),
+        "selected_observations": len(sel),
+        "selected_by_kind": dict(Counter(r.obs.kind for r in sel)),
+        "selected_by_decision": dict(Counter(r.decision for r in sel)),
+        "sources_total": len(src(sel)),
+        "sources_held_in_both_markets": len(held_both),
+        "sources_confirmed_by_market": {m: len(src([r for r in rec if r.obs.market_hint == m])) for m in ("US", "JP")},
+        "sources_with_both_kinds": len(held_both & src(rec)),
+        "planned_rows": sum(r.planned_rows for r in sel),
+        "planned_rows_breakdown": {
+            "観測(両区画に複製)": 2 * len(both), "観測(記録の市場の1区画)": len(rec),
+            "CLASSIFY判断": 2 * len(both) + len(rec), "CONFIRM判断(記録の市場)": len(rec),
+        },
+        "excluded_by_reason": {code: sum(1 for r in rows if r.reason == code) for code, _ in EXCLUSION_ORDER},
+        "excluded_total": len(rows) - len(sel),
+        "excluded_by_reason_and_kind": {
+            code: dict(Counter(r.obs.kind for r in rows if r.reason == code)) for code, _ in EXCLUSION_ORDER
+        },
+    }
+
+
+SELECTION_EXTRA_COLUMNS = ["selection", "exclusion_reason", "interval_days", "source_type", "source_key", "source_qualifier",
+                           "planned_db_rows"]
+
+
+OBSERVE_ONLY_REASONS = ("TYPE_HEURISTIC_ONLY", "TYPE_UNCLASSIFIED")
+
+
+def write_selection_csv(rows: list[SelectionRow], path: Path, as_of: datetime, *, observe_only: bool = False) -> Path:
+    """選択結果。元のdry-run CSVと同じ列に、選択の結果を足した別ファイル。apply列は選択した行だけY。
+    observe_only=True: 種別が確認できない履歴（推定のみ/未分類。取得成功の根拠と取得間隔内は満たす）だけにYを付ける。
+    legacy-apply を --classify none で使い、観測として残すだけ（種別・出典は作らず、保留にもしない）。"""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="", encoding="utf-8-sig") as fh:
+        w = csv.writer(fh)
+        w.writerow(DRY_RUN_COLUMNS + SELECTION_EXTRA_COLUMNS)
+        for r in rows:
+            o = r.obs
+            at = o.evidence_at.astimezone(timezone.utc)
+            w.writerow([
+                "Y" if ((r.reason in OBSERVE_ONLY_REASONS) if observe_only else r.selected) else "", o.group, o.kind, o.ref, o.data_marketplace, o.raw_value, at.strftime("%Y-%m-%d %H:%M:%S"),
+                o.evidence_at_basis, "" if o.asin_count is None else o.asin_count,
+                f"{o.success_grade}({GRADE_LABEL[o.success_grade]})", f"{o.market_grade}({GRADE_LABEL[o.market_grade]})",
+                f"{o.type_grade}({GRADE_LABEL[o.type_grade]})", o.type_hint or "", o.proposed_primary or "",
+                o.proposed_qualifier, o.type_hint_basis or "", o.market_hint or "", o.market_hint_basis or "",
+                "Y" if as_of - at <= timedelta(days=30) else "", proposed_action(o), o.note,
+                r.decision if r.selected else "EXCLUDE", REASON_LABEL.get(r.reason, "") if r.reason else "", r.interval_days,
+                r.key and o.type_hint or "", r.key[0] if r.key else "", r.key[1] if r.key else "", r.planned_rows,
+            ])
+    return path
+
+
+# ---- 誤分類候補（セラーID形式の推定のみ）の一覧
+
+HEURISTIC_COLUMNS = [
+    "group", "market_or_direction", "raw_value", "ref", "evidence_at_utc", "asin_count", "recorded_source", "length",
+    "asin_like_length_10", "in_known_seller_master_same_market", "also_recorded_as_seller_page_or_competitor",
+    "recorded_as_keyword_or_brand_elsewhere", "run_count_for_value", "risk_label", "note",
+]
+
+
+def enrich_heuristics(app_factory: SessionFactory, observations: list[Observation]) -> None:
+    """ID形式の推定分類(type_grade=ESTIMATEのSELLER)に、誤分類の裏付け/矛盾を示す事実を付ける（読み取り専用）。
+    裏付けがあっても確認済み種別にはしない: 一覧で人が判断するための材料。"""
+    for market in ("US", "JP"):
+        with app_factory.get_session(market) as conn, conn.begin():
+            _set_read_only(conn)
+            ksm = {r[0].strip().upper() for r in conn.execute(text("SELECT seller_id FROM known_seller_master"))}
+            tel: dict[str, list[str | None]] = {}
+            for sid, src in conn.execute(text("SELECT seller_id, source FROM tool_execution_link")):
+                tel.setdefault(sid.strip().upper(), []).append((src or "").strip().upper() or None)
+        for o in observations:
+            if o.kind != "TOOL_RUN" or o.data_marketplace != market or o.type_hint != "SELLER" or o.type_grade == "FACT":
+                continue
+            v = o.raw_value.strip().upper()
+            srcs = tel.get(v, [])
+            o.flags = {
+                "length": len(v), "asin_like": len(v) == 10,
+                "in_ksm": v in ksm,
+                "seller_page": any(s in ("SELLER_PAGE", "COMPETITOR") for s in srcs),
+                "keyword_brand": any(s in ("KEYWORD", "KEYWROD", "BRAND", "BRAND_STORE") for s in srcs),
+                "runs": len(srcs),
+            }
+
+
+def heuristic_risk_label(o: Observation) -> str:
+    f = o.flags
+    if f.get("keyword_brand"):
+        return "矛盾あり（別の実行ではキーワード/ブランドとして記録）"
+    if f.get("asin_like"):
+        return "要確認（ASINと同じ10桁）"
+    if f.get("in_ksm") or f.get("seller_page"):
+        return "裏付けあり（セラー台帳に登録済み/セラー系の記録あり。ただし確認済み種別ではない）"
+    return "裏付けなし（ID形式の一致のみ）"
+
+
+def write_heuristic_csv(rows: list[SelectionRow], path: Path) -> tuple[Path, dict]:
+    """推定のみ(TYPE_HEURISTIC_ONLY)で除外した観測を、誤分類の確認材料つきで出力する。選択はしない。"""
+    from collections import Counter
+
+    cands = [r.obs for r in rows if r.reason == "TYPE_HEURISTIC_ONLY"]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fmt = lambda ts: ts.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    with path.open("w", newline="", encoding="utf-8-sig") as fh:
+        w = csv.writer(fh)
+        w.writerow(HEURISTIC_COLUMNS)
+        for o in sorted(cands, key=lambda x: (heuristic_risk_label(x), x.raw_value, x.ref)):
+            f = o.flags
+            w.writerow([o.group, o.data_marketplace, o.raw_value, o.ref, fmt(o.evidence_at), o.asin_count, o.recorded_source or "(記録なし)",
+                        f.get("length", ""), "Y" if f.get("asin_like") else "", "Y" if f.get("in_ksm") else "",
+                        "Y" if f.get("seller_page") else "", "Y" if f.get("keyword_brand") else "", f.get("runs", ""),
+                        heuristic_risk_label(o), o.type_hint_basis or ""])
+    labels = Counter(heuristic_risk_label(o) for o in cands)
+    distinct = {}
+    for lab in labels:
+        distinct[lab] = len({o.raw_value.strip().upper() for o in cands if heuristic_risk_label(o) == lab})
+    return path, {"observations": len(cands), "distinct_values": len({o.raw_value.strip().upper() for o in cands}),
+                  "by_label": dict(labels), "distinct_by_label": distinct}
+
+
+# ---- セラー台帳(Excel)の「seller id」列による種別の確認
+#
+# ID形式(正規表現)の一致だけではSELLERを確認済みにしない。ただし、セラー台帳の「seller id」列に
+# （Brand印の行ではなく）そのIDが登録されていて、かつ別の実行でキーワード/ブランドとして使われた記録がなく、
+# ASINと同じ10桁でもなければ、「そのIDがセラーとして扱われた」明示的な根拠とみなして種別を確認済み(FACT)にする。
+# 取得先市場と取得成功の扱いは変えない（市場不明は両市場REVIEW_LEGACYのまま）。
+
+LEDGER_BASIS = "セラー台帳のseller id列に登録(Brand行でない・矛盾記録なし)"  # 列長60以内
+
+
+def load_ledger_seller_ids(path: Path, sheet: str) -> set[str]:
+    """台帳ワークブックの「seller id」列（4列目）から、Brand印でない行のIDを集める（読み取り専用）。"""
+    import openpyxl
+
+    wb = openpyxl.load_workbook(path, data_only=True, read_only=True)
+    try:
+        ids: set[str] = set()
+        for i, row in enumerate(wb[sheet].iter_rows(values_only=True)):
+            if i == 0:
+                continue
+            name = str(row[2]).strip() if len(row) > 2 and row[2] is not None else ""
+            sid = str(row[3]).strip() if len(row) > 3 and row[3] is not None else ""
+            if sid and sid != "Brand" and name != "Brand":
+                ids.add(sid.upper())
+        return ids
+    finally:
+        wb.close()
+
+
+def apply_ledger_corroboration(observations: list[Observation], ledger_ids: dict[str, set[str]]) -> int:
+    """ID形式の推定SELLER(TOOL_RUN)のうち、台帳の根拠があり矛盾がないものを確認済み種別にする。昇格した件数を返す。
+    enrich_heuristics の後に呼ぶ（flags が必要）。"""
+    n = 0
+    for o in observations:
+        if o.kind != "TOOL_RUN" or o.type_hint != "SELLER" or o.type_grade == "FACT":
+            continue
+        f = o.flags
+        if not f or f.get("keyword_brand") or f.get("asin_like"):
+            continue
+        if o.raw_value.strip().upper() in ledger_ids.get(o.data_marketplace, set()):
+            o.type_grade = "FACT"
+            o.type_hint_basis = LEDGER_BASIS
+            n += 1
+    return n
