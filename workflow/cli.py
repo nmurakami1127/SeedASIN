@@ -21,7 +21,7 @@ from pathlib import Path
 from workflow.backup import BackupError, create_backup, restore_backup
 from workflow.config import ConfigError, config_from_dict, load_config
 from workflow.engine import KIND_LABEL, Engine
-from workflow.store import DONE_STATES, State, StateCorrupt, WorkflowBusy, WorkflowStore
+from workflow.store import DONE_STATES, State, StateCorrupt, WorkflowBusy, WorkflowStore, usage
 
 EXAMPLE = Path("config") / "workflow.example.json"
 JA = {"PENDING": "未着手", "DONE": "完了", "SKIPPED": "省略", "WAITING": "待機（人の操作）", "HELD": "保留", "FAILED": "失敗（resumeで再試行）",
@@ -39,6 +39,34 @@ def overall(st: State) -> str:
     return "IN_PROGRESS"
 
 
+def mode_summary(t) -> str:
+    """工程ごとの 再利用／新規実行／スキップ／待機 の内訳。"""
+    c: dict[str, int] = {}
+
+    def add(k):
+        c[k] = c.get(k, 0) + 1
+
+    if t.kind == "discover":
+        for i in t.result.get("items", []):
+            add({"REUSED": "再利用(保存済みの調査結果)", "FOUND": "新規取得(商品ページ)", "NOT_FOUND": "新規取得(該当なし)"}.get(i["kind"], i["kind"]))
+    elif t.kind == "cross":
+        for v in t.result.get("via", {}).values():
+            for k in v.get("kinds", []):
+                add({"REUSED": "再利用(保存済みの調査結果)", "FOUND": "新規取得(商品ページ)", "NOT_FOUND": "新規取得(該当なし)"}.get(k, k))
+            if v.get("note"):
+                add("スキップ(上限)")
+    elif t.kind in ("acquire", "acquire_x"):
+        for r in t.result.get("sources", {}).values():
+            add({"REUSED": "再利用(保存済みの取得結果)", "FETCHED": "新規取得", "HELD": "保留", "CAPTCHA": "待機(CAPTCHA)",
+                 "FAILED": "失敗", "SKIPPED_AT_CLAIM": "スキップ"}.get(r["mode"], r["mode"]))
+    elif t.kind == "submit":
+        add("引き継ぎ(既存の対応記録)" if t.result.get("adopted") else "新規投入" if t.result.get("send_started") else "未送信")
+    elif t.kind == "expand":
+        for _ in t.result.get("keys", []):
+            add("投入計画")
+    return "〔" + "・".join(f"{k}{v}" for k, v in c.items()) + "〕" if c else ""
+
+
 def status_lines(st: State) -> list[str]:
     lines = [f"workflow {st.workflow_id}  作成 {st.created_at}  設定sha256={st.config_sha256[:12]}…  全体: {overall(st)}"]
     by: dict[str, dict[str, int]] = {}
@@ -51,14 +79,15 @@ def status_lines(st: State) -> list[str]:
     actions = []
     for t in st.tasks.values():
         mark = JA.get(t.status, t.status)
-        if t.kind == "submit" and t.status == "DONE":
-            continue
-        lines.append(f"    - {t.id} [{t.lane}] {mark}" + (f": {t.detail}" if t.detail else ""))
+        lines.append(f"    - {t.id} [{t.lane}] {mark}{mode_summary(t)}" + (f": {t.detail}" if t.detail else ""))
         if t.status in ("WAITING", "HELD", "UNKNOWN", "FAILED"):
             actions.append(f"{t.id}（{t.lane}）: {t.detail}")
     held = [(t.lane, h) for t in st.tasks.values() if t.kind == "discover" for h in t.result.get("held", [])]
     for lane, h in held:
         lines.append(f"    ! [{lane}] Amazon小売かの判定待ち: {h['key']}（{(h.get('detail') or '')[:80]}）— 人が判断。登録していません")
+    u = usage(st)
+    lines.append(f"  この実行で新しく使った量: Amazon新規取得 {u['pages']}ページ(出典{u['source_pages']}+商品ページ{u['product_pages']}) / 新規出典 {u['new_sources']}件 / "
+                 f"新規投入 {u['new_submissions']}件（引き継ぎ {u['adopted_submissions']}件）")
     done_sub = [t for t in st.tasks.values() if t.kind == "submit" and t.status == "DONE"]
     if done_sub:
         lines.append("  対応記録済みの投入:")

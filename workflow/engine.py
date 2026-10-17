@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import hashlib
 import time
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from typing import Callable
 
@@ -36,7 +36,7 @@ from tool_submission.planner import build_items, write_plan
 from tool_submission.runner import pending_others, submit_item
 from workflow.config import OPPOSITE, WorkflowConfig
 from workflow.ports import PortBlocked, Ports
-from workflow.store import DONE_STATES, State, Task, WorkflowStore, now_iso
+from workflow.store import DONE_STATES, State, Task, WorkflowStore, now_iso, usage
 
 SUCCESS = tuple(USABLE_FETCH_OUTCOMES)
 SUBMITTED_STATES = ("SUBMITTING", "UNKNOWN", "AMBIGUOUS", "RUN_IDENTIFIED", "MEMO_SAVED", "LINKED")
@@ -67,6 +67,16 @@ def find_duplicates(ledger: SubmissionLedger, item) -> list[dict]:
             out.append({"key": k, "collector_run_id": m.get("collector_run_id"), "state": st.state, "tool_run_id": st.tool_run_id,
                         "source_key": m.get("source_key")})
     return out
+
+
+class _NoFetch:
+    """取得不要と判断した時の代わり。呼ばれたら実装の誤り（外部へ出ない）。"""
+
+    def fetch(self, url: str):
+        raise AssertionError(f"取得不要と判断したのにページ取得が呼ばれました: {url}")
+
+    def wait_for_captcha_solved(self) -> None:
+        raise AssertionError("取得不要のはずです")
 
 
 class Engine:
@@ -117,19 +127,23 @@ class Engine:
     # ------------------------------------------------------------------ 使用量（実行全体の上限）
 
     def _pages_used(self) -> int:
-        return sum(int(r.get("pages", 0)) for t in self.st.tasks.values() if t.kind in ("acquire", "acquire_x")
-                   for r in t.result.get("sources", {}).values() if r.get("mode") == "FETCHED")
+        """この実行で新しく取得したAmazonのページ数（出典の取得ページ + 商品ページの調査）。再利用は数えない。resumeでリセットされない。"""
+        return usage(self.st)["pages"]
+
+    @contextmanager
+    def _fetcher(self, market: str, needed: bool):
+        """ページを実際に取得する必要がある時だけブラウザを開く（配送先の確認も、その前に行う）。保存済みの結果だけで足りる実行は外部操作ゼロ。"""
+        if not needed:
+            yield _NoFetch()
+            return
+        with self.ports.fetcher(market) as f:
+            yield f
 
     def _new_sources_used(self) -> int:
-        ids = set()
-        for t in self.st.tasks.values():
-            if t.kind in ("discover", "cross"):
-                ids |= {(s["market"], s["source_id"]) for s in t.result.get("new_sources", [])}
-        return len(ids)
+        return usage(self.st)["new_sources"]
 
     def _submit_asins_used(self) -> int:
-        return sum(int(t.result.get("asin_count", 0)) for t in self.st.tasks.values()
-                   if t.kind == "submit" and (t.status == "DONE" or t.result.get("send_started")))
+        return usage(self.st)["submit_asins"]
 
     # ------------------------------------------------------------------ 実行ループ
 
@@ -225,11 +239,16 @@ class Engine:
         remaining = self.cfg.totals.max_new_sources - self._new_sources_used()
         if remaining <= 0:
             return self._set(t, "HELD", f"新規出典の上限（{self.cfg.totals.max_new_sources}件）に達しています")
+        pages_left = self.cfg.totals.max_total_pages - self._pages_used()
+        if pages_left <= 0:
+            return self._set(t, "HELD", f"Amazonの新規取得ページの上限（{self.cfg.totals.max_total_pages}）に達しています")
         lim = self.cfg.limits
-        n = min(lim.origin_asins, remaining)
+        n = min(lim.origin_asins, remaining, pages_left)
         limits = DiscoveryLimits(n, min(lim.sources_per_origin, max(1, remaining // n)), lim.cross_asins, lim.cross_sources_per_asin)
-        with self.ports.fetcher(pm) as fetcher:
+        sel = self.svc.select_origins(ln.origin_import, pm, limits)
+        with self._fetcher(pm, any(pk.mode == "FETCH" for pk in sel.selected)) as fetcher:
             items = run_origin_discovery(self.svc, fetcher, ln.origin_import, pm, ln.routes, limits, sleep=self.sleep)
+        t.result["product_pages"] = t.result.get("product_pages", 0) + sum(1 for i in items if i.kind not in ("REUSED", "BLOCKED"))
         self._finish_discovery(t, items, pm)
 
     def _finish_discovery(self, t: Task, items, market: str) -> None:
@@ -292,7 +311,7 @@ class Engine:
         lim = self.cfg.limits
         fetch_ids = [s["source_id"] for s in todo if s["source_id"] in eligible]
         if fetch_ids:
-            with self.ports.fetcher(market) as fetcher:
+            with self._fetcher(market, True) as fetcher:
                 for sid in fetch_ids:
                     remaining = self.cfg.totals.max_total_pages - self._pages_used()
                     if remaining <= 0:
@@ -385,18 +404,22 @@ class Engine:
             require_own_accounts(self.factory, opp)
         except DiscoveryError as exc:
             return self._set(t, "HELD", str(exc))
-        with self.ports.fetcher(opp) as fetcher:
+        if True:
             for sid, rec in usable:
                 if str(sid) in done and done[str(sid)].get("ok"):
                     continue
                 remaining_new = self.cfg.totals.max_new_sources - self._new_sources_used()
-                if quota <= 0 or remaining_new <= 0:
+                pages_left = self.cfg.totals.max_total_pages - self._pages_used()
+                if quota <= 0 or remaining_new <= 0 or pages_left <= 0:
                     done.setdefault(str(sid), {"ok": True, "investigated": 0, "note": "展開の上限に達しています"})
                     continue
-                limits = DiscoveryLimits(1, 1, quota, min(self.cfg.limits.cross_sources_per_asin, remaining_new))
+                limits = DiscoveryLimits(1, 1, min(quota, pages_left), min(self.cfg.limits.cross_sources_per_asin, remaining_new))
                 try:
-                    items = run_cross_discovery(self.svc, fetcher, pm, sid, opp, ln.routes, limits, [ln.origin_import],
-                                                max_run_age_days=self.cfg.result_max_age_days, run_id=rec["run_id"], sleep=self.sleep)
+                    sel = self.svc.select_cross_asins(pm, sid, opp, limits, [ln.origin_import],
+                                                      max_run_age_days=self.cfg.result_max_age_days, run_id=rec["run_id"])
+                    with self._fetcher(opp, any(pk.mode == "FETCH" for pk in sel.picks)) as fetcher:
+                        items = run_cross_discovery(self.svc, fetcher, pm, sid, opp, ln.routes, limits, [ln.origin_import],
+                                                    max_run_age_days=self.cfg.result_max_age_days, run_id=rec["run_id"], sleep=self.sleep)
                 except DiscoveryError as exc:
                     done[str(sid)] = {"ok": False, "reason": str(exc)[:200]}
                     statuses.append("HELD")
@@ -404,6 +427,7 @@ class Engine:
                 kinds = [i.kind for i in items]
                 inv = sum(1 for k in kinds if k in ("FOUND", "REUSED", "NOT_FOUND"))
                 quota -= inv
+                t.result["product_pages"] = t.result.get("product_pages", 0) + sum(1 for k in kinds if k not in ("REUSED", "BLOCKED"))
                 for i in items:
                     for r in i.registered:
                         r_ = {"source_id": r.source_id, "market": opp, "source_type": r.source_type, "key": r.key}
@@ -492,7 +516,8 @@ class Engine:
         key = t.result["key"]
         st = self.ledger.state(key)
         if st.state == "LINKED":
-            return self._set(t, "DONE", f"対応記録済み（実行ID={st.tool_run_id}）。再送しません")
+            return self._set(t, "DONE", f"既存の対応記録を引き継ぎ（実行ID={st.tool_run_id}）。再送しません", adopted=True,
+                             tool_run_id=st.tool_run_id)
         item = item_from_manifest(st.manifest)
         fresh = st.state in ("PLANNED", "NOT_SUBMITTED")
         if fresh:
@@ -501,6 +526,11 @@ class Engine:
                 d0 = dups[0]
                 return self._set(t, "HELD", f"重複候補: 別のrun{d0['collector_run_id']}（キー{d0['key']}・実行ID={d0['tool_run_id']}・{d0['state']}）で"
                                             f"同じASIN集合を同じ方向に投入済みです。意図した再投入なら `resume --allow-duplicate {key}`", duplicates=dups)
+            cap = self.cfg.totals.max_new_submissions_per_direction
+            same_dir = [x for x in self.st.tasks.values() if x.kind == "submit" and x.id != t.id and x.result.get("send_started")
+                        and x.result.get("direction") == item.direction]
+            if cap is not None and len(same_dir) >= cap:
+                return self._set(t, "HELD", f"この実行で新しく投入できる件数（方向{item.direction}あたり{cap}件）に達しています")
             if self._submit_asins_used() + item.asin_count > self.cfg.totals.max_submit_asins:
                 return self._set(t, "HELD", f"投入件数の上限（{self.cfg.totals.max_submit_asins}）を超えるため投入しません")
             others = pending_others(self.ledger, key)

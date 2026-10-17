@@ -58,6 +58,7 @@ class Routing:
     def __init__(self, product_seller: dict[str, str], seller_asins: dict[str, list[str]]) -> None:
         self.product_seller, self.seller_asins, self.urls = product_seller, seller_asins, []
         self.captcha_products: set[str] = set()
+        self.product_offers: dict[str, tuple] = {}
         self.on_fetch = None
 
     def fetch(self, url: str) -> FetchedPage:
@@ -68,7 +69,7 @@ class Routing:
         if m:
             if m.group(1) in self.captcha_products:
                 return FetchedPage(f"<html>{CAPTCHA}</html>", url, 200)
-            return FetchedPage(product_html(buybox=self.product_seller.get(m.group(1), "A9NOBODY0001")), url, 200)
+            return FetchedPage(product_html(buybox=self.product_seller.get(m.group(1), "A9NOBODY0001"), offers=self.product_offers.get(m.group(1), ())), url, 200)
         m = re.search(r"me=([A-Z0-9]+)", url)
         if m:
             return FetchedPage(results(self.seller_asins.get(m.group(1), [])), url, 200)
@@ -261,7 +262,9 @@ def test_limits_are_applied_and_totals_stop_the_run_with_a_hold(app_role_factory
     assert len(eng.st.tasks["discover:US"].result["new_sources"]) == 1
     # 新規出典の合計上限(1)に達したので、JPの発見は保留（USの独立した工程は進む）
     assert eng.st.tasks["discover:JP"].status == "HELD" and "上限" in eng.st.tasks["discover:JP"].detail
-    assert eng.st.tasks["acquire:US"].status == "DONE"
+    # 取得ページの合計上限(1)は商品ページの調査で使い切るので、出典の取得は保留（再利用できる結果も無い）
+    assert eng.st.tasks["acquire:US"].status == "HELD"
+    assert all("上限" in r["reason"] for r in eng.st.tasks["acquire:US"].result["sources"].values())
     # 投入ASIN合計の上限(2)に対し、3件のrunは投入しない
     assert all(t.status == "HELD" and "上限" in t.detail for t in submit_tasks(eng))
     assert w.tool.submits == 0
@@ -565,3 +568,48 @@ def test_status_text_names_what_to_do_and_how_to_resume(world, capsys):
     eng = world.run()
     text_ = "\n".join(wcli.status_lines(eng.st))
     assert "待機（人の操作）" in text_ and "resume" in text_ and "ログイン" in text_ and "完了条件に含みません" in text_
+
+
+# ---------------------------------------------------------------- 既存結果の引き継ぎ・外部操作ゼロ・新規投入の上限
+
+def test_a_fresh_workflow_adopts_existing_results_with_zero_external_operations(world, tmp_path):
+    first = world.run()
+    n_tool = world.tool.submits
+    world.ports.forbid_all = True  # ブラウザ・統合ツールに一切触れてはいけない
+    cfg2 = config_from_dict({**world.cfg_dict, "state_dir": str(tmp_path / "wf_fresh")})  # 空のworkflow状態（投入台帳は既存のまま）
+    second = world.run(world.engine(cfg2))
+    assert wcli.overall(second.st) == "COMPLETED"
+    from workflow.store import usage
+
+    u = usage(second.st)
+    assert u["pages"] == 0 and u["new_sources"] == 0 and u["new_submissions"] == 0 and u["adopted_submissions"] == 2
+    assert world.tool.submits == n_tool
+    assert all(t.result.get("adopted") for t in submit_tasks(second))
+    assert {t.result["tool_run_id"] for t in submit_tasks(second)} == {t.result["tool_run_id"] for t in submit_tasks(first)}
+    out = "\n".join(wcli.status_lines(second.st))
+    assert "引き継ぎ(既存の対応記録)" in out and "再利用(保存済みの取得結果)" in out and "再利用(保存済みの調査結果)" in out
+
+
+def test_new_submissions_per_direction_are_capped_and_the_cap_survives_resume(world):
+    second_seller = uid("AUS")
+    world.us.product_offers = {world.us_top: (second_seller,)}
+    world.us.seller_asins[second_seller] = [f"B0{uuid.uuid4().hex[:8].upper()}"[:10] for _ in range(2)]
+    eng = world.run()
+    us = [t for t in submit_tasks(eng) if t.lane == "US"]
+    assert len(us) == 2 and sorted(t.status for t in us) == ["DONE", "HELD"], [(t.id, t.status, t.detail) for t in us]
+    held = next(t for t in us if t.status == "HELD")
+    assert "新しく投入できる件数" in held.detail
+    n = world.tool.submits
+    eng2 = world.resume(eng)  # 上限はresumeでリセットされない
+    assert world.tool.submits == n
+    assert next(t for t in submit_tasks(eng2) if t.id == held.id).status == "HELD"
+
+
+def test_product_page_investigations_count_against_the_amazon_page_cap(app_role_factory, tmp_path, own):
+    w = World(app_role_factory, tmp_path, cfg_extra={"totals": {"max_total_pages": 1}, "cross": {"enabled": False}})
+    eng = w.run()
+    from workflow.store import usage
+
+    assert usage(eng.st)["product_pages"] == 1  # 商品ページ1件で上限に達する
+    assert eng.st.tasks["acquire:US"].status == "HELD" or all(r["mode"] != "FETCHED" for r in eng.st.tasks["acquire:US"].result["sources"].values())
+    assert usage(eng.st)["pages"] <= 1

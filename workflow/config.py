@@ -49,6 +49,7 @@ class Totals:
     max_total_pages: int = 24      # 出典の取得ページの合計
     max_new_sources: int = 12      # 新規に登録する出典の合計
     max_submit_asins: int = 5000   # 統合ツールへ投入するASINの合計
+    max_new_submissions_per_direction: int | None = 1  # この実行で新しく投入する件数（方向ごと）。null=無制限。引き継ぎ済みの投入は数えない
 
 
 @dataclass
@@ -104,6 +105,9 @@ class WorkflowConfig:
             v = getattr(self.totals, name)
             if not isinstance(v, int) or v < 1 or v > HARD[name]:
                 raise ConfigError(f"totals.{name} は1〜{HARD[name]}で指定してください（指定: {v}）")
+        mn = self.totals.max_new_submissions_per_direction
+        if mn is not None and (not isinstance(mn, int) or mn < 1 or mn > 100):
+            raise ConfigError("totals.max_new_submissions_per_direction は1〜100またはnull")
         if not isinstance(self.tool_max_asins, int) or not 1 <= self.tool_max_asins <= HARD["tool_max_asins"]:
             raise ConfigError(f"tool_max_asins は1〜{HARD['tool_max_asins']}（統合ツールの1回の入力）")
         if not isinstance(self.result_max_age_days, int) or not 1 <= self.result_max_age_days <= 365:

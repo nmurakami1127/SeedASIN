@@ -40,8 +40,11 @@ class RealPorts:
         from tool_submission.cli import _open_tool_page
         from tool_submission.import_tool_page import Selectors
 
-        with _open_tool_page(Selectors()) as page:  # ログインは人が行う（Enterで続行）。実画面で確認済みの既定セレクタ
-            problems = page.preflight()
-            if problems:
-                raise PortBlocked("統合ツールの画面設定: " + "; ".join(problems))
-            yield page
+        try:
+            with _open_tool_page(Selectors()) as page:  # ログインは人が行う（Enterで続行）。実画面で確認済みの既定セレクタ
+                problems = page.preflight()
+                if problems:
+                    raise PortBlocked("統合ツールの画面設定: " + "; ".join(problems))
+                yield page
+        except EOFError as exc:  # 対話端末が無く、ログイン確認のEnterを待てない
+            raise PortBlocked("統合ツールにログインし、対話端末（Enterを押せる状態）で resume してください") from exc

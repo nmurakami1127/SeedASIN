@@ -96,6 +96,20 @@ class State:
         return st
 
 
+def usage(st: "State") -> dict:
+    """この実行（workflow全体）で新しく使った量。状態から数えるので、resumeでリセットされない。保存済み結果の再利用は数えない。"""
+    src = sum(int(r.get("pages", 0)) for t in st.tasks.values() if t.kind in ("acquire", "acquire_x")
+              for r in t.result.get("sources", {}).values() if r.get("mode") == "FETCHED")
+    prod = sum(int(t.result.get("product_pages", 0)) for t in st.tasks.values() if t.kind in ("discover", "cross"))
+    new_src = {(s["market"], s["source_id"]) for t in st.tasks.values() if t.kind in ("discover", "cross") for s in t.result.get("new_sources", [])}
+    subs = [t for t in st.tasks.values() if t.kind == "submit"]
+    return {"source_pages": src, "product_pages": prod, "pages": src + prod, "new_sources": len(new_src),
+            "new_submissions": sum(1 for t in subs if t.result.get("send_started")),
+            "adopted_submissions": sum(1 for t in subs if t.result.get("adopted")),
+            "submit_asins": sum(int(t.result.get("asin_count", 0)) for t in subs if t.status == "DONE" and not t.result.get("adopted")
+                                or t.result.get("send_started"))}
+
+
 class WorkflowStore:
     def __init__(self, root: str | Path) -> None:
         self.root = Path(root)
