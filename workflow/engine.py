@@ -69,6 +69,7 @@ class Engine:
         self.runs = AcquisitionRunService(factory, actor=actor)
         self.ledger = SubmissionLedger(Path(cfg.submission_dir) / "ledger.jsonl")
         self.usage = DailyUsage(Path(cfg.state_dir) / "daily_usage.jsonl", now=self.now)  # watch全体で共有する日次使用量（JST）
+        self.should_stop: Callable[[], bool] | None = None  # watchの停止要求（工程の間で確認する）
         self.st: State | None = None
         self._stack: ExitStack | None = None
         self._tool_page = None
@@ -185,6 +186,9 @@ class Engine:
                 for t in list(self.st.tasks.values()):
                     if t.status != "PENDING":
                         continue
+                    if self.should_stop is not None and self.should_stop():  # 停止要求: 実行中の工程は終わらせ、残りはPENDINGのまま保存して戻る
+                        self._event("drive", "停止要求により残りの工程をPENDINGのまま保存")
+                        return self.st
                     ok, why = self._ready(t)
                     if not ok:
                         if t.detail != why:

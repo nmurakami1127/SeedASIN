@@ -60,6 +60,7 @@ class Watcher:
         self.store = WorkflowStore(cfg.state_dir)
         self.usage = DailyUsage(Path(cfg.state_dir) / "daily_usage.jsonl", now=self.now)
         self.status_path = Path(cfg.state_dir) / "watch_status.json"
+        self.stop_path = Path(cfg.state_dir) / "stop.request"
         self.started = self.now()
         self.cycles = 0
         self._notified: dict[str, datetime] = {}
@@ -85,8 +86,13 @@ class Watcher:
         self.out(f"[{self.now().astimezone(JST):%m-%d %H:%M:%S} JST] {msg}")
 
     # ------------------------------------------------------------------ 1サイクル
+    def stop_requested(self) -> bool:
+        return self.stop_path.exists()
+
     def _engine(self, cfg: WorkflowConfig) -> Engine:
-        return Engine(self.factory, self.ports, cfg, self.store, sleep=self.sleep, now=self.now)
+        eng = Engine(self.factory, self.ports, cfg, self.store, sleep=self.sleep, now=self.now)
+        eng.should_stop = self.stop_requested
+        return eng
 
     def _cfg_for_state(self, st: State) -> WorkflowConfig:
         """再開は、起動時の市場・起点import（スナップショット）を使い、上限・間隔などは現在の設定を使う（上限の引き上げを反映できる）。"""
@@ -133,6 +139,8 @@ class Watcher:
         blocked_lanes: set[str] = set()
         # 1. 続行可能な未完了処理を再開する
         for wid in self.store.list_ids():
+            if self.stop_requested():
+                break
             try:
                 st = self.store.load(wid)
             except Exception:  # noqa: BLE001
@@ -160,6 +168,8 @@ class Watcher:
                     res.lanes.setdefault(t.lane, f"{t.id} {t.status}（再試行 {t.retry_after or '-'}）: {t.detail[:80]}")
         # 2. 次の実行可能な候補（市場ごとに別のworkflow）
         for lane in self.cfg.lanes:
+            if self.stop_requested():
+                break
             if lane in blocked_lanes:
                 res.lanes[lane] = res.lanes.get(lane) or "未完了の工程があるため新しい候補には進みません（人手対応/再試行待ち）"
                 continue
@@ -199,8 +209,11 @@ class Watcher:
     # ------------------------------------------------------------------ 常駐
     def run(self, max_cycles: int | None = None) -> int:
         with self.store.engine_lock("watch"):
-            self._say(f"watchを開始します（再確認の間隔 {self.cfg.watch.interval_minutes}分。Ctrl+Cで終了。PCが停止中は動きません）")
+            if self.stop_path.exists():
+                self.stop_path.unlink()  # 前回の停止要求の残り
+            self._say(f"watchを開始します（再確認の間隔 {self.cfg.watch.interval_minutes}分。Ctrl+C または `workflow.cli stop` で終了。PCが停止中は動きません）")
             self._write_status("running", "起動時の状態確認")
+            reason_stop = "停止しました"
             try:
                 while True:
                     res = self.cycle()
@@ -209,16 +222,27 @@ class Watcher:
                     self._write_status(res.state, reason, res)
                     if not res.worked:
                         self._say(f"待機: {reason}（次回確認 {res.next_check.astimezone(JST):%H:%M} JST。Amazon・統合ツールは開いていません）")
+                    if self.stop_requested():
+                        reason_stop = "停止要求（stop）を受けて、安全な区切りで停止しました"
+                        break
                     if max_cycles is not None and self.cycles >= max_cycles:
-                        return 0
+                        reason_stop = f"指定した確認回数（{max_cycles}回）を終えたので停止しました"
+                        break
                     self._wait(res.next_check)
+                    if self.stop_requested():
+                        reason_stop = "停止要求（stop）を受けて停止しました"
+                        break
             except KeyboardInterrupt:
-                self._write_status("stopped", "Ctrl+Cで停止しました。状態は保存済みです。次回watchで続きから再開します")
-                self._say("停止しました（状態は保存済み。次回watchで続きから再開します）")
-                return 0
+                reason_stop = "Ctrl+Cで停止しました"
+            finally:
+                if self.stop_path.exists():
+                    self.stop_path.unlink()
+            self._write_status("stopped", reason_stop + "。状態は保存済みです。次回watchで続きから再開します")
+            self._say(reason_stop + "（状態は保存済み。次回watchで続きから再開します）")
+            return 0
 
     def _wait(self, until: datetime) -> None:
-        while self.now() < until:
+        while self.now() < until and not self.stop_requested():
             self.sleep(min(1.0, max(0.0, (until - self.now()).total_seconds())))
 
 

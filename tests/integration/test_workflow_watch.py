@@ -437,3 +437,39 @@ def test_backup_while_watch_is_running_is_refused_and_after_stop_succeeds(app_ro
 
     names = set(verify_backup(tmp_path / "bk" / "stopped.zip")["files"])
     assert any(n.endswith("daily_usage.jsonl") for n in names) and any(n.endswith("ledger.jsonl") for n in names)  # 日次使用量も含む
+
+
+def test_stop_request_ends_watch_at_a_safe_boundary_and_the_work_continues_next_time(app_role_factory, tmp_path, own, ranked_rows):
+    env = Env(app_role_factory, tmp_path, ranked_rows["rows"][:2])
+    w = make_watcher(env, env.clock, [])
+    orig = env.routing.fetch
+
+    def fetch_then_stop(url):
+        out = orig(url)
+        w.stop_path.parent.mkdir(parents=True, exist_ok=True)
+        w.stop_path.write_text("stop", encoding="utf-8")  # 工程の途中で停止を依頼する
+        return out
+
+    env.routing.fetch = fetch_then_stop
+    assert w.run() == 0
+    st = read_status(env.cfg.state_dir)
+    assert st["state"] == "stopped" and "停止要求" in st["reason"] and not w.stop_path.exists()
+    store = WorkflowStore(env.cfg.state_dir)
+    (wid,) = store.list_ids()
+    sts = {t.id: t.status for t in store.load(wid).tasks.values()}
+    assert sts["discover:US"] == "DONE" and sts["acquire:US"] == "PENDING"  # 実行中の工程は終え、残りはPENDINGのまま保存
+    done_before = [u for u in env.routing.urls]
+    env.routing.fetch = orig
+    make_watcher(env, env.clock, []).run(max_cycles=1)  # 次回のwatchは続きから（完了済みの商品ページへは再アクセスしない）
+    after = env.product_asins_fetched()
+    assert len(after) == len(set(after)) and store.load(wid).tasks["acquire:US"].status == "DONE"
+    assert len([u for u in env.routing.urls if "/dp/" in u]) >= len([u for u in done_before if "/dp/" in u])
+
+
+def test_stop_command_only_acts_when_a_run_is_active(app_role_factory, tmp_path, own, capsys):
+    sd = tmp_path / "wf"
+    assert wcli.main(["stop", "--state-dir", str(sd)]) == 0
+    assert "稼働中" in capsys.readouterr().out and not (sd / "stop.request").exists()
+    with WorkflowStore(sd).engine_lock("watch"):
+        assert wcli.main(["stop", "--state-dir", str(sd)]) == 0
+        assert (sd / "stop.request").exists()

@@ -217,6 +217,19 @@ def _cmd_watch(a, factory=None, ports=None) -> int:
     return Watcher(cfg, factory or _factory(), ports or RealPorts()).run(max_cycles=a.max_cycles)
 
 
+def _cmd_stop(a, **_) -> int:
+    """稼働中のwatchに、安全な区切り（実行中の工程が終わった後）で停止するよう依頼する（Ctrl+Cが使えない時用）。"""
+    store = WorkflowStore(a.state_dir)
+    info = store.engine_lock_info()
+    if not info:
+        print("稼働中の watch / run / resume はありません（停止要求は作りません）")
+        return 0
+    Path(a.state_dir).mkdir(parents=True, exist_ok=True)
+    (Path(a.state_dir) / "stop.request").write_text("stop", encoding="utf-8")
+    print(f"停止を依頼しました（pid={info.get('pid')}・{info.get('who')}）。実行中の工程が終わり次第、状態を保存して止まります")
+    return 0
+
+
 def _cmd_yield(a, factory=None, **_) -> int:
     from workflow.yield_report import build_yield, format_yield
 
@@ -279,6 +292,8 @@ def build_parser() -> argparse.ArgumentParser:
     sp = add("watch", _cmd_watch, "常駐: 状態確認→未完了の再開→次の候補の処理→待機→再確認（Ctrl+Cで停止。PC停止中は動かない）")
     sp.add_argument("--config", default="config/workflow.json")
     sp.add_argument("--max-cycles", type=int, default=None, help="（検証用）この回数の確認で終了する")
+    sp = add("stop", _cmd_stop, "稼働中のwatchに安全な区切りでの停止を依頼する")
+    sp.add_argument("--state-dir", default="exports/workflow")
     sp = add("yield", _cmd_yield, "取得・投入の成果（新規ASIN・投入数・既存の出品成果）を表示（読み取りのみ）")
     sp.add_argument("--config", default="config/workflow.json")
     sp.add_argument("--submission-dir", default="exports/tool_submission")
