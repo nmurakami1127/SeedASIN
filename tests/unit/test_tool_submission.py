@@ -487,15 +487,20 @@ class PwPage:
         return El(self, sel)
 
 
-def test_adapter_refuses_to_run_until_the_unverified_input_selectors_are_configured():
+def test_adapter_defaults_use_the_verified_dom_and_refuse_when_selectors_are_removed():
     a = ImportToolPage(PwPage())
-    problems = a.preflight()
+    assert a.preflight() == []  # 実画面で確認したセレクタ（section 3のtextarea#asin_listとbutton#add_asin_list）
+    s = Selectors()
+    assert (s.asin_textarea, s.asin_save_button) == ("textarea#asin_list", "button#add_asin_list")
+    assert s.option_toggles["バリエーション"] == "input#asin_variation" and len(s.option_toggles) == 13
+    for other in ("add_keyword", "add_keyword_repeat", "add_store_url"):
+        assert other not in s.asin_save_button  # 他のセクションのSAVEは使わない
+    broken = ImportToolPage(PwPage(), Selectors(asin_textarea=None, option_toggles={}))
+    problems = broken.preflight()
     assert any("asin_textarea" in p for p in problems) and any("バリエーション" in p for p in problems)
     with pytest.raises(SubmitFailed) as e:
-        a.submit(item(), Path("x.csv"))
-    assert e.value.phase == "BEFORE_CLICK"  # 推測のセレクタで操作しない
-    ok = Selectors(input_url="https://example.invalid/in", asin_textarea="#t", asin_save_button="#s", option_toggles={"バリエーション": "#v"})
-    assert ImportToolPage(PwPage(), ok).preflight() == []
+        broken.submit(item(), Path("x.csv"))
+    assert e.value.phase == "BEFORE_CLICK"
 
 
 def test_adapter_log_reading_set_memo_and_unreadable_detection():
@@ -629,3 +634,112 @@ def test_log_snapshot_json_and_single_row_html_limit_the_ingest_to_the_target_ro
         single_row_html(LOG_HTML, 7300005, "輸入_X")  # メモ保存の確認前は取り込まない
     with pytest.raises(ValueError, match="0件"):
         single_row_html(LOG_HTML, 1, MEMO)
+
+
+# ---------------------------------------------------------------- 実行IDの対応根拠（evidence）と設定値の照合
+
+ROW_OPTS = "{cn_safe:on,variation:,sellers:on,brand:on,price:on,size:on,category:,ranking:on,low_country:on,part_number:on,model_number:on,f_sellers:on,f_price:on,f_ranking:on}"
+REQ_OPTS = {"cn_safe": "on", "variation": "", "sellers": "on", "brand": "on", "price": "on", "size": "on", "category": "", "ranking": "on",
+            "low_country": "on", "part_number": "on", "model_number": "on", "f_sellers": "on", "f_price": "on", "f_ranking": "on"}
+
+
+def test_row_options_are_compared_with_the_request_options():
+    from tool_submission.reconcile import corroborate, options_match, parse_row_options
+
+    assert parse_row_options(ROW_OPTS)["variation"] == "" and parse_row_options(ROW_OPTS)["cn_safe"] == "on"
+    assert options_match(ROW_OPTS, REQ_OPTS) is True
+    assert options_match(ROW_OPTS, {**REQ_OPTS, "variation": "on"}) is False  # バリエーションが違えば別の送信
+    assert options_match("", REQ_OPTS) is False
+    row = LogEntry(1, "asin_list", "jp", "", "待機中", None, ROW_OPTS)
+    ev = {"ok": True, "request_options": REQ_OPTS}
+    assert corroborate(row, ev) == []
+    assert corroborate(row, None) and corroborate(row, {"ok": False})  # 根拠なしでは自分の送信と断定しない
+    assert corroborate(LogEntry(1, "asin_list", "jp", "", "待機中", None, ""), ev)  # 行の設定値を確認できない
+    assert corroborate(row, {"ok": True, "request_options": {**REQ_OPTS, "price": ""}})
+
+
+def _cli_setup(tmp_path, n=3):
+    import hashlib
+    from dataclasses import asdict
+
+    asins = [f"B0TEST{i:04d}" for i in range(n)]
+    f = tmp_path / "in.csv"
+    f.write_bytes(asin_file_bytes(asins))
+    it = item(key="kc", n=n)
+    it.input_file, it.input_sha256 = str(f), hashlib.sha256(f.read_bytes()).hexdigest()
+    led = tmp_path / "l.jsonl"
+    lg = SubmissionLedger(led)
+    lg.append("kc", "PLANNED", manifest=asdict(it))
+    return lg, it, asins, str(led)
+
+
+def _write_json(path, obj):
+    import json
+
+    path.write_text(json.dumps(obj, ensure_ascii=False), encoding="utf-8")
+    return str(path)
+
+
+def test_cli_evidence_validates_the_request_against_the_plan_and_reconcile_needs_it(tmp_path):
+    import json
+
+    from tool_submission.cli import main
+
+    lg, it, asins, led = _cli_setup(tmp_path)
+    base = ["--ledger", led]
+    before = _write_json(tmp_path / "b.json", [{"seq": 100, "data_type": "asin_list", "memo": MEMO, "options": ROW_OPTS}])
+    from tool_submission.runner import claim_submission
+
+    assert claim_submission(lg, it, Path(it.input_file), [100], {"バリエーション": False})[0]
+    after = _write_json(tmp_path / "a.json", [{"seq": 100, "data_type": "asin_list", "memo": MEMO, "options": ROW_OPTS},
+                                                {"seq": 101, "data_type": "asin_list", "country": "jp", "memo": "", "status": "待機中", "options": ROW_OPTS}])
+    # 根拠が無いと、新規行が1件でも特定しない（結果不明として止める）
+    assert main(["reconcile", "--key", "kc", "--log-html", after, *base]) == 3
+    assert lg.state("kc").state == "UNKNOWN" and lg.state("kc").tool_run_id is None
+    # 以降は別の試行（根拠つき）で確認するため、新しい台帳で再現する
+    tmp2 = tmp_path / "t2"
+    tmp2.mkdir()
+    lg2, it2, asins2, led2 = _cli_setup(tmp2)
+    assert claim_submission(lg2, it2, Path(it2.input_file), [100], {"バリエーション": False})[0]
+    body = json.dumps({"url": ",".join(asins2), "now_page": 1, "csv_name": "none", "options": REQ_OPTS, "type": "asin_list", "country": "", "category_id": "", "repeat_cnt": 1})
+    good = {"endpoint": "https://import-tools.jp/asin/out/start_search4.php", "body": body, "status": 200, "response": "end"}
+    base2 = ["--ledger", led2]
+    bad = dict(good, response="no_api")
+    assert main(["evidence", "--key", "kc", "--capture-json", _write_json(tmp2 / "bad.json", bad), *base2]) == 3  # 保存成功の応答ではない
+    assert lg2.state("kc").evidence["ok"] is False
+    wrong = dict(good, body=json.dumps({**json.loads(body), "url": ",".join(asins2[:-1])}))
+    assert main(["evidence", "--key", "kc", "--capture-json", _write_json(tmp2 / "w.json", wrong), *base2]) == 3  # ASINが計画と違う
+    var_on = dict(good, body=json.dumps({**json.loads(body), "options": {**REQ_OPTS, "variation": "on"}}))
+    assert main(["evidence", "--key", "kc", "--capture-json", _write_json(tmp2 / "v.json", var_on), *base2]) == 3
+    assert main(["reconcile", "--key", "kc", "--log-html", after, *base2]) == 3  # 失敗した根拠では特定しない
+    lg3, it3, asins3, led3 = _cli_setup(tmp_path / "t3" if (tmp_path / "t3").mkdir() is None else tmp_path)
+    assert claim_submission(lg3, it3, Path(it3.input_file), [100], {"バリエーション": False})[0]
+    body3 = json.dumps({"url": ",".join(asins3), "options": REQ_OPTS, "type": "asin_list", "country": ""})
+    ok_cap = dict(good, body=body3)
+    assert main(["evidence", "--key", "kc", "--capture-json", _write_json(tmp_path / "t3" / "ok.json", ok_cap), "--ledger", led3]) == 0
+    assert lg3.state("kc").evidence["ok"] and lg3.state("kc").evidence["asin_count"] == 3
+    assert main(["reconcile", "--key", "kc", "--log-html", after, "--ledger", led3]) == 0
+    assert (lg3.state("kc").state, lg3.state("kc").tool_run_id) == ("RUN_IDENTIFIED", "101")
+    # 設定値が違う新規行は、1件でも自分の送信とは断定しない
+    lg4, it4, asins4, led4 = _cli_setup(tmp_path / "t4" if (tmp_path / "t4").mkdir() is None else tmp_path)
+    assert claim_submission(lg4, it4, Path(it4.input_file), [100], {"バリエーション": False})[0]
+    main(["evidence", "--key", "kc", "--capture-json", _write_json(tmp_path / "t4" / "ok.json", dict(good, body=json.dumps({"url": ",".join(asins4), "options": REQ_OPTS, "type": "asin_list", "country": ""}))), "--ledger", led4])
+    other = _write_json(tmp_path / "t4" / "o.json", [{"seq": 100, "data_type": "asin_list", "memo": MEMO, "options": ROW_OPTS},
+                                                      {"seq": 102, "data_type": "asin_list", "memo": "", "options": ROW_OPTS.replace("variation:,", "variation:on,")}])
+    assert main(["reconcile", "--key", "kc", "--log-html", other, "--ledger", led4]) == 3
+    assert lg4.state("kc").state == "UNKNOWN" and lg4.state("kc").tool_run_id is None
+
+
+def test_mark_not_submitted_only_when_the_log_shows_no_new_row(tmp_path):
+    from tool_submission.cli import main
+    from tool_submission.runner import claim_submission
+
+    lg, it, asins, led = _cli_setup(tmp_path)
+    assert claim_submission(lg, it, Path(it.input_file), [100], {"バリエーション": False})[0]
+    with_new = _write_json(tmp_path / "n.json", [{"seq": 100, "data_type": "asin_list"}, {"seq": 105, "data_type": "asin_list"}])
+    assert main(["mark-not-submitted", "--key", "kc", "--log-json", with_new, "--reason", "x", "--ledger", led]) == 3
+    assert lg.state("kc").state == "SUBMITTING"  # 新規行があれば、未送信とは確認できない（戻さない）
+    same = _write_json(tmp_path / "s.json", [{"seq": 100, "data_type": "asin_list"}])
+    assert main(["mark-not-submitted", "--key", "kc", "--log-json", same, "--reason", "SAVE前に中止", "--ledger", led]) == 0
+    assert lg.state("kc").state == "NOT_SUBMITTED"
+    assert main(["mark-not-submitted", "--key", "kc", "--log-json", same, "--reason", "x", "--ledger", led]) == 2  # 戻せるのはSUBMITTINGからだけ

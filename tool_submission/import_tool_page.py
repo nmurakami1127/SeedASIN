@@ -1,11 +1,14 @@
 """統合ツールの画面アダプター（Playwrightの`Page`を受け取る。ブラウザの起動・ログインはここでは行わない）。
 
-**検証状況（セレクタを推測して検証済みとしない）**
-- ログ画面（`logs.php`）: `tr[data-seq]`・`textarea.memo`・`td.log-status`・`td.log-csv`・メモの保存ボタン`button.save_memo`は、保存HTML
-  （tests/unit/test_log_ingest.pyの実例）と既存の自動化（import_tools_automation/automation.pyが`tr[data-seq]`・`textarea.memo`を使用）で
-  確認できる。ただし**実画面ではこのアダプターでは未検証**。
-- 入力画面（「3.ASINリストから情報取得」のテキスト欄・SAVE・設定のトグル・画面のURL）: **DOMが保存資料に無いので未設定**。
-  `Selectors`に利用者が確認した値を入れるまで`preflight()`が実行不可を返し、送信しない。国選択（上部のキーワード検索用）は一切操作しない。
+**検証状況**（2026-10-17、利用者がログイン済みの実画面のDOMを読み取って確認。読み取りのみで、SAVEは押していない）
+- 入力画面（`/asin/main.php`）: 「3.ASINリストから情報取得」のテキスト欄は`textarea#asin_list`、そのセクションのSAVEは`button#add_asin_list`
+  （入力があるまでdisabled。クリック処理は`js/main.js`で、2段階目がOFFで3段階目がONなら`alert`で停止し、ASIN（10桁/13桁）を重複除去して
+  `./out/start_search4.php`へ`country: ""`（**国指定なし**）でPOSTし、応答に`end`を含めば「保存しました。」）。他のSAVE（`#add_keyword`・
+  `#add_keyword_repeat`・`#add_store_url`）と国選択は操作しない。設定値は`input#asin_*`のチェックボックス（`asin_variation`等）。
+- ログ画面（`/asin/logs.php`）: `tr[data-seq]`（`data-type`・`data-country`・`data-options`＝送信時の設定値）、`textarea.memo`、
+  `button.save_memo`（クリックで`./db/save_log.php`へ`{text, file_name=trのid, log_seq=td.log-idの値}`をPOST）。
+- **このアダプター（Playwright）自体の実画面での動作は未検証**（実際の送信は、利用者のログイン済みChromeを読み取って確認したDOMに合わせて
+  別のブラウザ操作で行う）。
 
 操作の原則: SAVEは**1回だけ**押し、タイムアウトしても再クリックしない（クリック後の失敗は`UNKNOWN`として呼び出し側が照合する）。
 設定値（CNフラグ除外・詳細2/3段階目・バリエーション）は**読み取るだけ**で、切り替えない。
@@ -23,6 +26,16 @@ LOG_URL = "https://import-tools.jp/asin/logs.php"
 LOG_HEADER_MARKERS = ("CSV名", "メモ", "DL", "取得日時")  # 既存のautomation.pyが構造変化の検出に使う列名
 
 
+# 画面の設定値（読み取るだけで切り替えない）。表示名 → チェックボックスのセレクタ（実画面で確認済み）
+VERIFIED_OPTION_TOGGLES = {
+    "CNフラグ除外": "input#asin_cn_safe", "ライバル（出品者）数": "input#asin_sellers", "ランキング": "input#asin_ranking",
+    "ブランド名": "input#asin_brand", "最安値": "input#asin_price", "重量、体積重量": "input#asin_size",
+    "最安値セラーの出品者国": "input#asin_low_country", "品番": "input#asin_part_number", "型番": "input#asin_model_number",
+    "バリエーション": "input#asin_variation", "他国のライバル（出品者）数": "input#asin_f_sellers",
+    "他国のランキング": "input#asin_f_ranking", "他国の最安値と差益": "input#asin_f_price",
+}
+
+
 @dataclass
 class Selectors:
     # ---- ログ画面（保存HTML・既存automation.pyで確認済み。実画面は未検証）
@@ -30,11 +43,11 @@ class Selectors:
     row_by_seq: str = 'tr[data-seq="{seq}"]'
     memo_textarea: str = "textarea.memo"
     memo_save_button: str = "button.save_memo"
-    # ---- 入力画面（DOM未確認。利用者が確認するまで未設定）
-    input_url: str | None = None
-    asin_textarea: str | None = None  # 「3.ASINリストから情報取得」のテキスト欄
-    asin_save_button: str | None = None  # 同じセクションのSAVE
-    option_toggles: dict[str, str] = field(default_factory=dict)  # 画面の設定値の表示名 → トグルのセレクタ（バリエーションは必須）
+    # ---- 入力画面（実画面のDOMを読み取って確認済み。国指定はなく、他のSAVE・国選択は使わない）
+    input_url: str | None = "https://import-tools.jp/asin/main.php"
+    asin_textarea: str | None = "textarea#asin_list"  # 「3.ASINリストから情報取得」のテキスト欄
+    asin_save_button: str | None = "button#add_asin_list"  # 同じセクションのSAVE
+    option_toggles: dict[str, str] = field(default_factory=lambda: dict(VERIFIED_OPTION_TOGGLES))  # 設定値の表示名 → チェックボックス（バリエーションは必須）
 
 
 class ImportToolPage:
@@ -47,7 +60,7 @@ class ImportToolPage:
         s, out = self._s, []
         for name in ("input_url", "asin_textarea", "asin_save_button"):
             if not getattr(s, name):
-                out.append(f"入力画面のセレクタ/URL（{name}）が未設定です（DOMが未確認のため推測しません）")
+                out.append(f"入力画面のセレクタ/URL（{name}）が未設定です")
         if not any("バリエーション" in k or "variation" in k.lower() for k in s.option_toggles):
             out.append("バリエーションのトグルのセレクタが未設定です（ONでないことを確認できないため送信しません）")
         return out

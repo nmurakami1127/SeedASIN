@@ -35,6 +35,7 @@ class LedgerState:
     before_run_ids: list[int] = field(default_factory=list)
     observed_country: str | None = None
     options: dict | None = None
+    evidence: dict | None = None
     events: list[dict] = field(default_factory=list)
     manifest: dict | None = None
 
@@ -77,8 +78,11 @@ class SubmissionLedger:
                     st.before_run_ids = list(e.get("before_run_ids", []))
             elif ev == "SUBMIT_STARTED":
                 st.state, st.attempts = "SUBMITTING", st.attempts + 1
+                st.evidence = None  # 試行ごとに根拠を取り直す
                 st.before_run_ids = list(e.get("before_run_ids", []))
                 st.options = e.get("options", st.options)
+            elif ev == "EVIDENCE":
+                st.evidence = e.get("evidence")
             elif ev == "OUTCOME_UNKNOWN":
                 st.state = "UNKNOWN"
             elif ev == "AMBIGUOUS":

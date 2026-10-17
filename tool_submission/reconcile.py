@@ -27,12 +27,13 @@ class LogEntry:
     memo: str
     status: str
     csv: str | None
+    options: str = ""  # `data-options`（送信時の設定値。例 {cn_safe:on,variation:,...}。空=OFF）
 
 
 def entries_from_json(rows: list[dict]) -> list[LogEntry]:
     """実画面から読み取った行（seq/data_type/country/memo/status/csv）のスナップショット。"""
     return [LogEntry(int(r["seq"]), str(r.get("data_type", "")).lower(), str(r.get("country", "")).lower(), str(r.get("memo", "")).strip(),
-                     str(r.get("status", "")), r.get("csv") or None) for r in rows]
+                     str(r.get("status", "")), r.get("csv") or None, str(r.get("options", "")).strip()) for r in rows]
 
 
 def load_log_entries(path) -> list[LogEntry]:
@@ -80,7 +81,7 @@ def parse_log_entries(html: str) -> list[LogEntry]:
         out.append(LogEntry(
             int(seq), (tr.attributes.get("data-type") or "").strip().lower(), (tr.attributes.get("data-country") or "").strip().lower(),
             memo_node.text().strip() if memo_node else "", status_node.text().strip() if status_node else "",
-            None if csv_text in ("", "-") else csv_text,
+            None if csv_text in ("", "-") else csv_text, (tr.attributes.get("data-options") or "").strip(),
         ))
     return out
 
@@ -111,6 +112,38 @@ def identify_new_entry(entries: list[LogEntry], before_run_ids: set[int], *, exp
     if len(cands) == 1:
         return IdentifyDecision("IDENTIFIED", cands, new[0].country or None)
     return IdentifyDecision("AMBIGUOUS", cands)
+
+
+def parse_row_options(s: str) -> dict[str, str]:
+    """`data-options`（{k:v,k:v}。値が空=OFF）を辞書にする。"""
+    body = s.strip().strip("{}")
+    out = {}
+    for part in body.split(","):
+        if ":" in part:
+            k, v = part.split(":", 1)
+            out[k.strip()] = v.strip()
+    return out
+
+
+def options_match(row_options: str, request_options: dict) -> bool:
+    """送信リクエストの設定値と、ログ行の`data-options`が一致するか（キーは同じ。値はon/空）。"""
+    row = parse_row_options(row_options)
+    req = {k: ("on" if v in (True, "on", "ON", 1) else "") for k, v in request_options.items()}
+    return bool(row) and row == req
+
+
+def corroborate(entry: LogEntry, evidence: dict | None) -> list[str]:
+    """特定した新規行が、**自分の送信**に対応する根拠を満たすかを調べ、満たさない理由を返す（空なら根拠あり）。
+    「新規行が1件」という事実だけでは自分の送信と断定しない。根拠: ①送信リクエストのASINが計画と一致（`evidence`コマンドで検証済み）
+    ②応答が保存成功 ③行の設定値(data-options)が送信リクエストの設定値と一致 ④種別asin_list・メモが空（identifyで確認済み）。"""
+    if not evidence or not evidence.get("ok"):
+        return ["送信リクエスト・応答の記録（evidence）が無い、または検証に失敗しています"]
+    problems = []
+    if not entry.options:
+        problems.append("行の設定値(data-options)を確認できません")
+    elif evidence.get("request_options") is not None and not options_match(entry.options, evidence["request_options"]):
+        problems.append(f"行の設定値{entry.options}が送信リクエストの設定値と一致しません")
+    return problems
 
 
 def verify_output(input_asins: list[str], output_csv: Path) -> dict:

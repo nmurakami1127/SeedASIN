@@ -26,7 +26,7 @@ from tool_intake.csv_utils import open_text_auto
 from tool_submission.ledger import SubmissionLedger
 from tool_submission.model import SubmissionError
 from tool_submission.planner import build_items, write_plan
-from tool_submission.reconcile import identify_new_entry, load_log_entries, single_row_html, verify_output
+from tool_submission.reconcile import corroborate, identify_new_entry, load_log_entries, single_row_html, verify_output
 
 DEFAULT_DIR = Path("exports") / "tool_submission"
 
@@ -117,6 +117,64 @@ def _cmd_begin(a: argparse.Namespace) -> int:
     return 0 if ok else 2
 
 
+def _cmd_evidence(a: argparse.Namespace) -> int:
+    """SAVE直後に画面から得た「送信リクエストと応答」の記録を検証して台帳に残す（実行IDの対応根拠）。
+    capture: {"endpoint": "...start_search4.php", "body": "<送信したJSON文字列>", "status": 200, "response": "<応答テキスト>"}"""
+    import hashlib
+
+    ledger = _ledger(a)
+    st = _need(ledger, a.key)
+    if st is None:
+        return 2
+    if st.state != "SUBMITTING":
+        print(f"[中止] 状態が{st.state}です（evidenceは送信開始の記録後・実行ID特定の前に残します）")
+        return 2
+    cap = json.loads(Path(a.capture_json).read_text(encoding="utf-8"))
+    m = st.manifest
+    plan_asins = [x for x in Path(m["input_file"]).read_text(encoding="utf-8").splitlines() if x.strip()]
+    problems = []
+    try:
+        body = json.loads(cap["body"])
+    except (KeyError, ValueError):
+        body = {}
+        problems.append("送信リクエストの本文を読めません")
+    sent = [x for x in str(body.get("url", "")).split(",") if x]
+    if sent != plan_asins:
+        problems.append(f"送信したASIN（{len(sent)}件）が計画（{len(plan_asins)}件）と一致しません")
+    if not str(cap.get("endpoint", "")).endswith("start_search4.php"):
+        problems.append("送信先が想定（start_search4.php）と違います")
+    if body.get("type") != "asin_list" or body.get("country") not in ("", None):
+        problems.append(f"種別/国指定が想定と違います（type={body.get('type')!r}, country={body.get('country')!r}）")
+    if cap.get("status") != 200 or "end" not in str(cap.get("response", "")):
+        problems.append(f"応答が保存成功ではありません（status={cap.get('status')}, 応答={str(cap.get('response', ''))[:80]!r}）")
+    if (body.get("options") or {}).get("variation"):
+        problems.append("送信リクエストのバリエーションがONです")
+    ev = {"ok": not problems, "problems": problems, "asin_count": len(sent), "asin_list_sha256": hashlib.sha256(",".join(sent).encode()).hexdigest(),
+          "request_options": body.get("options"), "response": str(cap.get("response", ""))[:120], "alerts": cap.get("alerts", [])}
+    ledger.append(a.key, "EVIDENCE", evidence=ev)
+    print(("根拠を記録しました: " if ev["ok"] else "[不一致] 根拠として認められません: ")
+          + json.dumps({k: ev[k] for k in ("ok", "problems", "asin_count", "response")}, ensure_ascii=False))
+    return 0 if ev["ok"] else 3
+
+
+def _cmd_mark_not_submitted(a: argparse.Namespace) -> int:
+    """送信開始を記録したが、SAVEを押していない（または保存されなかった）と、**ログ画面で確認できた**ときだけ、未送信に戻す。"""
+    ledger = _ledger(a)
+    st = _need(ledger, a.key)
+    if st is None:
+        return 2
+    if st.state != "SUBMITTING":
+        print(f"[中止] 状態が{st.state}です（結果不明・特定済みの計画は未送信へ戻しません）")
+        return 2
+    new = [e.seq for e in load_log_entries(a.log_json) if e.seq not in set(st.before_run_ids)]
+    if new:
+        print(f"[中止] 送信前の基準に無い新規行{new}があります。未送信とは確認できません（結果不明として照合してください）")
+        return 3
+    ledger.append(a.key, "NOT_SUBMITTED_VERIFIED", reason=a.reason, via="log_snapshot")
+    print("未送信を確認して記録しました（基準に無い新規行なし）")
+    return 0
+
+
 def _cmd_ingest(a: argparse.Namespace) -> int:
     """既存のingest-logを、この投入の実行IDの1行だけに限定して実行する（DB更新: seller登録・tool_execution_link・取得完了なら出力取込）。"""
     import tempfile
@@ -172,8 +230,15 @@ def _cmd_reconcile(a: argparse.Namespace) -> int:
     d = identify_new_entry(entries, set(st.before_run_ids), expected_memo=m["memo"], exclude_run_ids=ledger.identified_run_ids(a.key),
                            response_run_id=a.response_run_id)
     if d.kind == "IDENTIFIED":
-        ledger.append(a.key, "RUN_IDENTIFIED", tool_run_id=d.tool_run_id, observed_country=d.country, via="log_html")
         row = next(e for e in entries if e.seq == int(d.tool_run_id))
+        if not a.no_evidence:
+            problems = corroborate(row, st.evidence)
+            if problems:
+                ledger.append(a.key, "OUTCOME_UNKNOWN", reason=("対応根拠を確認できない: " + "; ".join(problems))[:300], candidate=d.tool_run_id)
+                print(f"[停止] 新規行{d.tool_run_id}がありますが、自分の送信と対応する根拠を確認できません"
+                      f"（結果不明として止めます。メモを付けないでください）: {problems}")
+                return 3
+        ledger.append(a.key, "RUN_IDENTIFIED", tool_run_id=d.tool_run_id, observed_country=d.country, via="log_html")
         print(f"実行IDを特定しました: {d.tool_run_id}（送信前の基準に無い新しいASINリスト行）。ログ画面でこの行へメモ{m['memo']!r}を保存してください")
         if row.memo == m["memo"]:
             ledger.append(a.key, "MEMO_SAVED", tool_run_id=d.tool_run_id, via="log_html")
@@ -312,6 +377,14 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--key", required=True)
     sp.add_argument("--log-html", required=True)
     sp.add_argument("--response-run-id", type=int, default=None, help="送信直後の画面応答で実行IDが分かった場合")
+    sp.add_argument("--no-evidence", action="store_true", help="（非推奨）送信リクエスト・応答の根拠なしで特定する。既定では根拠が必要")
+    sp = add("evidence", _cmd_evidence, "SAVE直後に得た送信リクエストと応答を検証して台帳に残す（実行IDの対応根拠）")
+    sp.add_argument("--key", required=True)
+    sp.add_argument("--capture-json", required=True)
+    sp = add("mark-not-submitted", _cmd_mark_not_submitted, "SAVEを押していない/保存されなかったと、ログで確認できたときだけ未送信に戻す")
+    sp.add_argument("--key", required=True)
+    sp.add_argument("--log-json", required=True)
+    sp.add_argument("--reason", required=True)
     sp = add("resolve", _cmd_resolve, "新しい行が複数あるとき、人が実行IDを選ぶ")
     sp.add_argument("--key", required=True)
     sp.add_argument("--run-id", required=True, type=int)
