@@ -29,6 +29,7 @@ from typing import Callable, Protocol
 from tool_submission.ledger import MAX_ATTEMPTS, MEMO_MAX_ATTEMPTS, LedgerBusy, SubmissionLedger
 from tool_submission.model import SubmissionItem, option_blockers
 from tool_submission.reconcile import LogEntry, LogUnreadable, identify_new_entry
+from tool_submission.retention import blockers_of, check_retention, record_retention
 
 GLOBAL_LOCK = "GLOBAL-SUBMIT"
 
@@ -88,8 +89,21 @@ def pending_others(ledger: SubmissionLedger, key: str) -> list[str]:
     return [k for k, s in ledger.all_states().items() if k != key and s.state in PENDING_STATES]
 
 
+def retention_gate(entries: list[LogEntry] | None, *, dirs=None, db_rows=None, record_path: Path | None = None,
+                   context: dict | None = None) -> list[str]:
+    """新規送信で最古のログ行・出力CSVが削除されるため、削除対象の出力が保全されているかを確認する（止める理由の一覧。空なら進める）。
+    ログの全体を読めていない場合は、削除対象を特定できないので止める。"""
+    if entries is None:
+        return ["送信前のログ一覧を読めていないため、削除される行（最古の行と出力CSV）を特定できません"]
+    items = check_retention(entries, dirs=dirs, db_rows=db_rows)
+    if record_path is not None:
+        record_retention(record_path, items, context=context)
+    return blockers_of(items)
+
+
 def claim_submission(ledger: SubmissionLedger, item: SubmissionItem, input_path: Path, before_run_ids: list[int],
-                     options: dict[str, bool] | None) -> tuple[bool, str]:
+                     options: dict[str, bool] | None, *, log_entries: list[LogEntry] | None = None, retention_dirs=None,
+                     db_rows=None, retention_log: Path | None = None) -> tuple[bool, str]:
     """送信権を**原子的に**確保して送信開始を台帳に記録する（自動・手動の両方で、SAVEの前に必ず通す）。
     確認: 計画の存在と状態・入力ファイルのハッシュと件数・メモの規約・画面の設定値（バリエーションOFF）・他の投入が未完了でないこと。
     確保できたら True（SUBMIT_STARTEDを記録済み）。呼び出し側は、その後にだけASINを入力しSAVEを1回押す。"""
@@ -108,6 +122,10 @@ def claim_submission(ledger: SubmissionLedger, item: SubmissionItem, input_path:
                 others = pending_others(ledger, item.key)
                 if others:
                     return False, f"別の投入が未完了です: {others}（完了するまで次の投入に進みません）"
+                held = retention_gate(log_entries, dirs=retention_dirs, db_rows=db_rows, record_path=retention_log,
+                                      context={"key": item.key})
+                if held:
+                    return False, "ログ300件の上限で削除される行の出力が保全されていないため送信しません: " + " / ".join(held)
                 data = Path(input_path).read_bytes()
                 if hashlib.sha256(data).hexdigest() != item.input_sha256:
                     return False, "入力ファイルのハッシュが計画と違います（改変・取り違えの疑い）"
@@ -235,6 +253,10 @@ def _locked(ledger, page, item, input_path, log_retries, sleep) -> SubmitResult:
     blockers = option_blockers(options)
     if blockers:
         return SubmitResult("REFUSED", detail="; ".join(blockers))
+    held = retention_gate(before_entries, dirs=getattr(page, "retention_dirs", None), db_rows=getattr(page, "db_rows", None),
+                          record_path=getattr(page, "retention_log", None), context={"key": item.key})
+    if held:
+        return SubmitResult("REFUSED", detail="ログ300件の上限で削除される行の出力が保全されていないため送信しません: " + " / ".join(held))
     before = {e.seq for e in before_entries}
     ledger.append(item.key, "SUBMIT_STARTED", before_run_ids=sorted(before), attempt=st.attempts + 1, options=options,
                   input_sha256=item.input_sha256, asin_count=item.asin_count)  # SAVEの前に送信権を確保して記録する

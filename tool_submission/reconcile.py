@@ -28,12 +28,14 @@ class LogEntry:
     status: str
     csv: str | None
     options: str = ""  # `data-options`（送信時の設定値。例 {cn_safe:on,variation:,...}。空=OFF）
+    time: str = ""  # `td.log-time`（取得完了時刻。待機中は「-」）
 
 
 def entries_from_json(rows: list[dict]) -> list[LogEntry]:
     """実画面から読み取った行（seq/data_type/country/memo/status/csv）のスナップショット。"""
     return [LogEntry(int(r["seq"]), str(r.get("data_type", "")).lower(), str(r.get("country", "")).lower(), str(r.get("memo", "")).strip(),
-                     str(r.get("status", "")), r.get("csv") or None, str(r.get("options", "")).strip()) for r in rows]
+                     str(r.get("status", "")), r.get("csv") or None, str(r.get("options", "")).strip(),
+                     str(r.get("time", "")).strip()) for r in rows]
 
 
 def load_log_entries(path) -> list[LogEntry]:
@@ -78,10 +80,12 @@ def parse_log_entries(html: str) -> list[LogEntry]:
         status_node = tr.css_first("td.log-status")
         csv_node = tr.css_first("td.log-csv")
         csv_text = csv_node.text().strip() if csv_node else "-"
+        time_node = tr.css_first("td.log-time")
         out.append(LogEntry(
             int(seq), (tr.attributes.get("data-type") or "").strip().lower(), (tr.attributes.get("data-country") or "").strip().lower(),
             memo_node.text().strip() if memo_node else "", status_node.text().strip() if status_node else "",
             None if csv_text in ("", "-") else csv_text, (tr.attributes.get("data-options") or "").strip(),
+            time_node.text().strip() if time_node else "",
         ))
     return out
 
@@ -158,7 +162,11 @@ def verify_output(input_asins: list[str], output_csv: Path) -> dict:
     if "asin" not in header:
         return {"ok": False, "reason": "ASIN列がありません"}
     idx = header.index("asin")
-    got = {r[idx].strip().upper() for r in rows[1:] if len(r) > idx and r[idx].strip()}
+    listed = [r[idx].strip().upper() for r in rows[1:] if len(r) > idx and r[idx].strip()]
+    got = set(listed)
     want = {a.strip().upper() for a in input_asins}
-    return {"ok": bool(got) and got <= want, "input": len(want), "output": len(got), "outside_input": len(got - want),
-            "missing_from_output": len(want - got)}
+    # ok = 出力のASINが全て入力に含まれる（取り違えの疑いが無い）。入力にあって出力に無いASINは「不足」として報告するだけで、取込は止めない
+    # （統合ツールの仕様で出力されないことがあり得るため。仕様で説明できない場合は人が判断する）。
+    return {"ok": bool(got) and got <= want, "input": len(want), "output_rows": len(listed), "output": len(got),
+            "duplicate_rows": len(listed) - len(got), "outside_input": len(got - want), "missing_from_output": len(want - got),
+            "outside_input_asins": sorted(got - want)[:20], "missing_asins": sorted(want - got)[:20]}

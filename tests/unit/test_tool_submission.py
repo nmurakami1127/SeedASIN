@@ -239,7 +239,13 @@ def test_rows_ingested_after_the_snapshot_are_not_excluded_as_past():
 def test_verify_output_checks_the_output_asins_against_the_input(tmp_path):
     p = tmp_path / "o.csv"
     p.write_text("ASIN,title\nB000000001,a\nB000000002,b\n", encoding="utf-8")
-    assert verify_output(["B000000001", "B000000002", "B000000003"], p) == {"ok": True, "input": 3, "output": 2, "outside_input": 0, "missing_from_output": 1}
+    r = verify_output(["B000000001", "B000000002", "B000000003"], p)
+    assert (r["ok"], r["input"], r["output_rows"], r["output"], r["duplicate_rows"], r["outside_input"], r["missing_from_output"]) == (True, 3, 2, 2, 0, 0, 1)
+    assert r["missing_asins"] == ["B000000003"]  # 不足は報告するが、取込は止めない
+    p.write_text("ASIN,title\nB000000001,a\nB000000001,a2\n", encoding="utf-8")
+    d = verify_output(["B000000001", "B000000002"], p)
+    assert (d["ok"], d["output_rows"], d["output"], d["duplicate_rows"]) == (True, 2, 1, 1)  # 重複行は件数で区別して報告
+    p.write_text("ASIN,title\nB000000001,a\nB000000002,b\n", encoding="utf-8")
     assert verify_output(["B000000001"], p)["ok"] is False  # 入力に無いASINが出力にある=別の実行の可能性
     p.write_text("x,y\n1,2\n", encoding="utf-8")
     assert verify_output(["B000000001"], p)["ok"] is False
@@ -578,11 +584,11 @@ def test_claim_submission_records_the_start_atomically_and_only_once(ledger, tmp
     from tool_submission.runner import claim_submission
 
     it, f = _plan_item(tmp_path, ledger)
-    ok, msg = claim_submission(ledger, it, f, [3, 1, 2], OPTS_OK)
+    ok, msg = claim_submission(ledger, it, f, [3, 1, 2], OPTS_OK, log_entries=[])
     assert ok and "SAVEを1回だけ" in msg
     st = ledger.state("kb")
     assert (st.state, st.attempts, st.before_run_ids, st.options) == ("SUBMITTING", 1, [1, 2, 3], OPTS_OK)
-    ok2, msg2 = claim_submission(ledger, it, f, [1], OPTS_OK)
+    ok2, msg2 = claim_submission(ledger, it, f, [1], OPTS_OK, log_entries=[])
     assert not ok2 and "再送しません" in msg2 and ledger.state("kb").attempts == 1  # 送信済みの計画には送信権を与えない
 
 
@@ -590,26 +596,26 @@ def test_claim_submission_refuses_on_hash_count_memo_options_or_other_pending(le
     from tool_submission.runner import claim_submission, pending_others
 
     it, f = _plan_item(tmp_path, ledger)
-    assert claim_submission(ledger, it, f, [], None)[0] is False  # 設定値を読めていない
-    assert "バリエーション" in claim_submission(ledger, it, f, [], {"バリエーション": True})[1]
-    assert "判定不能" in claim_submission(ledger, it, f, [], {"CNフラグ除外": True})[1]  # バリエーションの値が無い
+    assert claim_submission(ledger, it, f, [], None, log_entries=[])[0] is False  # 設定値を読めていない
+    assert "バリエーション" in claim_submission(ledger, it, f, [], {"バリエーション": True}, log_entries=[])[1]
+    assert "判定不能" in claim_submission(ledger, it, f, [], {"CNフラグ除外": True}, log_entries=[])[1]  # バリエーションの値が無い
     f.write_bytes(f.read_bytes() + b"B0EXTRA000\n")
-    assert "ハッシュ" in claim_submission(ledger, it, f, [], OPTS_OK)[1]
+    assert "ハッシュ" in claim_submission(ledger, it, f, [], OPTS_OK, log_entries=[])[1]
     f.write_bytes(asin_file_bytes([f"B0TEST{i:04d}" for i in range(3)]))
     bad = item(key="kb", n=3, memo="輸入_A3AJLR7DMJUOQG")  # 業務方向とメモが食い違う
     bad.input_file, bad.input_sha256 = str(f), it.input_sha256
-    assert "メモ" in claim_submission(ledger, bad, f, [], OPTS_OK)[1]
+    assert "メモ" in claim_submission(ledger, bad, f, [], OPTS_OK, log_entries=[])[1]
     ledger.append("k1", "SUBMIT_STARTED", before_run_ids=[], attempt=1)  # 別の計画が送信中（未完了）
     assert pending_others(ledger, "kb") == ["k1"]
-    assert "別の投入が未完了" in claim_submission(ledger, it, f, [], OPTS_OK)[1]
+    assert "別の投入が未完了" in claim_submission(ledger, it, f, [], OPTS_OK, log_entries=[])[1]
     ledger.append("k1", "RUN_IDENTIFIED", tool_run_id=7300001)
     assert pending_others(ledger, "kb") == ["k1"]  # 実行ID確定でもメモ未保存の間は次へ進まない
     ledger.append("k1", "MEMO_SAVED", tool_run_id=7300001)
-    assert pending_others(ledger, "kb") == [] and claim_submission(ledger, it, f, [], OPTS_OK)[0]
+    assert pending_others(ledger, "kb") == [] and claim_submission(ledger, it, f, [], OPTS_OK, log_entries=[])[0]
     assert ledger.state("kb").state == "SUBMITTING"
     with ledger.key_lock("GLOBAL-SUBMIT"):  # ロック中は確保できない（同じマシン内の別プロセスだけ。別PC・別ブラウザは防げない）
         it2, f2 = _plan_item(tmp_path, ledger, key="kc")
-        assert "処理中" in claim_submission(ledger, it2, f2, [], OPTS_OK)[1]
+        assert "処理中" in claim_submission(ledger, it2, f2, [], OPTS_OK, log_entries=[])[1]
 
 
 def test_runner_refuses_while_another_submission_is_unfinished(ledger):
@@ -690,7 +696,7 @@ def test_cli_evidence_validates_the_request_against_the_plan_and_reconcile_needs
     before = _write_json(tmp_path / "b.json", [{"seq": 100, "data_type": "asin_list", "memo": MEMO, "options": ROW_OPTS}])
     from tool_submission.runner import claim_submission
 
-    assert claim_submission(lg, it, Path(it.input_file), [100], {"バリエーション": False})[0]
+    assert claim_submission(lg, it, Path(it.input_file), [100], {"バリエーション": False}, log_entries=[])[0]
     after = _write_json(tmp_path / "a.json", [{"seq": 100, "data_type": "asin_list", "memo": MEMO, "options": ROW_OPTS},
                                                 {"seq": 101, "data_type": "asin_list", "country": "jp", "memo": "", "status": "待機中", "options": ROW_OPTS}])
     # 根拠が無いと、新規行が1件でも特定しない（結果不明として止める）
@@ -700,7 +706,7 @@ def test_cli_evidence_validates_the_request_against_the_plan_and_reconcile_needs
     tmp2 = tmp_path / "t2"
     tmp2.mkdir()
     lg2, it2, asins2, led2 = _cli_setup(tmp2)
-    assert claim_submission(lg2, it2, Path(it2.input_file), [100], {"バリエーション": False})[0]
+    assert claim_submission(lg2, it2, Path(it2.input_file), [100], {"バリエーション": False}, log_entries=[])[0]
     body = json.dumps({"url": ",".join(asins2), "now_page": 1, "csv_name": "none", "options": REQ_OPTS, "type": "asin_list", "country": "", "category_id": "", "repeat_cnt": 1})
     real_response = "start_search4asin_listrivalsuccess asin7170081 https://example.invalid/asin/csv_del.php<br>"  # 実画面の成功応答の形
     good = {"endpoint": "https://import-tools.jp/asin/out/start_search4.php", "body": body, "status": 200, "response": real_response}
@@ -714,7 +720,7 @@ def test_cli_evidence_validates_the_request_against_the_plan_and_reconcile_needs
     assert main(["evidence", "--key", "kc", "--capture-json", _write_json(tmp2 / "v.json", var_on), *base2]) == 3
     assert main(["reconcile", "--key", "kc", "--log-html", after, *base2]) == 3  # 失敗した根拠では特定しない
     lg3, it3, asins3, led3 = _cli_setup(tmp_path / "t3" if (tmp_path / "t3").mkdir() is None else tmp_path)
-    assert claim_submission(lg3, it3, Path(it3.input_file), [100], {"バリエーション": False})[0]
+    assert claim_submission(lg3, it3, Path(it3.input_file), [100], {"バリエーション": False}, log_entries=[])[0]
     body3 = json.dumps({"url": ",".join(asins3), "options": REQ_OPTS, "type": "asin_list", "country": ""})
     ok_cap = dict(good, body=body3)
     assert main(["evidence", "--key", "kc", "--capture-json", _write_json(tmp_path / "t3" / "ok.json", ok_cap), "--ledger", led3]) == 0
@@ -723,7 +729,7 @@ def test_cli_evidence_validates_the_request_against_the_plan_and_reconcile_needs
     assert (lg3.state("kc").state, lg3.state("kc").tool_run_id) == ("RUN_IDENTIFIED", "101")
     # 設定値が違う新規行は、1件でも自分の送信とは断定しない
     lg4, it4, asins4, led4 = _cli_setup(tmp_path / "t4" if (tmp_path / "t4").mkdir() is None else tmp_path)
-    assert claim_submission(lg4, it4, Path(it4.input_file), [100], {"バリエーション": False})[0]
+    assert claim_submission(lg4, it4, Path(it4.input_file), [100], {"バリエーション": False}, log_entries=[])[0]
     main(["evidence", "--key", "kc", "--capture-json", _write_json(tmp_path / "t4" / "ok.json", dict(good, body=json.dumps({"url": ",".join(asins4), "options": REQ_OPTS, "type": "asin_list", "country": ""}))), "--ledger", led4])
     other = _write_json(tmp_path / "t4" / "o.json", [{"seq": 100, "data_type": "asin_list", "memo": MEMO, "options": ROW_OPTS},
                                                       {"seq": 102, "data_type": "asin_list", "memo": "", "options": ROW_OPTS.replace("variation:,", "variation:on,")}])
@@ -736,7 +742,7 @@ def test_mark_not_submitted_only_when_the_log_shows_no_new_row(tmp_path):
     from tool_submission.runner import claim_submission
 
     lg, it, asins, led = _cli_setup(tmp_path)
-    assert claim_submission(lg, it, Path(it.input_file), [100], {"バリエーション": False})[0]
+    assert claim_submission(lg, it, Path(it.input_file), [100], {"バリエーション": False}, log_entries=[])[0]
     with_new = _write_json(tmp_path / "n.json", [{"seq": 100, "data_type": "asin_list"}, {"seq": 105, "data_type": "asin_list"}])
     assert main(["mark-not-submitted", "--key", "kc", "--log-json", with_new, "--reason", "x", "--ledger", led]) == 3
     assert lg.state("kc").state == "SUBMITTING"  # 新規行があれば、未送信とは確認できない（戻さない）
@@ -744,3 +750,76 @@ def test_mark_not_submitted_only_when_the_log_shows_no_new_row(tmp_path):
     assert main(["mark-not-submitted", "--key", "kc", "--log-json", same, "--reason", "SAVE前に中止", "--ledger", led]) == 0
     assert lg.state("kc").state == "NOT_SUBMITTED"
     assert main(["mark-not-submitted", "--key", "kc", "--log-json", same, "--reason", "x", "--ledger", led]) == 2  # 戻せるのはSUBMITTINGからだけ
+
+
+# ---------------------------------------------------------------- ログ300件上限（削除される最古の行の保全）
+
+def _rows(n, start=1000, status="取得完了"):
+    return [LogEntry(start + i, "asin_list", "jp", f"輸入_S{i}", status, f"{start + i}_x.csv") for i in range(n)]
+
+
+def test_rows_at_risk_is_the_oldest_rows_beyond_the_300_limit():
+    from tool_submission.retention import rows_at_risk
+
+    assert rows_at_risk(list(range(299))) == []  # 余裕がある間は削除されない
+    assert rows_at_risk(list(range(300))) == [0]  # 300行で1件追加 → 最古の1行
+    assert rows_at_risk(list(range(300)), will_add=3) == [0, 1, 2]
+    assert rows_at_risk([5, 1, 3], limit=3) == [1]
+
+
+def test_retention_blocks_when_the_oldest_output_is_not_preserved_locally(tmp_path):
+    from tool_submission.retention import blockers_of, check_retention
+
+    es = _rows(300)
+    items = check_retention(es, dirs=[tmp_path])
+    assert [i.seq for i in items] == [1000] and not items[0].ok
+    assert "保全されていません" in blockers_of(items)[0]
+    (tmp_path / "1000_x.csv").write_text("ASIN\nB0\n", encoding="utf-8")  # 元CSVが保全されていれば進める
+    ok = check_retention(es, dirs=[tmp_path], db_rows=lambda m, s: 5)
+    assert ok[0].ok and ok[0].local_sha256 and ok[0].db_rows == 5 and ok[0].market == "JP"
+    assert any("全列の保全ではありません" in w for w in ok[0].warnings)  # DB取込と元CSVの保全は区別する
+
+
+def test_retention_db_import_alone_does_not_count_as_preserved_and_unimported_is_reported(tmp_path):
+    from tool_submission.retention import check_retention
+
+    it = check_retention(_rows(300), dirs=[tmp_path], db_rows=lambda m, s: 99)[0]
+    assert not it.ok  # DBに入っていても、元CSVが無ければ止める
+    (tmp_path / "1000_x.csv").write_text("ASIN\n", encoding="utf-8")
+    it = check_retention(_rows(300), dirs=[tmp_path], db_rows=lambda m, s: 0)[0]
+    assert it.ok and any("未取込" in w for w in it.warnings)  # 保全はOKでも、取込が必要な対象として報告する
+
+
+def test_retention_blocks_waiting_running_and_undeterminable_rows(tmp_path):
+    from tool_submission.retention import check_retention
+
+    for status in ("待機中", "取得中", "", "謎の状態"):
+        es = _rows(300)
+        es[0] = LogEntry(1000, "asin_list", "jp", "輸入_X", status, None)
+        assert not check_retention(es, dirs=[tmp_path])[0].ok, status
+    es = _rows(300)
+    es[0] = LogEntry(1000, "asin_list", "jp", "", "禁止セラー", None)
+    assert check_retention(es, dirs=[tmp_path])[0].ok  # 出力が無い行は止めない（記録のみ）
+
+
+def test_claim_submission_refuses_when_the_oldest_output_is_unpreserved_or_the_log_is_unread(ledger, tmp_path):
+    from tool_submission.runner import claim_submission
+
+    it, f = _plan_item(tmp_path, ledger)
+    ok, msg = claim_submission(ledger, it, f, [], OPTS_OK)  # ログ一覧を渡せない = 削除対象を特定できない
+    assert not ok and "特定できません" in msg
+    ok, msg = claim_submission(ledger, it, f, [], OPTS_OK, log_entries=_rows(300), retention_dirs=[tmp_path / "none"])
+    assert not ok and "保全されていない" in msg and ledger.state("kb").state == "PLANNED"  # 送信開始を記録しない
+    (tmp_path / "1000_x.csv").write_text("ASIN\n", encoding="utf-8")
+    log = tmp_path / "ret.jsonl"
+    ok, msg = claim_submission(ledger, it, f, [], OPTS_OK, log_entries=_rows(300), retention_dirs=[tmp_path], retention_log=log)
+    assert ok and ledger.state("kb").state == "SUBMITTING"
+    assert '"seq": 1000' in log.read_text(encoding="utf-8")  # 削除される行の記録を残す
+
+
+def test_log_time_is_parsed_from_the_row():
+    from tool_submission.reconcile import parse_log_entries
+
+    html = ('<table><tr data-seq="7"><td class="log-csv">7_a.csv</td><td class="log-status">取得完了</td>'
+            '<td class="log-memo"><textarea class="memo">輸入_X</textarea></td><td class="log-time">2026-10-17 20:00</td></tr></table>')
+    assert parse_log_entries(html)[0].time == "2026-10-17 20:00"

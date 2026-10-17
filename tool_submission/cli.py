@@ -108,13 +108,51 @@ def _cmd_begin(a: argparse.Namespace) -> int:
     if st is None:
         return 2
     item = item_from_manifest(st.manifest)
-    ids = [e.seq for e in load_log_entries(a.log_json)]
+    entries = load_log_entries(a.log_json)
+    ids = [e.seq for e in entries]
     options = json.loads(Path(a.options_json).read_text(encoding="utf-8")) if a.options_json else None
-    ok, msg = claim_submission(ledger, item, Path(item.input_file), ids, options)
+    ok, msg = claim_submission(ledger, item, Path(item.input_file), ids, options, log_entries=entries,
+                               db_rows=None if a.no_db else _db_rows(), retention_log=DEFAULT_DIR / "log_retention.jsonl")
     print(("[確保] " if ok else "[中止] ") + msg)
     if ok:
         print(f"対象: 取得run={item.collector_run_id} 業務方向={item.direction} ASIN{item.asin_count}件 sha256={item.input_sha256[:16]}… メモ（後付け）={item.memo!r}")
     return 0 if ok else 2
+
+
+def _db_rows():
+    """ログの行ごとに、tool_output_asinへ取り込み済みの件数（DB読み取りのみ）。ASINと取得日時だけで、元CSVの全列の保全ではない。"""
+    from sqlalchemy import text
+
+    factory = SessionFactory.for_app_role()
+
+    def count(market: str, seq: int) -> int:
+        with factory.get_session(market) as conn:
+            return int(conn.execute(text("SELECT count(*) FROM tool_output_asin WHERE marketplace=:m AND tool_run_id=:r"),
+                                    {"m": market, "r": str(seq)}).scalar_one())
+    return count
+
+
+def _cmd_retention_check(a: argparse.Namespace) -> int:
+    """新しい送信で削除される最古のログ行（と出力CSV）が保全されているかを送信前に確認する（読み取りのみ。記録はローカルJSONL）。"""
+    from tool_submission.retention import LOG_LIMIT, blockers_of, check_retention, record_retention
+
+    entries = load_log_entries(a.log_json)
+    items = check_retention(entries, will_add=a.will_add, db_rows=None if a.no_db else _db_rows())
+    print(f"ログ{len(entries)}行（上限{LOG_LIMIT}）。今回{a.will_add}件追加で削除される可能性のある行: {len(items)}")
+    for it in items:
+        flag = "OK " if it.ok else "停止"
+        print(f"  [{flag}] ログ{it.seq} 状態={it.status} メモ={it.memo or '-'} CSV={it.csv or '-'} 市場={it.market or '-'} "
+              f"ローカル元CSV={'あり ' + it.local_sha256[:12] if it.local_files else 'なし'} DB取込={'-' if it.db_rows is None else it.db_rows}件")
+        for w in it.warnings:
+            print(f"        注意: {w}")
+        for b in it.blockers:
+            print(f"        停止理由: {b}")
+    if not a.no_record:
+        n = record_retention(DEFAULT_DIR / "log_retention.jsonl", items, context={"will_add": a.will_add})
+        print(f"[記録] {n}行をlog_retention.jsonlへ追記しました")
+    held = blockers_of(items)
+    print("[結果] " + ("新規送信を止めます" if held else "削除対象の保全を確認できました"))
+    return 3 if held else 0
 
 
 def _cmd_evidence(a: argparse.Namespace) -> int:
@@ -318,6 +356,78 @@ def _cmd_link_check(a: argparse.Namespace) -> int:
     return 0
 
 
+def _output_target(a):
+    """（台帳、状態、入力ASIN、市場、実行ID）。対応済み（メモ保存済み以降）でなければ出力を扱わない。"""
+    ledger = _ledger(a)
+    st = _need(ledger, a.key)
+    if st is None:
+        return None
+    if st.state not in ("MEMO_SAVED", "LINKED") or not st.tool_run_id:
+        print(f"[中止] 状態が{st.state}です（実行IDとメモの対応が確定してから出力を扱います）")
+        return None
+    asins = [x for x in Path(st.manifest["input_file"]).read_text(encoding="utf-8").splitlines() if x.strip()]
+    return ledger, st, asins, st.manifest["business_market"], st.tool_run_id
+
+
+def _cmd_find_output(a: argparse.Namespace) -> int:
+    """既存のautomation.pyが保存済みの出力CSVがローカルにあるか探す（取得・ダウンロードはしない）。"""
+    from tool_intake.processed_file_lookup import find_tool_output_files
+    from tool_submission.retention import LOCAL_ORIGINAL_DIRS
+
+    t = _output_target(a)
+    if t is None:
+        return 2
+    _, st, asins, market, run_id = t
+    processed = find_tool_output_files(market, run_id)
+    pending = [p for d in LOCAL_ORIGINAL_DIRS if "incoming" in str(d) and d.is_dir() for p in d.iterdir() if p.name.startswith(f"{run_id}_")]
+    print(f"ツール実行ID={run_id} 市場={market} 入力ASIN={len(asins)}件")
+    print(f"  処理済みフォルダー: {[str(p) for p in processed] or 'なし'}")
+    print(f"  取り込み待ちフォルダー: {[str(p) for p in pending] or 'なし'}")
+    return 0 if processed else 3
+
+
+def _cmd_import_output(a: argparse.Namespace) -> int:
+    """検証済みの出力だけを既存の取込（IntegrationToolImportService）でDBへ入れる。入力に無いASINがあれば取り込まない。"""
+    from tool_intake.integration_tool_import import IntegrationToolImportService
+    from tool_intake.processed_file_lookup import find_tool_output_files
+
+    t = _output_target(a)
+    if t is None:
+        return 2
+    ledger, st, asins, market, run_id = t
+    if a.csv:
+        path = Path(a.csv)
+    else:
+        files = find_tool_output_files(market, run_id)
+        if len(files) != 1:
+            print(f"[中止] 処理済みフォルダーの出力CSVが{len(files)}件です（1件に特定できません。--csvで指定してください）")
+            return 3
+        path = files[0]
+    if not path.name.startswith(f"{run_id}_"):
+        print(f"[中止] ファイル名が実行ID{run_id}で始まりません（取り違えの疑い）: {path.name}")
+        return 3
+    r = verify_output(asins, path)
+    print(json.dumps(r, ensure_ascii=False))
+    if not r.get("ok"):
+        print("[中止] 出力に入力へ含まれないASINがある、または空/ASIN列なしのため取り込みません（実行IDの取り違えの疑い）")
+        return 3
+    factory = SessionFactory.for_app_role()
+    count = _db_rows()
+    before = count(market, int(run_id))
+    svc = IntegrationToolImportService()
+    s1 = svc.import_file(factory, market, run_id, path)
+    mid = count(market, int(run_id))
+    print(f"取込: 行{s1.total_rows} 成功{s1.success_rows} エラー{s1.error_rows} / DB件数 {before} -> {mid}")
+    ledger.append(a.key, "OUTPUT_IMPORTED", tool_run_id=run_id, file=path.name, before=before, after=mid,
+                  output_rows=r["output_rows"], output=r["output"], missing_from_output=r["missing_from_output"])
+    if a.recheck:
+        s2 = svc.import_file(factory, market, run_id, path)
+        after = count(market, int(run_id))
+        print(f"再実行: 成功{s2.success_rows} / DB件数 {mid} -> {after}（{'重複なし' if after == mid else '件数が変わりました！'}）")
+        return 0 if after == mid else 3
+    return 0
+
+
 def _cmd_verify_output(a: argparse.Namespace) -> int:
     ledger = _ledger(a)
     st = _need(ledger, a.key)
@@ -393,6 +503,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--key", required=True)
     sp.add_argument("--log-json", required=True, help="送信直前のログ一覧のスナップショット（JSONまたは保存HTML）")
     sp.add_argument("--options-json", default=None, help="画面の設定値（表示名→ON/OFFのJSON。バリエーションを含むこと）")
+    sp.add_argument("--no-db", action="store_true", help="削除対象のDB取込の有無を調べない")
     sp = add("ingest", _cmd_ingest, "既存のingest-logを、この投入の実行IDの1行だけに限定して実行する（メモ保存の確認後）")
     sp.add_argument("--key", required=True)
     sp.add_argument("--row-html", required=True, help="その実行IDの行（またはログ画面）のHTML")
@@ -419,6 +530,17 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--selectors", default=None, help="入力画面のセレクタ等のJSON（Selectorsの項目名）。利用者がDOMを確認した値だけを入れる")
     sp = add("link-check", _cmd_link_check, "ingest-log後に、tool_execution_linkへの記録（対応記録済み）を確認する（DB読み取りのみ）")
     sp.add_argument("--key", required=True)
+    sp = add("retention-check", _cmd_retention_check, "新しい送信で削除される最古のログ行の出力が保全されているか確認する（送信はしない）")
+    sp.add_argument("--log-json", required=True, help="現在のログ全体（JSONまたは保存HTML。状態・CSV・メモを含むこと）")
+    sp.add_argument("--will-add", type=int, default=1)
+    sp.add_argument("--no-db", action="store_true", help="DB取込の有無を調べない")
+    sp.add_argument("--no-record", action="store_true", help="log_retention.jsonlへ記録しない")
+    sp = add("find-output", _cmd_find_output, "この投入の出力CSVが既にローカルにあるか探す（取得はしない）")
+    sp.add_argument("--key", required=True)
+    sp = add("import-output", _cmd_import_output, "出力を検証し、入力に無いASINが無ければ既存の取込でDBへ入れる（冪等）")
+    sp.add_argument("--key", required=True)
+    sp.add_argument("--csv", default=None, help="省略時は処理済みフォルダーの「<実行ID>_…csv」（1件に特定できる場合）")
+    sp.add_argument("--recheck", action="store_true", help="取込を再実行して件数が変わらない（重複なし）ことを確認する")
     sp = add("verify-output", _cmd_verify_output, "出力CSVのASINが入力に含まれるか、事後に確認する（送信結果と実行IDの対応の確認）")
     sp.add_argument("--key", required=True)
     sp.add_argument("--csv", required=True)

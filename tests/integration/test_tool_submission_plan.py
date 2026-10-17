@@ -268,3 +268,43 @@ def test_manual_flow_ambiguity_stops_and_only_a_human_choice_continues(app_role_
     assert cli_main(["resolve", "--key", k, "--run-id", "7800001", *base]) == 2  # 候補外（基準にある行）は選べない
     assert cli_main(["resolve", "--key", k, "--run-id", "7800003", *base]) == 0
     assert (ledger.state(k).state, ledger.state(k).tool_run_id) == ("RUN_IDENTIFIED", "7800003")
+
+
+def test_import_output_refuses_foreign_asins_and_is_idempotent(app_role_factory, registry, runs, tmp_path, monkeypatch, capsys):
+    from db.session import SessionFactory
+
+    monkeypatch.setattr(SessionFactory, "for_app_role", classmethod(lambda cls: app_role_factory))
+    _, run_id, _, _, key = fetched(app_role_factory, registry, runs, tmp_path, "US", [results([asin(81), asin(82), asin(83)])], origin_asin=asin(120), units=2, name="k.csv")
+    out, led = tmp_path / "o", tmp_path / "o" / "l.jsonl"
+    base = ["--ledger", str(led)]
+    assert cli_main(["plan", "--fetch-market", "US", "--run-id", str(run_id), "--out-dir", str(out), *base]) == 0
+    ledger = SubmissionLedger(led)
+    (k,) = ledger.all_states()
+    assert cli_main(["import-output", "--key", k, "--csv", str(tmp_path / "x.csv"), *base]) == 2  # 実行IDとメモの対応が確定する前は出力を扱わない
+    run_tool_id = "7790123"
+    ledger.append(k, "SUBMIT_STARTED", before_run_ids=[], attempt=1, options={"バリエーション": False})
+    ledger.append(k, "RUN_IDENTIFIED", tool_run_id=run_tool_id)
+    ledger.append(k, "MEMO_SAVED", tool_run_id=run_tool_id)
+    asins = [x for x in (out / f"run{run_id}_EXPORT_{k}.csv").read_text(encoding="utf-8").split() if x]
+    assert len(asins) == 3
+
+    def write(name, lst):
+        p = tmp_path / name
+        p.write_text("ASIN,取得日時\n" + "".join(f"{a},2026-10-17 20:00:00\n" for a in lst), encoding="utf-8")
+        return str(p)
+
+    def count():
+        with app_role_factory.get_session("US") as conn, conn.begin():
+            return conn.execute(text("SELECT count(*) FROM tool_output_asin WHERE marketplace='US' AND tool_run_id=:r"), {"r": run_tool_id}).scalar_one()
+
+    bad = write(f"{run_tool_id}_bad.csv", asins[:2] + ["B0FOREIGN01"])  # 入力に無いASIN = 別の実行の可能性
+    assert cli_main(["import-output", "--key", k, "--csv", bad, *base]) == 3 and count() == 0
+    assert cli_main(["import-output", "--key", k, "--csv", write("wrongname.csv", asins), *base]) == 3  # ファイル名が実行IDで始まらない
+    assert count() == 0
+    good = write(f"{run_tool_id}_ok.csv", asins[:2] + [asins[0]])  # 1件不足・1行重複でも、入力の範囲内なら取り込む（差分は報告）
+    assert cli_main(["import-output", "--key", k, "--csv", good, "--recheck", *base]) == 0
+    assert count() == 2  # 重複行は1件、不足は取り込まない。再実行でも増えない
+    text_out = capsys.readouterr().out
+    assert "重複なし" in text_out and '"missing_from_output": 1' in text_out and '"duplicate_rows": 1' in text_out
+    assert cli_main(["import-output", "--key", k, "--csv", good, *base]) == 0 and count() == 2
+    assert any(e["event"] == "OUTPUT_IMPORTED" for e in ledger.events())
