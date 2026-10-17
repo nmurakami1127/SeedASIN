@@ -188,3 +188,27 @@ def test_cli_plan_dry_run_writes_nothing_and_reconcile_confirms_from_a_saved_log
     html.write_text("<table>" + row.format(s=7400001, m=memo) + row.format(s=7400002, m=memo) + "</table>", encoding="utf-8")
     assert cli_main(["reconcile", "--key", k, "--log-html", str(html), "--ledger", str(led)]) == 0  # 確定済みは変えない
     assert ledger.state(k).tool_run_id == "7400001"
+
+
+def test_prior_tool_runs_with_the_same_memo_are_listed_and_never_adopted_as_the_new_run(app_role_factory, registry, runs, tmp_path, monkeypatch):
+    from db.session import SessionFactory
+
+    monkeypatch.setattr(SessionFactory, "for_app_role", classmethod(lambda cls: app_role_factory))
+    _, run_id, _, _, key = fetched(app_role_factory, registry, runs, tmp_path, "US", [results([asin(71)])], origin_asin=asin(110), units=2, name="j.csv")
+    with app_role_factory.get_session("US") as conn, conn.begin():  # 過去の統合ツール実行（同じ業務方向・同じ文字列）
+        conn.execute(text("INSERT INTO tool_execution_link (marketplace, seller_id, tool_run_id, source) VALUES ('US', :k, '7500001', 'ASIN_LIST')"),
+                     {"k": key.upper()})
+    out, led = tmp_path / "o", tmp_path / "o" / "l.jsonl"
+    (it,), _ = build_items(app_role_factory, "US", run_id, tool_country="jp", out_dir=out)
+    assert it.prior_tool_runs == ["7500001"]
+    assert cli_main(["plan", "--fetch-market", "US", "--run-id", str(run_id), "--tool-country", "jp", "--out-dir", str(out), "--ledger", str(led)]) == 0
+    (k,) = SubmissionLedger(led).all_states()
+    row = ('<tr data-seq="{s}" data-type="asin_list" data-text="asin" data-country="jp"><td class="log-status">取得完了</td>'
+           '<td class="log-csv">-</td><td><textarea class="memo">{m}</textarea></td></tr>')
+    html = tmp_path / "log.html"
+    html.write_text("<table>" + row.format(s=7500001, m=it.memo) + "</table>", encoding="utf-8")
+    assert cli_main(["reconcile", "--key", k, "--log-html", str(html), "--ledger", str(led)]) == 3  # 過去の実行だけ: 確定しない
+    assert SubmissionLedger(led).state(k).state == "PLANNED"
+    html.write_text("<table>" + row.format(s=7500001, m=it.memo) + row.format(s=7500009, m=it.memo) + "</table>", encoding="utf-8")
+    assert cli_main(["reconcile", "--key", k, "--log-html", str(html), "--ledger", str(led)]) == 0
+    assert SubmissionLedger(led).state(k).tool_run_id == "7500009"  # 過去の実行を除いた新しい行だけを採用する

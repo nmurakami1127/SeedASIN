@@ -69,6 +69,12 @@ def build_items(app: SessionFactory, fetch_market: str, run_id: int, *, tool_cou
     sha = hashlib.sha256(content).hexdigest()
     key_name = src.key_primary if src.source_type == "SELLER" else src.display_primary
     partial = run.outcome == "SUCCESS_TRUNCATED"
+    prior: dict[str, list[str]] = {}
+    for d in directions:
+        with app.get_session(BUSINESS_MARKET[d]) as conn, conn.begin():
+            prior[d] = sorted((r[0] for r in conn.execute(
+                text("SELECT tool_run_id FROM tool_execution_link WHERE marketplace = :m AND seller_id = :k"),
+                {"m": BUSINESS_MARKET[d], "k": key_name})), key=lambda x: (len(x), x))
     items, files = [], []
     for d in directions:
         dpaths = [p for p in paths if p.direction == d] or []
@@ -83,7 +89,7 @@ def build_items(app: SessionFactory, fetch_market: str, run_id: int, *, tool_cou
             input_file=str(Path(out_dir) / f"run{run_id}_{d}_{key}.csv"), input_sha256=sha,
             origin=None if best is None else {"market": best.origin_marketplace, "import_id": best.origin_import_id,
                                               "asin": best.origin_asin, "units": best.origin_units},
-            paths=[_path_dict(p) for p in dpaths], other_directions=[x for x in directions if x != d],
+            paths=[_path_dict(p) for p in dpaths], other_directions=[x for x in directions if x != d], prior_tool_runs=prior[d],
         ))
         files.append(content)
     return items, files

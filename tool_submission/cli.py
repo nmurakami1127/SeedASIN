@@ -39,6 +39,9 @@ def _cmd_plan(a: argparse.Namespace) -> int:
         print(f"    入力: ASIN{it.asin_count}件（取得{it.total_rows}行・重複除去{it.duplicate_rows_removed}）sha256={it.input_sha256[:16]}… → {it.input_file}")
         if it.origin:
             print(f"    起点: {it.origin['market']} import={it.origin['import_id']} {it.origin['asin']} 注文{it.origin['units']}点")
+        if it.prior_tool_runs:
+            print(f"    [注意] 同じ業務方向・同じ文字列の統合ツール実行が既に{len(it.prior_tool_runs)}件あります: {it.prior_tool_runs}"
+                  "（新しい投入の実行IDとして採用しません）")
         if it.other_directions:
             print(f"    同じ取得runを別の方向でも使う: {it.other_directions}（別の入力・別のメモ）")
     if a.dry_run:
@@ -75,6 +78,14 @@ def _cmd_reconcile(a: argparse.Namespace) -> int:
         return 0
     entries = parse_log_entries(open_text_auto(Path(a.log_html)))
     others = {int(s.tool_run_id) for k, s in ledger.all_states().items() if k != a.key and s.state == "CONFIRMED" and s.tool_run_id}
+    # 既に取り込み済みの統合ツール実行（過去の実行）は新しい投入の候補にしない: 計画時の一覧に加え、今のDBの記録も読む
+    others |= {int(x) for x in st.manifest.get("prior_tool_runs", []) if str(x).isdigit()}
+    from sqlalchemy import text
+
+    with SessionFactory.for_app_role().get_session(st.manifest["business_market"]) as conn, conn.begin():
+        others |= {int(r[0]) for r in conn.execute(
+            text("SELECT tool_run_id FROM tool_execution_link WHERE marketplace = :m AND seller_id = :k"),
+            {"m": st.manifest["business_market"], "k": st.manifest["source_key"]}) if str(r[0]).isdigit()}
     before = set(st.before_run_ids) if st.before_run_ids else None  # 自動投入の基準があればそれを使う（手動投入は基準なし）
     m = st.manifest
     d = match_new_entries(entries, m["memo"], m.get("tool_country"), before_run_ids=before, exclude_run_ids=others)

@@ -1062,3 +1062,5 @@ PERMANENTLY_EXCLUDEDは引き続き完全除外のまま変更しない。
 **不足しているもの（スキーマ変更案。保留）**: `collector_run` ↔ 統合ツール実行IDの対応はDBに無く、台帳（ファイル）は暫定。最小案: 表`tool_submission`（submission_key UNIQUE、collector_run_id、source_id、fetch_marketplace、direction、business_marketplace、memo、tool_country、origin_import_id/origin_asin、input_sha256、asin_count、input_is_partial、status、tool_run_id、attempts、各時刻、UNIQUE(business_marketplace, tool_run_id)）＋追記専用の履歴表`tool_submission_event`。RLSは業務方向の市場（tool_execution_linkと同じ）で、app_roleはINSERT・状態列のUPDATEのみ。`tool_execution_link`へ(business_marketplace, tool_run_id)で結ぶ。適用前に実装方針とマイグレーション構成案を提示して確認を得る（CLAUDE.md）。
 
 **未確認（利用者の確認が必要）**: ①統合ツールの投入画面の構造（入力欄・国設定・メモ欄の有無・送信ボタン）—ログ画面ではメモ欄に「保存」ボタンがあり、投入後にメモを付ける運用の可能性があるため、投入時にメモを入力できるか ②ASINリスト投入時の`data-country`（ツールの国設定）の決め方 ③投入の際のその他のオプション（カテゴリ・繰り返し等）④投入の1回あたりのASIN上限。
+
+**#60 追記（過去の統合ツール実行との取り違えの防止）**: 対象の出典には、過去の統合ツール実行が既に記録されている（出典11のセラー: US `tool_execution_link` に5件、うち4件は2026-06-11の移行データLEGACY_IMPORT、1件は2026-09-12）。そのため、手動で投入した後の`reconcile`（投入前の基準が無い）で、同じメモ・種別の**過去の実行を新しい実行と取り違えない**よう、計画に`prior_tool_runs`（計画時点の既存の実行ID）を残し、`reconcile`は計画時の一覧と**現在のDBの`tool_execution_link`**にある実行IDを候補から除く。過去の実行しか見つからなければ確定しない（終了コード3）。

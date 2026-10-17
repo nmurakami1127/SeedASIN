@@ -70,6 +70,7 @@ class SubmissionItem:
     origin: dict | None  # 代表起点（import・ASIN・注文点数・市場）
     paths: list[dict] = field(default_factory=list)  # この業務方向の全ての経路（起点・経由出典・経由ASIN・調査先市場）
     other_directions: list[str] = field(default_factory=list)  # 同じ取得runを別の方向でも使う場合の他の方向
+    prior_tool_runs: list[str] = field(default_factory=list)  # 計画時点で既に`tool_execution_link`にある、同じ業務方向・同じメモ文字列の統合ツール実行ID（照合で新しい実行と取り違えない）
 
     @property
     def status(self) -> str:
