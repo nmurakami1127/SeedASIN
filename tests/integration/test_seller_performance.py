@@ -751,18 +751,19 @@ class TestSellerRecommenderService:
         with app_role_factory.get_session("US") as conn, conn.begin():
             _seed_seller_and_tool_run(conn, seller_id, old_run, days_ago=60)
             SellerService().register(conn, "US", seller_id)
-            # recent_run1/recent_run2は同じ日（20日前）に2回取得したことを模す。
+            # recent_run1/recent_run2は同じ日（20日前）に2回取得したことを模す。実行時刻に依存しないよう、DB側の基準日(date_trunc('day', now()))の
+            # 2時・3時に置く（now()に1時間足す書き方は、UTCの23時台に実行すると日付をまたいで別の日になり、不安定だった）。
             conn.execute(
                 text(
                     "INSERT INTO tool_execution_link (marketplace, seller_id, tool_run_id, source, requested_at) "
-                    "VALUES ('US', :sid, :rid, 'SELLER_PAGE', now() - make_interval(days => 20))"
+                    "VALUES ('US', :sid, :rid, 'SELLER_PAGE', date_trunc('day', now()) - make_interval(days => 20) + interval '2 hours')"
                 ),
                 {"sid": seller_id, "rid": recent_run1},
             )
             conn.execute(
                 text(
                     "INSERT INTO tool_execution_link (marketplace, seller_id, tool_run_id, source, requested_at) "
-                    "VALUES ('US', :sid, :rid, 'SELLER_PAGE', now() - make_interval(days => 20) + interval '1 hour')"
+                    "VALUES ('US', :sid, :rid, 'SELLER_PAGE', date_trunc('day', now()) - make_interval(days => 20) + interval '3 hours')"
                 ),
                 {"sid": seller_id, "rid": recent_run2},
             )
