@@ -51,17 +51,18 @@ RELEASE_CODE = "RELEASE_HOLD"
 USABLE_FETCH_OUTCOMES = ("SUCCESS_NONEMPTY", "SUCCESS_TRUNCATED")
 HARD_CAPS = {"max_origin_asins": 10, "max_sources_per_origin": 10, "max_cross_asins": 5, "max_cross_sources_per_asin": 5}
 
-# 販売元IDではない識別子（市場ID）。出典として登録しない。
-#  - US ATVPDKIKX0DER: 利用者が実ブラウザで確認したストアフロントURLの `marketplaceID=`（check_recommendations.py）。
-#    既存の記録でも known_seller_master と storefront_blocked_seller(RETRY_LATER)に出てくる。Amazon.com自身の販売元IDと同一とされるが、
-#    ここでは確認できない。市場ID／Amazon自身のどちらの意味でも出典にしない。
-#  - JP A1VC38T7YXB528: JPの市場ID。リポジトリ内に根拠は無く、DB(known_seller_master・storefront_blocked_seller)とJP台帳に
-#    「セラー」として記録されているのみ（URLの市場IDの誤記録の疑い）。販売元IDとしては登録しない。
-# **JPのAmazon.co.jp自身の販売元IDは確認できていないため、IDでは除外しない**（推測で追加しない）。代わりに表示名が
-# Amazon小売と完全一致する出品者は登録せず「要確認」として報告する（IDを人が確認し、販売元ならstorefront_blocked_sellerへ）。
-# FBAの出品者（配送元がAmazonなだけ）は、販売元IDが別なので除外しない。
-MARKETPLACE_IDS = {"US": {"ATVPDKIKX0DER"}, "JP": {"A1VC38T7YXB528"}}
+# Amazon小売かどうかを判定できない出品者は、**登録を保留して根拠を報告する**（除外とも登録とも決めつけない）。
+# 根拠の種類（`Skipped.detail`に残す）:
+#  - 市場IDとの一致: US `ATVPDKIKX0DER` は利用者が実ブラウザで確認したストアフロントURLの `marketplaceID=` と同じ値、
+#    JP `A1VC38T7YXB528` はJPの市場IDとして知られる値。**これらが販売元識別子としても使われ得ないとは断定しない**
+#    （リポジトリ・DBに「Amazon自身の販売元ID」としての根拠が無いことと、そうでないことは別）。DBの既存記録
+#    （known_seller_master・storefront_blocked_seller）ではセラーとして記録されている。確認できるまで登録しない。
+#  - 表示名がAmazon小売と完全一致（amazon / amazon.com / amazon.co.jp / amazon.com services llc）。
+# 配送元の表示（Ships from）は出典の候補にしない。FBAの出品者（配送元がAmazonなだけ）は、販売元リンクのIDが別なので登録する。
+# 確認できないIDを推測で追加しない。判定は人が行い、販売元がAmazon小売なら storefront_blocked_seller へ（このコードは変更しない）。
+AMAZON_RETAIL_UNDETERMINED_IDS = {"US": {"ATVPDKIKX0DER"}, "JP": {"A1VC38T7YXB528"}}
 AMAZON_RETAIL_NAMES = {"amazon", "amazon.com", "amazon.co.jp", "amazon.com services llc"}
+HELD_AMAZON = "HELD_AMAZON_RETAIL_UNDETERMINED"
 
 
 class DiscoveryError(Exception):
@@ -399,13 +400,14 @@ class SourceCandidate:
 class Skipped:
     key: str
     reason: str
+    detail: str | None = None  # 見送り・保留の根拠（報告用）
 
 
 def build_candidates(result, routes: Iterable[str], page_market: str, own_ids: set[str], limit: int,
                      host: str) -> tuple[list[SourceCandidate], list[Skipped]]:
     """商品ページの抽出結果から、登録する候補を上限つきで選ぶ（ブランド→セラーの順）。
-    除外: 自社(OWN_SELLER) / 販売元でない市場ID(MARKETPLACE_ID) / 表示名がAmazon小売と完全一致(NEEDS_REVIEW_AMAZON_NAME。IDを推測しない)。
-    配送元がAmazonなだけのFBA出品者は、販売元IDが別なので除外しない。"""
+    除外: 自社(OWN_SELLER)。保留（登録せず根拠を報告）: Amazon小売かを判定できないもの(HELD_AMAZON_RETAIL_UNDETERMINED)。
+    配送元の表示は候補にならない。配送元がAmazonなだけのFBA出品者は、販売元リンクのIDが別なので登録する。"""
     from urllib.parse import urljoin
 
     routes = set(routes)
@@ -417,12 +419,13 @@ def build_candidates(result, routes: Iterable[str], page_market: str, own_ids: s
             cands.append(SourceCandidate(b.source_type, key, {"basis": b.basis}))
     if "SELLER" in routes:
         for s in result.sellers:
+            basis = f"リンクの役割={s.role} 領域={s.region} 表示名={s.name!r}"
             if s.seller_id in own_ids:
-                skipped.append(Skipped(s.seller_id, "OWN_SELLER"))
-            elif s.seller_id in MARKETPLACE_IDS.get(page_market, set()):
-                skipped.append(Skipped(s.seller_id, "MARKETPLACE_ID"))
+                skipped.append(Skipped(s.seller_id, "OWN_SELLER", basis))
+            elif s.seller_id in AMAZON_RETAIL_UNDETERMINED_IDS.get(page_market, set()):
+                skipped.append(Skipped(s.seller_id, HELD_AMAZON, f"市場{page_market}の市場IDと一致（販売元識別子かは未確認）; {basis}"))
             elif (s.name or "").strip().casefold() in AMAZON_RETAIL_NAMES:
-                skipped.append(Skipped(s.seller_id, "NEEDS_REVIEW_AMAZON_NAME"))
+                skipped.append(Skipped(s.seller_id, HELD_AMAZON, f"表示名がAmazon小売と完全一致（IDからは判定不能）; {basis}"))
             else:
                 cands.append(SourceCandidate("SELLER", s.seller_id, {"region": s.region, "seller_scope": result.seller_scope,
                                                                       "name": s.name}))

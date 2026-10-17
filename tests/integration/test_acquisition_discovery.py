@@ -110,8 +110,8 @@ def test_sellers_are_registered_with_origin_paths_scope_note_and_shared_across_o
     shared = "A5SHARED0001"
     pages = [product_html(buybox=shared, offers=[shared, "A6ONLY000001", own["JP"], "A1VC38T7YXB528"]), product_html(buybox=shared)]
     first, second = run_origin_discovery(svc, FakeFetcher(*pages), rid, "JP", ["SELLER"], DiscoveryLimits(max_origin_asins=2, max_sources_per_origin=3))
-    assert [r.key for r in first.registered] == [shared, "A6ONLY000001"]  # 自社と市場IDは登録しない
-    assert {s.key: s.reason for s in first.skipped} == {own["JP"]: "OWN_SELLER", "A1VC38T7YXB528": "MARKETPLACE_ID"}
+    assert [r.key for r in first.registered] == [shared, "A6ONLY000001"]  # 自社は除外、市場IDと一致するものは保留（登録しない）
+    assert {s.key: s.reason for s in first.skipped} == {own["JP"]: "OWN_SELLER", "A1VC38T7YXB528": "HELD_AMAZON_RETAIL_UNDETERMINED"}
     assert (first.seller_scope, second.seller_scope) == ("VISIBLE_OFFERS", "BUYBOX_ONLY")
     sid = source_by_key(app_role_factory, "JP", "SELLER", shared)
     ps = paths(app_role_factory, "JP", sid)
@@ -130,7 +130,7 @@ def test_fba_seller_and_unverified_amazon_name_handling_in_the_full_flow(app_rol
             '<a href="/gp/aag/main?seller=ARETAIL00009">Amazon.co.jp</a></div></div>')
     item = run_origin_discovery(svc, FakeFetcher(html), rid, "JP", ["SELLER"], DiscoveryLimits())[0]
     assert [r.key for r in item.registered] == ["AFBA00000009"]  # 配送元がAmazonなだけのFBA出品者は登録する
-    assert [(s.key, s.reason) for s in item.skipped] == [("ARETAIL00009", "NEEDS_REVIEW_AMAZON_NAME")]  # 名前一致は登録せず要確認
+    assert [(s.key, s.reason) for s in item.skipped] == [("ARETAIL00009", "HELD_AMAZON_RETAIL_UNDETERMINED")]  # 名前一致は登録せず要確認
     assert source_by_key(app_role_factory, "JP", "SELLER", "ARETAIL00009") is None
 
 

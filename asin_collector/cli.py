@@ -244,7 +244,7 @@ def _print_discovery(items) -> None:
             print(f"      登録 {r.source_type} source_id={r.source_id} {r.key} 出典{'新規' if r.source_created else '既存'}"
                   f"/経路{'追加' if r.path_created else '既存'}")
         for k in it.skipped:
-            print(f"      見送り {k.key}: {k.reason}")
+            print(f"      見送り {k.key}: {k.reason}" + (f"（{k.detail}）" if k.detail else ""))
 
 
 def _discover_in_browser(factory: SessionFactory, page_market: str, args: argparse.Namespace, run) -> None:

@@ -8,7 +8,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from acquisition.discovery import (
-    MARKETPLACE_IDS, RELEASE_CODE, DiscoveryError, DiscoveryLimits, GuardConfig, InvestigationRow, build_candidates,
+    AMAZON_RETAIL_UNDETERMINED_IDS, HELD_AMAZON, RELEASE_CODE, DiscoveryError, DiscoveryLimits, GuardConfig, InvestigationRow, build_candidates,
     decide_investigation, investigation_target, routes_tag,
 )
 from asin_collector.product_page import (
@@ -179,23 +179,43 @@ def test_build_candidates_excludes_own_and_marketplace_ids_orders_brand_first_an
         ("BRAND_STORE", "https://www.amazon.com/stores/Sony/page/ABCDEF12-3456-7890-ABCD-EF1234567890"),
         ("SELLER", "A2OFFER0002"), ("SELLER", "A3OFFER0003")]
     reasons = {s.key: s.reason for s in skipped}
-    assert reasons["AOWN00000001"] == "OWN_SELLER" and reasons["ATVPDKIKX0DER"] == "MARKETPLACE_ID" and reasons["A4OFFER0004"] == "OVER_LIMIT"
+    assert reasons["AOWN00000001"] == "OWN_SELLER" and reasons["ATVPDKIKX0DER"] == HELD_AMAZON and reasons["A4OFFER0004"] == "OVER_LIMIT"
     only_sellers, _ = build_candidates(page, ["SELLER"], "US", set(), 10, "www.amazon.com")
     assert all(c.source_type == "SELLER" for c in only_sellers)
 
 
-def test_marketplace_ids_are_per_market_and_unverified_amazon_ids_are_not_guessed():
-    assert MARKETPLACE_IDS["US"] == {"ATVPDKIKX0DER"} and MARKETPLACE_IDS["JP"] == {"A1VC38T7YXB528"}
-    # JPのAmazon.co.jp自身の販売元IDは確認できていないため、IDでは除外しない（推測で追加しない）
+def test_ids_matching_a_market_id_are_held_with_evidence_not_declared_non_seller_and_unverified_ids_are_not_added():
+    assert AMAZON_RETAIL_UNDETERMINED_IDS["US"] == {"ATVPDKIKX0DER"} and AMAZON_RETAIL_UNDETERMINED_IDS["JP"] == {"A1VC38T7YXB528"}
+    # JPのAmazon.co.jp自身の販売元IDは確認できていないため、IDを推測して追加しない（名前が一致しない限り登録の候補）
     page = extract_product_page(product_html(offers=["AN1VRQENFRJN5", "A1VC38T7YXB528"]))
     cands, skipped = build_candidates(page, ["SELLER"], "JP", set(), 10, "www.amazon.co.jp")
-    assert [c.key for c in cands] == ["AN1VRQENFRJN5"] and [(s.key, s.reason) for s in skipped] == [("A1VC38T7YXB528", "MARKETPLACE_ID")]
-    # 市場IDは市場ごと: USの市場IDはJPページでは市場IDとして扱わない
+    assert [c.key for c in cands] == ["AN1VRQENFRJN5"]
+    (held,) = skipped
+    assert (held.key, held.reason) == ("A1VC38T7YXB528", HELD_AMAZON)
+    assert "市場IDと一致" in held.detail and "未確認" in held.detail and "領域=VISIBLE_OFFERS" in held.detail  # 断定せず、根拠を残す
+    # 市場IDは市場ごと: USの市場IDはJPページでは保留の対象にならない
     jp = build_candidates(extract_product_page(product_html(offers=["ATVPDKIKX0DER"])), ["SELLER"], "JP", set(), 5, "h")[0]
     assert [c.key for c in jp] == ["ATVPDKIKX0DER"]
 
 
-def test_fba_sellers_shipped_by_amazon_are_kept_and_only_exact_amazon_names_need_review():
+def test_ships_from_display_is_not_a_seller_candidate_and_sold_by_link_is():
+    html = (
+        '<div id="dp-container"><span id="productTitle">T</span><div id="tabular-buybox">'
+        '<div id="fulfillerInfoFeature_feature_div"><a href="/gp/aag/main?seller=ASHIPPER0001">Amazon</a></div>'
+        '<div id="merchantInfoFeature_feature_div"><a id="sellerProfileTriggerId" href="/gp/aag/main?seller=ASOLDBY00001">Real Shop</a></div>'
+        '<a href="/gp/aag/main?seller=ANOROLE00001">No Marker</a></div></div>')
+    page = extract_product_page(html)
+    assert [(s.seller_id, s.role) for s in page.sellers] == [("ASOLDBY00001", "SOLD_BY"), ("ANOROLE00001", "UNSPECIFIED")]
+    assert [(s.seller_id, s.role) for s in page.shippers] == [("ASHIPPER0001", "SHIPS_FROM")]  # 配送元の表示は出典にせず、報告用に分ける
+    cands, _ = build_candidates(page, ["SELLER"], "JP", set(), 10, "www.amazon.co.jp")
+    assert [c.key for c in cands] == ["ASOLDBY00001", "ANOROLE00001"]
+    assert result_from_json(result_to_json(page)) == page  # 保存・再利用でも役割と配送元が保たれる
+    old = result_from_json('{"v": 1, "status": "FOUND", "seller_scope": "BUYBOX_ONLY", "notes": [], "brands": [], '
+                           '"sellers": [{"id": "AOLD00000001", "name": null, "region": "BUYBOX"}]}')
+    assert old.sellers[0].role == "UNSPECIFIED" and old.shippers == []  # 役割を持たない保存形式も読める
+
+
+def test_fba_sellers_shipped_by_amazon_are_kept_and_only_exact_amazon_names_are_held():
     html = (
         '<div id="dp-container"><span id="productTitle">T</span><div id="merchant-info">'
         '<a href="/gp/help/customer/display.html?nodeId=201910130">Amazon</a> から発送、販売元: '
@@ -207,4 +227,5 @@ def test_fba_sellers_shipped_by_amazon_are_kept_and_only_exact_amazon_names_need
     page = extract_product_page(html)
     cands, skipped = build_candidates(page, ["SELLER"], "JP", set(), 10, "www.amazon.co.jp")
     assert [c.key for c in cands] == ["AFBA00000001", "AFBA00000002"]  # 配送元がAmazonなだけ／名前に「Amazon」を含むだけは除外しない
-    assert {(s.key, s.reason) for s in skipped} == {("ARETAIL00001", "NEEDS_REVIEW_AMAZON_NAME"), ("ARETAIL00002", "NEEDS_REVIEW_AMAZON_NAME")}
+    assert {(s.key, s.reason) for s in skipped} == {("ARETAIL00001", HELD_AMAZON), ("ARETAIL00002", HELD_AMAZON)}
+    assert all("表示名がAmazon小売と完全一致" in s.detail for s in skipped)

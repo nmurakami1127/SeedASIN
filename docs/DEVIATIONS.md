@@ -1015,3 +1015,8 @@ PERMANENTLY_EXCLUDEDは引き続き完全除外のまま変更しない。
 - B. 抽出結果の保存先を`error_message`から専用列（`page_extraction JSONB`）へ。
 - C. （代替案）出典種別`ASIN_PAGE`を追加して、claim・lease・間隔を出典と完全に共通化（acquisition_source / acquisition_interval_config / 旧証拠のCHECKとシード、planの対象から除外する処理が要る）。A+Bで足りるなら不要。
 - D. `acquisition_path`の抽出元・セラー範囲・ページ市場・調査runの構造化列（現在はnote JSON）、展開数の上限の設定テーブル化。
+
+**#59 追記2（2026-10-17、初回試行の直前に改訂）**
+- **Amazon小売の扱い（上の「Amazon自身の除外」を置き換え）**: 「リポジトリ・DBに根拠が無い」ことと「そのIDが誤りである」ことは別なので、`ATVPDKIKX0DER`（USの市場ID）や`A1VC38T7YXB528`（JPの市場ID）が**販売元識別子としても使われ得ないとは断定しない**。除外ではなく**登録を保留して根拠を報告**する（`HELD_AMAZON_RETAIL_UNDETERMINED`。根拠＝市場IDとの一致／表示名がAmazon小売と完全一致、リンクの役割・領域・表示名を`Skipped.detail`に残す）。確認できないIDは推測で追加しない（未確認の`AN1VRQENFRJN5`は削除済み）。判定は人が行い、販売元がAmazon小売なら`storefront_blocked_seller`へ（既存記録・`storefront_blocked_seller`はこのコードでは変更しない）。
+- **販売元リンク・販売元表示・配送元表示の区別**: 候補にするのは`seller=`付きのリンク（販売元リンク）だけ。配送元の表示内（fulfillerInfo / shipsFrom 等の目印）のリンクは`shippers`に分けて出典にしない（FBAは配送元がAmazonなだけ）。販売元の表示にIDのリンクが無いものはIDが無いので登録できない。役割の目印が見つからないリンクは`UNSPECIFIED`（決めつけない。目印のマークアップは実ページ未検証）。
+- **抽出結果を`collector_run.error_message`へ保存する方式は暫定**（誤用に近い。`error_message`は本来エラー文）。今回の試行のための追加改修はしないが、**大量運用の前に、専用の保存先（`page_extraction JSONB`列。案B）と、DB側の保護（トリガー拡張・CHECK・部分ユニーク索引。案A）を整える**。AsinPageGuardの保証はアプリ層だけで、生SQL等で保護を迂回できる限界は残る。

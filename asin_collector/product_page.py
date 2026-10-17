@@ -14,6 +14,10 @@ Amazonのマークアップ（bylineInfo / po-brand / merchant-info / aod-offer 
 - `NONE`           : 出品者を抽出できなかった
 商品ページ内の他の領域（おすすめ・広告・関連商品）のリンクは拾わない（認識した領域の内側だけを見る）。
 
+**販売元リンク・販売元表示・配送元表示を区別する**: 候補にするのは`seller=`付きのリンクだけ（販売元リンク）。配送元の表示内
+（fulfillerInfo / shipsFrom 等の目印）にあるものは`shippers`に分けて出典にしない（FBAは配送元がAmazonなだけ）。販売元の表示に
+リンク（ID）が無いものは、IDが無いので登録できない。役割の目印が見つからないリンクは`UNSPECIFIED`として扱い、決めつけない。
+
 **ブランド名・ブランドストアは混同しない**:
 - ブランドストア(BRAND_STORE): bylineInfoのリンクが `/stores/` を指すとき、そのURL
 - ブランド名(BRAND_NAME): bylineInfoのリンクが `rh=...p_89:<名前>`（ブランド絞込）を指すとき、または商品詳細表の
@@ -52,6 +56,7 @@ class SellerRef:
     seller_id: str
     name: str | None
     region: str  # 'VISIBLE_OFFERS' / 'BUYBOX'
+    role: str = "UNSPECIFIED"  # 'SOLD_BY'（販売元の表示内のリンク）/ 'SHIPS_FROM'（配送元の表示内）/ 'UNSPECIFIED'（seller=付きのリンクだが役割の目印なし）
 
 
 @dataclass(frozen=True)
@@ -68,6 +73,7 @@ class ProductPageResult:
     brands: list[BrandRef] = field(default_factory=list)
     seller_scope: str = "NONE"  # VISIBLE_OFFERS / BUYBOX_ONLY / NONE
     notes: list[str] = field(default_factory=list)
+    shippers: list[SellerRef] = field(default_factory=list)  # 配送元の表示内にあった識別子（販売元ではないので出典にしない。報告用）
 
 
 def product_url(market: str, asin: str) -> str:
@@ -79,6 +85,23 @@ def product_url(market: str, asin: str) -> str:
     return f"https://{DOMAIN[market]}/dp/{a}"
 
 
+# 販売元／配送元の表示を見分ける目印（実ページ未検証。外れていれば役割は UNSPECIFIED になり、販売元とも配送元とも決めつけない）
+_SHIPS_MARKERS = ("fulfillerinfo", "shipsfrom", "ships-from", "ships_from")
+_SOLD_MARKERS = ("merchantinfofeature", "sellerprofiletrigger", "soldby", "sold-by", "sold_by")
+
+
+def _role(a) -> str:
+    node, depth = a, 0
+    while node is not None and depth < 8:
+        marks = f"{node.attributes.get('id') or ''} {node.attributes.get('class') or ''}".lower()
+        if any(m in marks for m in _SHIPS_MARKERS):
+            return "SHIPS_FROM"
+        if any(m in marks for m in _SOLD_MARKERS):
+            return "SOLD_BY"
+        node, depth = node.parent, depth + 1
+    return "UNSPECIFIED"
+
+
 def _seller_links(tree: HTMLParser, selectors: tuple[str, ...], region: str) -> list[SellerRef]:
     out: list[SellerRef] = []
     for sel in selectors:
@@ -88,7 +111,7 @@ def _seller_links(tree: HTMLParser, selectors: tuple[str, ...], region: str) -> 
                 m = _SELLER_PARAM.search(a.attributes.get("href") or "")
                 if m:
                     name = (a.text(separator=" ").strip() or None)
-                    out.append(SellerRef(m.group(1).upper(), name, region))
+                    out.append(SellerRef(m.group(1).upper(), name, region, _role(a)))
     return out
 
 
@@ -129,16 +152,19 @@ def extract_product_page(html: str, status: int | None = None) -> ProductPageRes
     offers = _seller_links(tree, _OFFER_SELECTORS, "VISIBLE_OFFERS")
     buybox = _seller_links(tree, _BUYBOX_SELECTORS, "BUYBOX")
     sellers: list[SellerRef] = []
+    shippers: list[SellerRef] = []
     seen: set[str] = set()
     for s in buybox + offers:  # 購入ボックスの出品者を先に、重複は1件
-        if s.seller_id not in seen:
+        if s.role == "SHIPS_FROM":  # 配送元の表示。販売元ではないので出典の候補にしない
+            shippers.append(s)
+        elif s.seller_id not in seen:
             seen.add(s.seller_id)
             sellers.append(s)
-    scope = "VISIBLE_OFFERS" if offers else ("BUYBOX_ONLY" if buybox else "NONE")
+    scope = "VISIBLE_OFFERS" if any(s.region == "VISIBLE_OFFERS" for s in sellers) else ("BUYBOX_ONLY" if sellers else "NONE")
     notes = []
     if scope == "BUYBOX_ONLY":
         notes.append("購入ボックスの出品者のみ（全出品者の取得とは扱わない）")
-    return ProductPageResult("FOUND", sellers=sellers, brands=_brands(tree), seller_scope=scope, notes=notes)
+    return ProductPageResult("FOUND", sellers=sellers, brands=_brands(tree), seller_scope=scope, notes=notes, shippers=shippers)
 
 
 # ---------------------------------------------------------------------- 取得（ブラウザ非依存）
@@ -197,7 +223,8 @@ def result_to_json(r: ProductPageResult) -> str:
 
     return json.dumps({
         "v": 1, "status": r.status, "seller_scope": r.seller_scope, "notes": r.notes,
-        "sellers": [{"id": s.seller_id, "name": s.name, "region": s.region} for s in r.sellers],
+        "sellers": [{"id": s.seller_id, "name": s.name, "region": s.region, "role": s.role} for s in r.sellers],
+        "shippers": [{"id": s.seller_id, "name": s.name, "region": s.region, "role": s.role} for s in r.shippers],
         "brands": [{"type": b.source_type, "key": b.key, "basis": b.basis} for b in r.brands],
     }, ensure_ascii=False)
 
@@ -212,7 +239,8 @@ def result_from_json(text_: str | None) -> ProductPageResult | None:
         if d.get("v") != 1:
             return None
         return ProductPageResult(
-            d["status"], [SellerRef(s["id"], s.get("name"), s["region"]) for s in d["sellers"]],
-            [BrandRef(b["type"], b["key"], b["basis"]) for b in d["brands"]], d["seller_scope"], list(d.get("notes", [])))
+            d["status"], [SellerRef(s["id"], s.get("name"), s["region"], s.get("role", "UNSPECIFIED")) for s in d["sellers"]],
+            [BrandRef(b["type"], b["key"], b["basis"]) for b in d["brands"]], d["seller_scope"], list(d.get("notes", [])),
+            [SellerRef(s["id"], s.get("name"), s["region"], s.get("role", "SHIPS_FROM")) for s in d.get("shippers", [])])
     except (ValueError, KeyError, TypeError):
         return None
