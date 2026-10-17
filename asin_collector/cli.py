@@ -357,7 +357,9 @@ def _add_discovery_options(sp: argparse.ArgumentParser) -> None:
 
 def _add_run_options(sp: argparse.ArgumentParser) -> None:
     sp.add_argument("--market", required=True, choices=["US", "JP"], help="取得先市場（ブラウザプロファイルもこの市場のものを使う）")
-    sp.add_argument("--max-pages", type=int, default=5, help="1出典あたりの最大ページ数（上限で打ち切ると SUCCESS_TRUNCATED。既定: 5）")
+    sp.add_argument("--max-pages", type=int, default=5, help="1出典あたり**新しく保存して進む**最大ページ数（上限で打ち切ると SUCCESS_TRUNCATED。既定: 5）。続き取得での"
+                                                     "前回の最後のページの取り直し(overlap。設定 overlap_pages、既定1)は含まない別枠で、実際のページアクセスは"
+                                                     "最大 max-pages + overlap_pages（5xxの再試行・CAPTCHA後の取り直しは別に数える）")
     sp.add_argument("--max-asins", type=int, default=None, help="1出典あたりの最大ASIN数（任意）")
     sp.add_argument("--require-delivery-match", action="store_true",
                     help="配送先表示が想定の郵便番号と確認できない場合は、claimせずに中止する（既定は警告のみ）")

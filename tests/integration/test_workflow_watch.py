@@ -592,3 +592,70 @@ def test_repeat_input_is_held_until_explicitly_allowed_while_new_asins_are_submi
     eng2.prepare_resume()
     eng2.drive()
     assert next(t for t in submit_tasks(eng2) if t.result["repeat"]).status == "DONE" and env.tool.submits == 2
+
+
+# ---------------------------------------------------------------- 冷却は再実行可能時刻まで飛ばす／実アクセス数は日次上限を超えない／対象指定の取得
+
+def test_a_source_in_cooldown_is_skipped_until_it_can_run_instead_of_every_thirty_minutes(app_role_factory, tmp_path, own, ranked_rows):
+    from tests.integration.test_continuation import decision as source_decision
+
+    r = ranked_rows
+    env = Env(app_role_factory, tmp_path, r["rows"][:1])
+    seller = env.seller[r["o1"]]
+    env.routing.seller_pages[seller] = [[asin10() for _ in range(3)], [asin10() for _ in range(3)]]
+    first = env.run()
+    assert statuses(first)["acquire:US"] == "DONE"
+    # 取得に失敗した別の出典を直接作って、失敗の冷却（既定60分）の挙動を確認する
+    from acquisition.registry import SourceRegistry
+    from tests.integration.acq_helpers import make_runs
+
+    reg = SourceRegistry(app_role_factory, actor="tester")
+    cool = reg.register_path("US", "SELLER", uid("ACL"), "", origin_import_id=env.import_id, origin_asin=r["o1"]).source.source_id
+    runs = make_runs(app_role_factory)
+    c = runs.claim("US", cool)
+    runs.finish(c, "FAILED", error_code="PAGE_LOAD_FAILED")
+    d = source_decision(app_role_factory, cool)
+    assert d.state == "COOLDOWN"
+    until = next(b.until for b in d.blockers if b.code == "COOLDOWN")
+    eng = env.engine()
+    eng.new_state()
+    t = eng.st.tasks["acquire:US"]
+    t.result["market"] = "US"
+    eng._acquire_sources(t, "US", env.import_id, [{"source_id": cool, "market": "US", "source_type": "SELLER", "key": "x"}])
+    assert t.status == "HELD" and "再実行可能" in t.detail
+    from datetime import datetime, timedelta, timezone
+
+    assert t.retry_after == (until + timedelta(seconds=60)).astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")  # 30分後ではなく、冷却が明ける時刻
+
+
+def test_real_page_accesses_including_retries_never_exceed_the_daily_cap(app_role_factory, tmp_path, own, ranked_rows):
+    r = ranked_rows
+    env = Env(app_role_factory, tmp_path, r["rows"][:1], cfg_extra={"daily": {"max_pages": 3}})
+    env.routing.seller_503.add(env.seller[r["o1"]])  # 出典のページが5xxを返し続ける → 再試行も実アクセス
+    eng = env.run()
+    seller_calls = [u for u in env.routing.urls if env.seller[r["o1"]] in u]
+    used = env.engine().usage.used().get("pages", 0)
+    assert used <= 3 and len(env.product_asins_fetched()) + len(seller_calls) <= 3  # 商品ページ1 + 出典の2アクセスで上限(3)に達し、再試行は打ち切られる
+    rec = next(iter(eng.st.tasks["acquire:US"].result["sources"].values()))
+    assert rec["mode"] == "FAILED" and rec["accesses"] == 2
+
+
+def test_fetch_source_goes_through_the_daily_budget_and_counts_the_overlap(app_role_factory, tmp_path, own, ranked_rows):
+    from acquisition.registry import SourceRegistry
+
+    r = ranked_rows
+    env = Env(app_role_factory, tmp_path, r["rows"][:1], cfg_extra={"daily": {"max_pages": 6}})
+    seller = env.seller[r["o1"]]
+    env.routing.seller_pages[seller] = [[asin10() for _ in range(3)] for _ in range(6)]
+    sid = SourceRegistry(app_role_factory, actor="tester").register_source("US", "SELLER", seller).source_id
+    eng = env.engine()
+    a = eng.fetch_source("US", sid, 2, total_cap=5)
+    assert (a["status"], a["plan"], a["accesses"], a["pages"], a["outcome"]) == ("RAN", "FRESH", 2, 2, "SUCCESS_TRUNCATED")
+    b = env.engine().fetch_source("US", sid, 2, total_cap=5)  # 続き: 重なり確認1 + 新規2 = 3アクセス（総数5以内）
+    assert (b["status"], b["plan"], b["accesses"], b["pages"], b["overlap_pages_fetched"]) == ("RAN", "CONTINUE", 3, 2, 1) and b["daily_used"] == 5
+    c = env.engine().fetch_source("US", sid, 2, total_cap=5)  # 日次残り1ページ: 重なり確認だけで新規ページを進められない → 実行しない
+    assert c["status"] == "DAILY_LIMIT" and env.engine().usage.used()["pages"] == 5
+    d = env.engine().fetch_source("US", sid, 2, total_cap=1)
+    assert d["status"] == "CAP_TOO_SMALL"  # overlap(1) + 新規1 > 総数の上限1
+    seller_urls = [u for u in env.routing.urls if seller in u]
+    assert len(seller_urls) == 5  # 実際のアクセスは5件のみ

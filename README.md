@@ -327,3 +327,5 @@ python -m workflow.cli backup  --out backups/wf.zip   /   restore --zip backups/
 - 投入は同じ出典・業務方向の差分だけ（同じ一巡で投入済み・予約済み・結果不明のASINは再送しない。過去の一巡のASINは別の入力にして明示許可を待つ。新しいASINは待たせない）。
 - 除外・保留・期間内の出典の枝は`SKIPPED`（自動で再試行しない）。解除・期間経過後は、状態から再評価されて次の候補選択で続きに選ばれる。
 - **マイグレーション0017の適用は実DBでは未実施。** 適用前のDBに新しいコードを向けるとCLIが案内して終了する。適用手順は docs/DEVIATIONS.md #63 の6。
+
+**取得ページ数の数え方（`--max-pages`・日次上限）**: `--max-pages`（`asin_collector.cli collect-source` / `workflow.cli fetch-source`）は**新しく保存して進むページ数**です。続き取得での前回の最後のページの取り直し（overlap。`overlap_pages`、初期1）は含まない別枠で、実際のページアクセスは最大 `max-pages + overlap_pages` です（5xxの再試行・CAPTCHA後の取り直しも実アクセスとして数えます）。workflow経由の取得は、overlapと再試行を含む実アクセス数を日次（JST）の上限に対して確保してから行い、枠を使い切ったら、それ以上は取得しません（`fetch-source --total-cap N` で、overlapを含む総アクセス数の上限も指定できます）。冷却中の出典は30分ごとに再試行せず、冷却が明ける時刻まで飛ばします。

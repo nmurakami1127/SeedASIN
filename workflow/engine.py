@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import hashlib
+import uuid
 import time
 from datetime import datetime, timedelta, timezone
 from contextlib import ExitStack, contextmanager
@@ -46,6 +47,25 @@ from workflow.store import DONE_STATES, State, Task, WorkflowStore, now_iso, usa
 SUCCESS = tuple(USABLE_FETCH_OUTCOMES)
 POLICY_CODES = ("EXCLUDED", "ON_HOLD", "TOO_RECENT", "REVIEW_LEGACY", "CYCLE_RESTART_LIMIT")  # 方針による枝のスキップ（自動で再試行しない）
 KIND_LABEL = {"discover": "発見", "acquire": "取得", "cross": "反対側展開", "acquire_x": "反対側の取得", "expand": "投入計画", "submit": "投入"}
+
+
+class _BudgetFetcher:
+    """実際のページ取得（fetch呼び出し）を数え、確保した日次枠を超える取得は、追加の枠を確保できた時だけ許す（5xxの再試行・CAPTCHA後の取り直しも
+    実アクセスなので数える）。確保できなければ取得せず失敗として止める。これにより、overlapや再試行を含む実アクセスが日次上限を超えない。"""
+
+    def __init__(self, base, reserved: int, extra) -> None:
+        self._b, self.reserved, self._extra, self.calls = base, reserved, extra, 0
+
+    def fetch(self, url: str):
+        from asin_collector.source_runner import PageLoadError
+
+        if self.calls >= self.reserved and not self._extra():
+            raise PageLoadError("日次のページ上限に達したため、これ以上取得しません（確保した枠を使い切りました）")
+        self.calls += 1
+        return self._b.fetch(url)
+
+    def wait_for_captcha_solved(self) -> None:
+        return self._b.wait_for_captcha_solved()
 
 
 class _NoFetch:
@@ -161,6 +181,15 @@ class Engine:
         with self.ports.fetcher(market) as f:
             yield f
 
+    def _budget(self, fetcher, rid: str, reserved: int, task) -> "_BudgetFetcher":
+        n = {"i": 0}
+
+        def extra() -> bool:
+            n["i"] += 1
+            return self._grant_pages(f"{rid}:x{n['i']}", 1, task) > 0
+
+        return _BudgetFetcher(fetcher, reserved, extra)
+
     def _new_sources_used(self) -> int:
         return usage(self.st)["new_sources"]
 
@@ -252,6 +281,50 @@ class Engine:
             row = conn.execute(text("SELECT status, outcome FROM collector_run WHERE id = :i"), {"i": run_id}).one_or_none()
         return row is not None and row.status == "COMPLETED" and row.outcome in SUCCESS
 
+    # ------------------------------------------------------------------ 対象を指定した1回の取得（日次の使用枠を通す）
+
+    def fetch_source(self, market: str, source_id: int, max_pages: int, *, total_cap: int | None = None) -> dict:
+        """指定した1出典を1回だけ取得する（workflowの工程には載せない）。取得可否は`claim`と同じ判定で、日次のページ使用量（JST）を通す
+        （重なり確認(overlap)を含む実アクセス数を確保してから開く）。max_pagesは「新しく保存して進むページ数」で、overlapは別枠。
+        total_capを渡すと、overlapを含む総アクセス数の上限にする。"""
+        from types import SimpleNamespace
+
+        from acquisition.eligibility import db_now, decide, load_configs, load_facts
+
+        with self.factory.get_session(market) as conn, conn.begin():
+            facts = load_facts(conn, market, [source_id])
+            if not facts:
+                return {"status": "NOT_FOUND", "market": market, "source_id": source_id}
+            d = decide(facts[0], load_configs(conn, market)[facts[0].source_type], db_now(conn))
+        out: dict = {"market": market, "source_id": source_id, "state": d.state, "plan": d.plan, "overlap_pages": d.overlap_pages,
+                     "blockers": [f"{b.code}: {b.detail}" for b in d.blockers]}
+        if not d.eligible:
+            return {**out, "status": "NOT_ELIGIBLE"}
+        new_pages = max_pages if total_cap is None else min(max_pages, total_cap - d.overlap_pages)
+        if new_pages < 1:
+            return {**out, "status": "CAP_TOO_SMALL"}
+        self.st = State(f"manual-{market}-{source_id}", now_iso(), self.cfg.to_dict(), self.cfg.sha256())
+        task = SimpleNamespace(id="manual-fetch")
+        rid = f"manual-fetch:{market}:{source_id}:{uuid.uuid4().hex[:10]}"
+        granted = self._grant_pages(rid, new_pages + d.overlap_pages, task)
+        if granted <= d.overlap_pages:
+            if granted:
+                self.usage.release(rid)
+            return {**out, "status": "DAILY_LIMIT", "daily_used": self.usage.used().get("pages", 0), "daily_cap": self.cfg.daily.max_pages}
+        with self._fetcher(market, True) as fetcher:
+            bf = self._budget(fetcher, rid, granted, task)
+            items = run_batch(self.runs, self.factory, bf, market, [source_id], limits=RunLimits(max_pages=granted - d.overlap_pages),
+                              sleep=self.sleep)
+        it = items[0]
+        if it.result == "SKIPPED":
+            self.usage.release(rid)
+            return {**out, "status": "NOT_CLAIMED", "reason": it.reason}
+        rp = it.report
+        self.usage.commit(rid, {"pages": min(bf.calls, granted)})
+        return {**out, "status": "RAN", "run_id": rp.run_id, "outcome": rp.outcome, "pages": rp.pages, "overlap_pages_fetched": rp.overlap_pages,
+                "accesses": bf.calls, "new_asins": rp.asins, "drift": rp.drift, "error_code": rp.error_code, "detail": rp.detail,
+                "reserved": granted, "daily_used": self.usage.used().get("pages", 0), "daily_cap": self.cfg.daily.max_pages}
+
     # ------------------------------------------------------------------ 発見
 
     def _lane_info(self, lane: str):
@@ -293,10 +366,11 @@ class Engine:
                 return self._set(t, "HELD", f"本日(JST)のAmazon新規取得ページの上限（{self.cfg.daily.max_pages}）に達しています。JST 0:00以降に再開します",
                                  retry_after=self._midnight(), daily_hold="pages")
         with self._fetcher(pm, any(pk.mode == "FETCH" for pk in sel.selected)) as fetcher:
-            items = run_origin_discovery(self.svc, fetcher, ln.origin_import, pm, ln.routes, limits, sleep=self.sleep, selection=sel)
-        actual = sum(1 for i in items if i.kind not in ("REUSED", "BLOCKED"))
+            bf = self._budget(fetcher, rid, granted, t) if granted else fetcher
+            items = run_origin_discovery(self.svc, bf, ln.origin_import, pm, ln.routes, limits, sleep=self.sleep, selection=sel)
+        actual = bf.calls if granted else sum(1 for i in items if i.kind not in ("REUSED", "BLOCKED"))  # 実アクセス数
         if granted:
-            self.usage.commit(rid, {"pages": actual})
+            self.usage.commit(rid, {"pages": min(actual, granted)})  # 追加で確保した分は、確保のまま使用済みとして数える
         t.result["product_pages"] = t.result.get("product_pages", 0) + actual
         t.result["selection"] = {"mode": sel.mode, "scanned": sel.scanned, "done": len(sel.done), "skipped": len(sel.skipped),
                                  "picked": [{"asin": pk.asin, "mode": pk.mode, "units": pk.candidate.units_sum if pk.candidate else None,
@@ -398,16 +472,17 @@ class Engine:
                                           "reason": f"本日(JST)のAmazon新規取得ページの上限（{self.cfg.daily.max_pages}）に達しています"}
                         continue
                     limits = RunLimits(max_pages=granted - overlap, max_asins=lim.max_asins_per_source)
-                    items = run_batch(self.runs, self.factory, fetcher, market, [sid], limits=limits, sleep=self.sleep)
+                    bf = self._budget(fetcher, rid, granted, t)
+                    items = run_batch(self.runs, self.factory, bf, market, [sid], limits=limits, sleep=self.sleep)
                     it = items[0]
                     if it.result == "SKIPPED":  # claimの時点で取得できなかった（他の実行中・状態の変化）→ 一時的な保留として扱う
                         self.usage.release(rid)
                         recs[str(sid)] = {"mode": "HELD", "reason": f"claimできませんでした: {it.reason}"}
                         continue
                     rp = it.report
-                    self.usage.commit(rid, {"pages": rp.pages + rp.overlap_pages})
+                    self.usage.commit(rid, {"pages": min(bf.calls, granted)})
                     base = {"run_id": rp.run_id, "plan": rp.plan, "pages": rp.pages, "overlap_pages": rp.overlap_pages, "asins": rp.asins,
-                            "drift": rp.drift}
+                            "drift": rp.drift, "accesses": bf.calls}
                     if rp.outcome in SUCCESS:
                         recs[str(sid)] = {"mode": "FETCHED", "outcome": rp.outcome, **base, "truncated": rp.outcome == "SUCCESS_TRUNCATED",
                                           "cycle_complete": rp.outcome == "SUCCESS_NONEMPTY"}
@@ -437,7 +512,9 @@ class Engine:
                                   "reason": "; ".join(f"{b.code}({b.detail})" for b in d.blockers)[:300]}
             else:
                 why = "; ".join(f"{b.code}" + (f"({b.detail})" if b.detail else "") for b in (d.blockers if d else [])) or "取得できる状態ではありません"
-                recs[str(sid)] = {"mode": "HELD", "reason": why + "（利用できる保存済みの結果もありません）"}
+                until = max((b.until for b in (d.blockers if d else []) if b.until), default=None)  # 冷却などが明ける時刻（DB時刻）
+                recs[str(sid)] = {"mode": "HELD", "reason": why + "（利用できる保存済みの結果もありません）",
+                                  "retry_at": (until + timedelta(seconds=60)).astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ") if until else None}
         self._save_task(t)
         usable = sum(1 for r in recs.values() if r["mode"] in ("FETCHED", "REUSED"))
         t.result["usable"] = usable
@@ -460,7 +537,15 @@ class Engine:
         if modes.count("FAILED") and not modes.count("HELD"):
             return self._set(t, "FAILED", summary)
         daily = any(r.get("daily") for r in recs.values() if r["mode"] == "HELD")
-        return self._set(t, "HELD", summary + ("。JST 0:00以降に再開します" if daily else ""), retry_after=self._midnight() if daily else None,
+        held = [r for r in recs.values() if r["mode"] == "HELD" and not r.get("daily")]
+        until_all = [r["retry_at"] for r in held if r.get("retry_at")]
+        if daily:
+            retry = self._midnight()
+        elif held and len(until_all) == len(held):
+            retry = min(until_all)  # 冷却中の出典は、30分ごとに再試行せず、再実行可能時刻まで飛ばす
+        else:
+            retry = None
+        return self._set(t, "HELD", summary + ("。JST 0:00以降に再開します" if daily else f"。再実行可能: {retry}" if retry else ""), retry_after=retry,
                          **({"daily_hold": "pages"} if daily else {}))
 
     def _save_task(self, t: Task) -> None:
@@ -521,6 +606,7 @@ class Engine:
                         statuses.append("DAILY")
                         continue
                     with self._fetcher(opp, n_fetch > 0) as fetcher:
+                        fetcher = self._budget(fetcher, crid, n_fetch, t) if n_fetch else fetcher
                         items = run_cross_discovery(self.svc, fetcher, pm, sid, opp, ln.routes, limits, [ln.origin_import],
                                                     max_run_age_days=self.cfg.result_max_age_days, run_id=rec["run_id"], sleep=self.sleep)
                 except DiscoveryError as exc:
@@ -529,10 +615,10 @@ class Engine:
                     continue
                 kinds = [i.kind for i in items]
                 if n_fetch:
-                    self.usage.commit(crid, {"pages": sum(1 for k in kinds if k not in ("REUSED", "BLOCKED"))})
+                    self.usage.commit(crid, {"pages": min(fetcher.calls, n_fetch)})
                 inv = sum(1 for k in kinds if k in ("FOUND", "REUSED", "NOT_FOUND"))
                 quota -= inv
-                t.result["product_pages"] = t.result.get("product_pages", 0) + sum(1 for k in kinds if k not in ("REUSED", "BLOCKED"))
+                t.result["product_pages"] = t.result.get("product_pages", 0) + (fetcher.calls if n_fetch else 0)
                 for i in items:
                     for r in i.registered:
                         r_ = {"source_id": r.source_id, "market": opp, "source_type": r.source_type, "key": r.key}

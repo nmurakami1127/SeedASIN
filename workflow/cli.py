@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import shutil
 import sys
 from pathlib import Path
@@ -222,6 +223,16 @@ def _cmd_watch(a, factory=None, ports=None) -> int:
     return Watcher(cfg, factory or _factory(), ports or RealPorts()).run(max_cycles=a.max_cycles)
 
 
+def _cmd_fetch_source(a, factory=None, ports=None) -> int:
+    """対象の出典を1回だけ取得する（日次のページ使用量とengine_lockを通す。配送先・自社除外・保留・旧証拠・leaseは通常の取得と同じ）。"""
+    cfg = load_config(a.config)
+    eng = _engine(cfg, factory, ports)
+    with eng.store.engine_lock("fetch-source"):
+        out = eng.fetch_source(a.market, a.source_id, a.max_pages, total_cap=a.total_cap)
+    print(json.dumps(out, ensure_ascii=False, indent=1, default=str))
+    return 0 if out.get("status") == "RAN" else 3
+
+
 def _cmd_stop(a, **_) -> int:
     """稼働中のwatchに、安全な区切り（実行中の工程が終わった後）で停止するよう依頼する（Ctrl+Cが使えない時用）。"""
     store = WorkflowStore(a.state_dir)
@@ -297,6 +308,12 @@ def build_parser() -> argparse.ArgumentParser:
     sp = add("watch", _cmd_watch, "常駐: 状態確認→未完了の再開→次の候補の処理→待機→再確認（Ctrl+Cで停止。PC停止中は動かない）")
     sp.add_argument("--config", default="config/workflow.json")
     sp.add_argument("--max-cycles", type=int, default=None, help="（検証用）この回数の確認で終了する")
+    sp = add("fetch-source", _cmd_fetch_source, "指定した1出典を1回だけ取得する（日次のページ使用量を通す。--max-pagesは新しく保存して進むページ数で、overlapは別枠）")
+    sp.add_argument("--config", default="config/workflow.json")
+    sp.add_argument("--market", required=True, choices=["US", "JP"])
+    sp.add_argument("--source-id", required=True, type=int)
+    sp.add_argument("--max-pages", type=int, default=2, help="新しく保存して進む最大ページ数（続きの前の重なり確認(overlap)は含まない別枠）")
+    sp.add_argument("--total-cap", type=int, default=None, help="重なり確認を含む実アクセスの総数の上限（指定すると max-pages をそれに合わせて減らす）")
     sp = add("stop", _cmd_stop, "稼働中のwatchに安全な区切りでの停止を依頼する")
     sp.add_argument("--state-dir", default="exports/workflow")
     sp = add("yield", _cmd_yield, "取得・投入の成果（新規ASIN・投入数・既存の出品成果）を表示（読み取りのみ）")

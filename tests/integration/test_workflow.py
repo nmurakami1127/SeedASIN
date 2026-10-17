@@ -59,6 +59,7 @@ class Routing:
         self.product_seller, self.seller_asins, self.urls = product_seller, seller_asins, []
         self.captcha_products: set[str] = set()
         self.seller_pages: dict[str, list[list[str]]] = {}
+        self.seller_503: set[str] = set()
         self.product_offers: dict[str, tuple] = {}
         self.on_fetch = None
 
@@ -73,6 +74,8 @@ class Routing:
             return FetchedPage(product_html(buybox=self.product_seller.get(m.group(1), "A9NOBODY0001"), offers=self.product_offers.get(m.group(1), ())), url, 200)
         m = re.search(r"me=([A-Z0-9]+)", url)
         if m:
+            if m.group(1) in self.seller_503:
+                return FetchedPage('<html><body><div id="cs_503_logo"></div></body></html>', url, 503)
             pages = self.seller_pages.get(m.group(1))
             if pages:  # 複数ページの出品者一覧（次ページは &page=N+1）
                 pm = re.search(r"[?&]page=(\d+)", url)
