@@ -1020,3 +1020,10 @@ PERMANENTLY_EXCLUDEDは引き続き完全除外のまま変更しない。
 - **Amazon小売の扱い（上の「Amazon自身の除外」を置き換え）**: 「リポジトリ・DBに根拠が無い」ことと「そのIDが誤りである」ことは別なので、`ATVPDKIKX0DER`（USの市場ID）や`A1VC38T7YXB528`（JPの市場ID）が**販売元識別子としても使われ得ないとは断定しない**。除外ではなく**登録を保留して根拠を報告**する（`HELD_AMAZON_RETAIL_UNDETERMINED`。根拠＝市場IDとの一致／表示名がAmazon小売と完全一致、リンクの役割・領域・表示名を`Skipped.detail`に残す）。確認できないIDは推測で追加しない（未確認の`AN1VRQENFRJN5`は削除済み）。判定は人が行い、販売元がAmazon小売なら`storefront_blocked_seller`へ（既存記録・`storefront_blocked_seller`はこのコードでは変更しない）。
 - **販売元リンク・販売元表示・配送元表示の区別**: 候補にするのは`seller=`付きのリンク（販売元リンク）だけ。配送元の表示内（fulfillerInfo / shipsFrom 等の目印）のリンクは`shippers`に分けて出典にしない（FBAは配送元がAmazonなだけ）。販売元の表示にIDのリンクが無いものはIDが無いので登録できない。役割の目印が見つからないリンクは`UNSPECIFIED`（決めつけない。目印のマークアップは実ページ未検証）。
 - **抽出結果を`collector_run.error_message`へ保存する方式は暫定**（誤用に近い。`error_message`は本来エラー文）。今回の試行のための追加改修はしないが、**大量運用の前に、専用の保存先（`page_extraction JSONB`列。案B）と、DB側の保護（トリガー拡張・CHECK・部分ユニーク索引。案A）を整える**。AsinPageGuardの保証はアプリ層だけで、生SQL等で保護を迂回できる限界は残る。
+
+**#59 追記3: 初回の実地試行（2026-10-17、各市場の起点1 ASIN・商品ページ1ページ・SELLER最大3件）**
+自社IDを設定（US: A5FRT2XHYO43T / JP: A3R9V8IM8MACMH、`own-account-add`）。試行前に、test-dbでAsinPageGuardの二重起動拒否・期限切れ後の登録拒否・回収後の旧プロセスの終了確定拒否を確認済み（アプリ層だけの保証）。
+- US: 起点B0076AZHC8（注文9点）→ 商品ページ run=80 `SUCCESS_NONEMPTY` / 抽出範囲`BUYBOX_ONLY`（購入ボックスの1件のみ。全セラー取得ではない）→ SELLER A3AJLR7DMJUOQG（DLC international、リンクの役割=SOLD_BY）を source_id=11 に登録（出典新規・経路ORIGIN_ASIN/EXPORT）。同じページからブランドストア（Panduit）とブランド名（Panduit、詳細表）も抽出して保存（今回はrouteがSELLERのため未登録）。自社除外・Amazon小売の保留・配送元表示: 該当なし。再探索可能（ページ）: 2026-11-16 09:46 UTC。
+- JP: 起点B0B46VP7NS（注文1点）→ run=81 `SUCCESS_NONEMPTY` / `BUYBOX_ONLY` → SELLER A1MN7UZC7MPZTE（TOPSWING2、SOLD_BY）を source_id=12 に登録（IMPORT）。ブランド名「HD Ridez」（詳細表）を保存。自社除外・保留・配送元: 該当なし。再探索可能: 2026-11-16 09:47 UTC。
+- 実ページで確認できたこと: 商品ページの判定マーカー、購入ボックスの販売元リンク（seller=）、販売元表示の役割目印（SOLD_BY）、詳細表のブランド行（po-brand）、bylineのブランドストアリンク。**出品一覧パネル（VISIBLE_OFFERS）は商品ページ内に出なかった**（購入ボックスの1件のみ）ため、他セラーの網羅は別の画面が要る。配送元（SHIPS_FROM）の目印は、この2ページには該当がなく未検証。
+- 出典の取得（セラー取扱ASIN）、反対側展開、統合ツール投入、既存データの変更は行っていない（collector_run id<=77のハッシュ一致、保留・旧RUNNING・レポート無変更）。
