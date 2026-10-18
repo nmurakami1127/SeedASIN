@@ -428,3 +428,28 @@ def test_0018_upgrade_function_is_idempotent_when_rerun(owner):
             module.upgrade()
         n = conn.execute(text("SELECT count(*) FROM pg_constraint WHERE conname IN ('ck_collector_run_end_reached', 'ck_collector_run_interrupt_values', 'ck_aic_overlap_pages')")).scalar_one()
     assert n == 3
+
+
+def test_0018_rollback_past_0017_with_daily_limit_rows_keeps_every_row_and_upgrades_again(owner, superuser_url, app_role_factory, registry):
+    """DAILY_LIMITの中断行がある状態で、0016・0015まで戻しても行は削除されず、再びheadへ上げられる。
+    0016へは行を変更せずに戻る（interrupt_kindの制約はDAILY_LIMITを許す定義のまま残る）。0015へ戻す際は、0016のdowngradeの既存の規則
+    （中断を失敗へ写し、0016の列を外す）がこの行にも同じく適用される（0018の変更ではない）。"""
+    s = new_source(registry)
+    runs = make_runs(app_role_factory)
+    c = runs.claim("US", s.source_id)
+    assert runs.interrupt(c, "DAILY_LIMIT", "日次枠")
+    count = lambda conn: conn.execute(text("SELECT count(*) FROM collector_run")).scalar_one()
+    with owner.begin() as conn:
+        n = count(conn)
+    _alembic(superuser_url, "downgrade", "0016")
+    with owner.begin() as conn:
+        assert count(conn) == n
+        assert tuple(conn.execute(text("SELECT status, interrupt_kind FROM collector_run WHERE id = :i"), {"i": c.run_id}).one()) == ("INTERRUPTED", "DAILY_LIMIT")
+        assert "DAILY_LIMIT" in conn.execute(text("SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conname = 'ck_collector_run_interrupt_values'")).scalar_one()
+    _alembic(superuser_url, "downgrade", "0015")
+    with owner.begin() as conn:
+        assert count(conn) == n
+        assert conn.execute(text("SELECT status FROM collector_run WHERE id = :i"), {"i": c.run_id}).scalar_one() == "FAILED"  # 0016のdowngradeの既存規則
+    _alembic(superuser_url, "upgrade", "head")
+    with owner.begin() as conn:
+        assert count(conn) == n and conn.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0018"

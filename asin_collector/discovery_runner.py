@@ -11,7 +11,8 @@ CAPTCHA待機中も継続）→ 登録の直前にlease確認 → 終了確定�
 同じページの再利用: 30日以内に調査済みなら、ページへ再アクセスせず保存済みの抽出結果から登録する（`REUSED`）。
 別のroute（SELLER→BRAND）を後から求めたときも、調査範囲は取得済みのページ単位なので追加アクセスは不要。
 
-停止条件: CAPTCHAが解けない / 連続して調査に失敗 / leaseを失った → 残りを実行しない。
+停止条件: CAPTCHAが解けない / 連続して調査に失敗 / leaseを失った / 日次のページ枠が尽きた → 残りを実行しない。
+日次枠の不足（DAILY_LIMIT）は調査行を中断（INTERRUPTED/DAILY_LIMIT）として確定し、調査の失敗・冷却・自動停止に数えない。
 """
 from __future__ import annotations
 
@@ -31,7 +32,7 @@ from asin_collector.source_runner import Heartbeat, PageFetcher
 class ItemReport:
     asin: str
     page_market: str
-    kind: str  # FOUND / REUSED / NOT_FOUND / UNCONFIRMED / LOAD_FAILED / SERVER_ERROR / CAPTCHA_UNSOLVED / BLOCKED / REGISTER_ERROR / LEASE_LOST
+    kind: str  # FOUND / REUSED / NOT_FOUND / UNCONFIRMED / LOAD_FAILED / SERVER_ERROR / CAPTCHA_UNSOLVED / BLOCKED / REGISTER_ERROR / LEASE_LOST / DAILY_LIMIT
     run_id: int | None = None
     seller_scope: str | None = None
     registered: list[Registered] = field(default_factory=list)
@@ -64,6 +65,10 @@ def _investigate(svc: DiscoveryService, fetcher: PageFetcher, page_market: str, 
             if hb.lost.is_set():
                 raise LeaseLost("heartbeatでleaseの喪失を検知しました")
             item = ItemReport(asin, page_market, outcome.kind, claim.run_id, detail=outcome.detail)
+            if outcome.kind == "DAILY_LIMIT":  # 失敗ではない: 中断として確定する（leaseを失っていればLEASE_LOST）
+                if not guard.interrupt(claim, "DAILY_LIMIT", outcome.detail):
+                    raise LeaseLost("日次枠での中断の確定時に、leaseを失っていました")
+                return item
             if outcome.kind != "FOUND":
                 guard.finish(claim, outcome.kind, detail=outcome.detail)
                 return item
@@ -102,9 +107,9 @@ def _run(svc, fetcher, page_market, picks, make_record, sleep, stop_after_failur
     for pick in picks:
         item = _investigate(svc, fetcher, page_market, pick, make_record(pick), sleep, heartbeat_interval)
         items.append(item)
-        if item.kind != "BLOCKED":
+        if item.kind not in ("BLOCKED", "DAILY_LIMIT"):  # 日次枠の不足は調査の失敗ではない
             streak = 0 if _ok(item.kind) else streak + 1
-        if item.kind in ("CAPTCHA_UNSOLVED", "LEASE_LOST") or streak >= stop_after_failures:
+        if item.kind in ("CAPTCHA_UNSOLVED", "LEASE_LOST", "DAILY_LIMIT") or streak >= stop_after_failures:
             break
     return items
 

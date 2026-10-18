@@ -61,6 +61,7 @@ class Routing:
         self.seller_pages: dict[str, list[list[str]]] = {}
         self.seller_503: set[str] = set()
         self.seller_empty: set[str] = set()  # 「検索結果0件」ウィジェット付きの0件（確認済みの正常な0件）
+        self.product_503: set[str] = set()  # 商品ページが5xxを返し続ける
         self.product_offers: dict[str, tuple] = {}
         self.on_fetch = None
 
@@ -72,6 +73,8 @@ class Routing:
         if m:
             if m.group(1) in self.captcha_products:
                 return FetchedPage(f"<html>{CAPTCHA}</html>", url, 200)
+            if m.group(1) in self.product_503:
+                return FetchedPage('<html><body><div id="cs_503_logo"></div></body></html>', url, 503)
             return FetchedPage(product_html(buybox=self.product_seller.get(m.group(1), "A9NOBODY0001"), offers=self.product_offers.get(m.group(1), ())), url, 200)
         m = re.search(r"me=([A-Z0-9]+)", url)
         if m:

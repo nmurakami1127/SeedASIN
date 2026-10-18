@@ -792,3 +792,29 @@ def test_restart_limit_and_daily_hold_are_labelled_for_the_user():
     s = wcli.mode_summary(t)
     for want in ("要解除(release)", "保留(日次上限・翌日に続きから)", "新規取得(1ページ目から再試行)・上限打切り", "新規取得(正常な0件)・一巡完了"):
         assert want in s, (want, s)
+
+
+def test_a_daily_budget_refusal_on_a_product_page_never_counts_as_an_investigation_failure(app_role_factory, tmp_path, own, ranked_rows):
+    """商品ページの5xxの再試行で日次枠が尽きる日が、調査の自動停止の回数（3回）を超えて続いても、失敗・冷却・自動停止に数えない。
+    発見の工程は日次の保留（JST 0:00に再開）になり、枠が戻って5xxが直れば同じ商品ページを調べられる。"""
+    from acquisition.discovery import AsinPageGuard
+
+    r = ranked_rows
+    env = Env(app_role_factory, tmp_path, r["rows"][:1], cfg_extra={"daily": {"max_pages": 1}})
+    env.routing.product_503.add(r["o1"])
+    guard = AsinPageGuard(app_role_factory)
+    for day in range(4):
+        eng = env.run()
+        t = eng.st.tasks["discover:US"]
+        assert t.status == "HELD" and t.retry_after == eng._midnight() and "失敗ではありません" in t.detail, (day, t.status, t.detail)
+        assert [i["kind"] for i in t.result["items"]] == ["DAILY_LIMIT"]
+        with app_role_factory.get_session("US") as conn, conn.begin():
+            st = conn.execute(text("SELECT status, interrupt_kind FROM collector_run WHERE id = :i"), {"i": t.result["items"][0]["run_id"]}).one()
+        assert tuple(st) == ("INTERRUPTED", "DAILY_LIMIT")
+        lk = guard.lookup("US", r["o1"])
+        assert (lk.state, lk.failures) == ("ELIGIBLE", 0)  # 冷却にも自動停止(3回)にもならない
+        assert env.engine().usage.used()["pages"] == 1  # 実アクセスは日次上限を超えない
+        env.clock.t += timedelta(days=1)
+    env.routing.product_503.clear()
+    eng = env.run()
+    assert eng.st.tasks["discover:US"].status == "DONE" and [i["kind"] for i in eng.st.tasks["discover:US"].result["items"]] == ["FOUND"]

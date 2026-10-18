@@ -120,6 +120,12 @@ def _migrated_schema(superuser_url: str):
 
     env = os.environ.copy()
     env["SEEDASIN_DATABASE_URL"] = superuser_url
+    # 前回の実行のteardown（downgrade base）が失敗・中断していると、スキーマと行が残ったまま `upgrade head` が何もせずに通り、
+    # 前回の行（期限切れの実行中runなど）が次のテストモジュールへ漏れる（2026-10-18に実際に発生。docs/DEVIATIONS.md #64）。
+    # 毎回、空の状態から作り直す。戻せない場合はここで失敗させ、汚れたDBでテストを続けない。
+    subprocess.run(
+        [sys.executable, "-m", "alembic", "downgrade", "base"], check=True, cwd=_PROJECT_ROOT, env=env
+    )
     subprocess.run(
         [sys.executable, "-m", "alembic", "upgrade", "head"], check=True, cwd=_PROJECT_ROOT, env=env
     )

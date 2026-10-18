@@ -40,7 +40,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 from selectolax.parser import HTMLParser
 
 from asin_collector.browser_session import html_is_captcha, html_is_server_error
-from asin_collector.source_runner import DOMAIN, CaptchaNotSolved, FetchedPage, PageFetcher, PageLoadError
+from asin_collector.source_runner import DOMAIN, AccessBudgetExhausted, CaptchaNotSolved, FetchedPage, PageFetcher, PageLoadError
 
 ASIN_RE = re.compile(r"^[A-Z0-9]{10}$")
 _SELLER_PARAM = re.compile(r"[?&]seller=([A-Za-z0-9]{8,20})(?:[&#]|$)")
@@ -176,7 +176,7 @@ def extract_product_page(html: str, status: int | None = None) -> ProductPageRes
 
 @dataclass
 class PageOutcome:
-    kind: str  # FOUND / NOT_FOUND / UNCONFIRMED / LOAD_FAILED / SERVER_ERROR / CAPTCHA_UNSOLVED
+    kind: str  # FOUND / NOT_FOUND / UNCONFIRMED / LOAD_FAILED / SERVER_ERROR / CAPTCHA_UNSOLVED / DAILY_LIMIT（日次枠の不足。ページを開いていない）
     result: ProductPageResult | None = None
     detail: str | None = None
     url: str | None = None
@@ -194,6 +194,8 @@ def fetch_product_page(
     while True:
         try:
             page: FetchedPage = fetcher.fetch(url)
+        except AccessBudgetExhausted as exc:  # 日次枠が尽きた: ページの失敗ではない（調査の失敗・冷却・自動停止に数えない）
+            return PageOutcome("DAILY_LIMIT", detail=str(exc)[:300], url=url)
         except PageLoadError as exc:
             return PageOutcome("LOAD_FAILED", detail=str(exc)[:300], url=url)
         if html_is_captcha(page.html):

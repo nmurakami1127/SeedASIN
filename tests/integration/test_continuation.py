@@ -208,7 +208,7 @@ def test_process_death_around_the_save_resumes_without_gap_or_duplicate(app_role
     runs.append_asins = orig
     site.hook = None
     expire_run(app_role_factory, "US", claim.run_id)
-    assert runs.reap_expired("US") == [claim.run_id]
+    assert runs.reap_expired("US", src.source_id) == [claim.run_id]  # この出典だけ（他のテストの実行中の行に依存しない）
     r = row(app_role_factory, claim.run_id)
     assert (r.status, r.cycle_state) == ("INTERRUPTED", "OPEN")
     stored = 2 if crash_at == "before_save" else 3
@@ -243,7 +243,7 @@ def test_concurrent_continuation_old_token_and_expired_lease_are_rejected(app_ro
     with pytest.raises(NotEligible):
         runs.claim("US", src.source_id)  # 同時の継続・新しい一巡は始められない
     expire_run(app_role_factory, "US", c2.run_id)
-    runs.reap_expired("US")
+    runs.reap_expired("US", src.source_id)
     with pytest.raises(LeaseLost):
         runs.append_asins(c2, ["B0ZZZZZZ01"], cursor=PageCursor("https://x/9", 9, "https://x/8", "b" * 64, ("B0ZZZZZZ01",)))
     with pytest.raises(LeaseLost):
@@ -554,7 +554,7 @@ def test_stop_after_saving_the_last_page_finalizes_without_refetching_or_going_b
     runs.append_asins, runs.finish = orig_append, orig_finish
     if how != "finish_failed":
         expire_run(app_role_factory, "US", claim.run_id)
-        assert runs.reap_expired("US") == [claim.run_id]  # 回収は既存の経路（INTERRUPTED/LEASE_EXPIRED）
+        assert runs.reap_expired("US", src.source_id) == [claim.run_id]  # 回収は既存の経路（INTERRUPTED/LEASE_EXPIRED）
     r = end_row(app_role_factory, claim.run_id)
     assert r.cycle_state == "OPEN" and r.end_reached is True and r.next_url is None and r.last_page_url == site.u(3)
     assert r.status == ("FAILED" if how == "finish_failed" else "INTERRUPTED")
@@ -592,7 +592,7 @@ def test_null_next_url_alone_is_not_treated_as_the_end(app_role_factory, registr
     go(runs, app_role_factory, site2, s2.source_id, pages=1)
     c = runs.claim("US", s2.source_id)  # 続きのrunが1ページも保存せずに中断 → next_urlはNULLだが末尾ではない
     expire_run(app_role_factory, "US", c.run_id)
-    runs.reap_expired("US")
+    runs.reap_expired("US", s2.source_id)
     assert end_row(app_role_factory, c.run_id).end_reached is None
     assert decision(app_role_factory, s2.source_id).plan == "CONTINUE"
 

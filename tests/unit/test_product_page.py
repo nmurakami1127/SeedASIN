@@ -14,7 +14,7 @@ from acquisition.discovery import (
 from asin_collector.product_page import (
     ProductPageResult, extract_product_page, fetch_product_page, product_url, result_from_json, result_to_json,
 )
-from asin_collector.source_runner import CaptchaNotSolved, FetchedPage, PageLoadError
+from asin_collector.source_runner import AccessBudgetExhausted, CaptchaNotSolved, FetchedPage, PageLoadError
 
 UTC = timezone.utc
 T0 = datetime(2026, 10, 1, 12, 0, tzinfo=UTC)
@@ -238,3 +238,14 @@ def test_missing_brand_leaves_a_diagnostic_note_about_which_markers_were_present
     assert any("bylineInfo=あり(href=なし)" in n for n in odd.notes)
     ok = extract_product_page(product_html(po_brand="Panasonic"))
     assert not any("ブランド未抽出" in n for n in ok.notes)
+
+
+def test_a_daily_budget_refusal_is_not_a_page_failure():
+    """日次枠が尽きてページを開かなかった場合は DAILY_LIMIT（LOAD_FAILEDにしない＝調査の失敗・冷却・自動停止に数えない）。
+    5xxの再試行の途中で枠が尽きた場合も同じ。"""
+    assert fetch_product_page(Seq(AccessBudgetExhausted("枠")), "US", "B000000001").kind == "DAILY_LIMIT"
+    out = fetch_product_page(Seq(FetchedPage("x", "u", 503), AccessBudgetExhausted("枠")), "US", "B000000001", sleep=lambda s: None)
+    assert out.kind == "DAILY_LIMIT"
+    assert fetch_product_page(Seq(PageLoadError("t")), "JP", "B000000001").kind == "LOAD_FAILED"  # 通常の読み込み失敗は従来どおり
+    daily = row("INTERRUPTED", "INTERRUPTED", T0, T0)
+    assert decide_investigation([daily] * 5, T0 + timedelta(seconds=1), GuardConfig()).state == "ELIGIBLE"  # 中断は失敗に数えない

@@ -1225,7 +1225,9 @@ PERMANENTLY_EXCLUDEDは引き続き完全除外のまま変更しない。
 - `collector_run.end_reached BOOLEAN`（NULL可）: 1ページを正常に解析・保存し、そのページに次ページが無かったことを、ASIN・再開位置の保存と同じトランザクションで記録する。制約: TRUEのときは続き取得の行で、`next_url`なし・`last_page_url`ありに限る。既存行はNULL（=末尾到達の記録なし）。
 - `interrupt_kind` に `DAILY_LIMIT` を追加。
 - `acquisition_interval_config.overlap_pages` を0/1に制限（`ck_aic_overlap_pages`）。既に2以上の行がある環境では値を書き換えず`NOT VALID`で付け、アプリが読み込み時に設定エラー（`ConfigError`、直し方の案内つき）で止める。0/1へ直した後に`VALIDATE CONSTRAINT`できる。
-- downgrade: 行は削除・変更しない。`end_reached`列（の値）を外し、overlapの制約を0017の定義に戻す。interrupt_kindの制約は、`DAILY_LIMIT`の行が無ければ0017の定義に戻し、あれば行を書き換えずに`DAILY_LIMIT`を許す定義のまま残す（0017のコードはINTERRUPTEDを失敗に数えないので、そのまま読める）。
+- downgrade: 行は削除・変更しない。`end_reached`列（の値）を外し、overlapの制約を0017の定義（`CHECK (overlap_pages BETWEEN 0 AND 3)`）に戻す。interrupt_kindの制約は、`DAILY_LIMIT`の行が無ければ0017の定義（`CHECK (interrupt_kind IS NULL OR interrupt_kind IN ('USER','USER_ABORT','LEASE_EXPIRED'))`）に戻す。`DAILY_LIMIT`の行があれば、行を書き換えずに、同じ名前の制約を **`ck_collector_run_interrupt_values CHECK (interrupt_kind IS NULL OR interrupt_kind IN ('USER','USER_ABORT','LEASE_EXPIRED','DAILY_LIMIT'))`** のまま残す（NOTICEを出す。0017のコードはINTERRUPTEDを失敗に数えないので、そのまま読める）。
+  - **再upgradeの成立**: 0018のupgradeは、この制約を`DROP CONSTRAINT IF EXISTS`してから同じ定義で作り直すので、残した定義のままでも、0017の定義に戻した後でも成立する（テストで確認: 0018→0017→head、0018→0016→head、0018→0015→head）。
+  - さらに0016以前へ戻した場合: 0017のdowngradeはこの制約に触れない。0016のdowngrade（0015へ）は、既存の規則どおり中断行を失敗（FAILED）へ写して0016の列を外す（DAILY_LIMITの行も同じ扱いで、行は削除されない。0018で変えた動作ではない）。
 
 **1. 最終ページ保存後・finish前の停止（末尾到達の確定 FINALIZE）**
 - 一巡の最新runが`cycle_state='OPEN'`で`end_reached=TRUE`（かつ`next_url`なし・`last_page_url`あり）なら、判定は`END_REACHED` → plan `FINALIZE`（状態`ELIGIBLE_CONTINUATION`、30日待機を適用しない。除外・保留・冷却・leaseは従来どおり先に効く）。**next_urlがNULLというだけでは末尾到達としない**（開始前・1ページ目の失敗・保存前の中断・旧行もNULLのため。それらは従来どおり続き/1ページ目から）。
@@ -1248,13 +1250,19 @@ PERMANENTLY_EXCLUDEDは引き続き完全除外のまま変更しない。
 **4. 日次枠の不足（DAILY_LIMIT）**
 - workflowの取得で、確保した日次枠を使い切り、追加の枠も取れない場合（5xxの再試行・CAPTCHA後の取り直しなど）は、ページを開かずに止め（`AccessBudgetExhausted`）、runを`INTERRUPTED`/`interrupt_kind='DAILY_LIMIT'`で確定する。**失敗ではない**: 連続失敗・冷却・自動保留に数えない。一巡はOPENのままで、再開位置は保存済みの最後のページの次。
 - 枝の記録は日次の保留（`HELD`、`daily`、再実行可能時刻=次のJST 0:00）。同じ取得工程の残りの出典も、その日は開かない。翌JST日付に、保存済みの位置から続ける（取得済みページを取り直さない）。`workflow.cli fetch-source`は`status=DAILY_LIMIT`と`retry_after`を返す。
-- 実アクセス（overlap・再試行・CAPTCHA後の取り直しを含む）は、従来どおり日次上限を超えない。商品ページの調査で枠が尽きた場合の扱い（LOAD_FAILED）は変更していない。
+- 実アクセス（overlap・再試行・CAPTCHA後の取り直しを含む）は、従来どおり日次上限を超えない。
+- **商品ページの調査（追補）**: 枠が尽きてページを開かなかった場合は`PageOutcome.kind='DAILY_LIMIT'`（従来はLOAD_FAILED=調査の失敗で、冷却・3回で自動停止に数えられていた）。調査行は`INTERRUPTED`/`interrupt_kind='DAILY_LIMIT'`で確定し（既存スキーマ0018の範囲内。調査の判定`decide_investigation`は中断を失敗に数えない）、その回の残りの調査を止める（連続失敗にも数えない）。workflowの発見工程は日次の保留（JST 0:00に再開。「失敗ではありません」と表示）、反対側展開は日次の保留。
 
 **5. その他**
 - `overlap_pages`は0/1だけ（`set-cycle-config --overlap-pages`も0/1以外は明確なエラー。黙って1に丸めない）。
 - 正常な0件（`SUCCESS_EMPTY`）を、workflowで「新規取得(正常な0件)・一巡完了」（枝の状態`EMPTY`）として表示する。従来は失敗として表示・扱われていた。投入・反対側展開の対象にはしない。
 - `claim`は`INSERT ... RETURNING id, cycle_id`でDBが確定した`cycle_id`を返し、`RunReport`・workflowの枝の記録・`fetch-source`・`collect-source`の表示に載せる。
 - 投入計画: 台帳（JSON Lines）は1回の計画作成ごとに1回だけ読み、入力ファイルの内容はその計画作成の中だけで再利用する（ファイルは内容のハッシュで名前が決まり書き換えない。台帳の状態は毎回読み直すので、送信前の最新状態の確認は省略しない）。台帳の`all_states()`はファイルを1回だけ読んで畳み込む（従来はキーの数だけ読み直していた）。
+
+**5b. 追補（2026-10-18、実DB適用前の仕上げ）**
+- `carried_from_runs`の対象を、条件として**同じ取得先市場・同じ出典・同じ一巡**に明示（`marketplace`もSQLの条件に追加。RLSでも分かれる）。通しのテストで、中断（日次枠・プロセス死）・失敗（CAPTCHA）が続いた後の続き（CONTINUE）と、末尾到達の確定（FINALIZE）を経て、保存済みのASINが保存順のまま欠落なく次の使える取得runの入力に入ること、全期間で1回ずつになること、別の一巡（BROKEN後の取り直し）・別の出典・別の市場のrunは引き継がないこと、引き継いだASINのうち同じ一巡で投入済み・予約済み・結果不明のものは送らず、未送信と確認済みのものは対象に戻り、過去の一巡で投入済みのものはrepeat入力になることを確認した。引き継ぎを無効にするとこれらのテストが失敗することも確認した。
+- **selectolax の上限**: 1.0.0・1.0.1 は `from selectolax.parser import HTMLParser`（Modestバックエンド）を import 時に `ImportError` で拒否する（クリーンな環境で確認。0.4.13 は可）。本プロジェクトは6モジュールで `selectolax.parser` を使うため、`pyproject.toml` を `selectolax>=0.3,<1.0` にした。lexbor（`selectolax.lexbor`）への移行はHTML解析の結果が変わり得るため、実ページでの再検証が必要（未実施）。
+- **結合テストの状態漏れ（一度発生した失敗の原因）**: 1回だけ `test_process_death_around_the_save...` で `reap_expired("US")` が `[219, 232, 249]` を返して失敗した。原因は、その直前のpytest実行で、当時の0018のdowngradeが`DAILY_LIMIT`行のために例外で止まり（その後、行を残す方式に変更）、モジュール終了時の `alembic downgrade base` が失敗して**スキーマと行が残った**こと。次の実行では `upgrade head` が何もせずに通り、前回の行（期限切れの実行中run）が漏れて、市場全体を回収する `reap_expired("US")` に含まれた。確認: 空のDBではこのテストのrun idは7〜8で、249には届かない／前回の行を模擬して残すと同じ失敗が再現する。対策: (1) `tests/integration/conftest.py` は各モジュールの開始時にも `downgrade base` してから `upgrade head` する（戻せなければその場で失敗し、汚れたDBでテストを続けない）。(2) 継続取得のテストの回収は、そのテストの出典に限定（`reap_expired("US", source_id)`）。これにより、モジュール内で実行中のまま残る他のテストのrun（leaseは300秒）が、実行時間によって巻き込まれることも無くなる。修正後、前回の行を残した状態から実行しても通ることを確認した。製品コードへの影響: なし（テスト基盤とテストの書き方の問題）。
 
 **6. 実DBへの適用手順（未実施。実DBは現在0016）**: #63の6と同じ手順で、`alembic upgrade head`により0017と0018をまとめて適用する（確認時の`alembic current`は0018）。0018は既存行を変更しない。戻す場合は`alembic downgrade 0016`（0018→0017→0016の順に戻り、行は削除されない）。0017だけ適用済みの環境では、`alembic upgrade head`で0018だけが追加される。
 

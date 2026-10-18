@@ -181,12 +181,15 @@ def _items_for(d, part, chunks, is_repeat, run_id, fetch_market, src, key_name, 
 
 def _carried_runs(conn, run) -> list[int]:
     """同じ一巡で、このrunの直前の使える取得runより後に、中断・失敗で終わったrunのid（古い順）。それらが保存したページは、続きの取得で
-    取り直さないので、このrunの入力に引き継ぐ。一巡の無い旧方式のrun・一巡の最初のrunでは空。"""
+    取り直さないので、このrunの入力に引き継ぐ。一巡の無い旧方式のrun・一巡の最初のrunでは空。
+    対象は**同じ取得先市場・同じ出典・同じ一巡**だけ（市場はRLSでも分かれるが、条件として明示する）。別の一巡（BROKEN後の取り直し等）・
+    別の出典・別の市場のrunは引き継がない。"""
     if run.cycle_id is None or not run.cycle_seq or run.cycle_seq <= 1:
         return []
     prev = conn.execute(
-        text("SELECT id, status, outcome FROM collector_run WHERE cycle_id = :c AND source_id = :s AND cycle_seq < :q ORDER BY cycle_seq DESC"),
-        {"c": run.cycle_id, "s": run.source_id, "q": run.cycle_seq}).all()
+        text("SELECT id, status, outcome FROM collector_run WHERE cycle_id = :c AND source_id = :s AND marketplace = :m AND cycle_seq < :q "
+             "ORDER BY cycle_seq DESC"),
+        {"c": run.cycle_id, "s": run.source_id, "m": run.marketplace, "q": run.cycle_seq}).all()
     carried = []
     for r in prev:
         if r.status == "COMPLETED" and r.outcome in USABLE_OUTCOMES:

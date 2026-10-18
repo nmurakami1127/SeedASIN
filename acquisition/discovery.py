@@ -299,15 +299,18 @@ class AsinPageGuard:
                 {"s": status, "o": outcome, "c": code, "d": detail, "n": candidates, "id": claim.run_id},
             )
 
-    def interrupt(self, claim: PageClaim) -> bool:
-        """実行者自身の中断（Ctrl+C）。leaseを失っていれば何もしない（False）。失敗に数えない。"""
+    def interrupt(self, claim: PageClaim, kind: str = "USER", message: str | None = None) -> bool:
+        """実行者自身の中断（Ctrl+C）。leaseを失っていれば何もしない（False）。失敗に数えない。
+        DAILY_LIMIT: 日次のページ枠が尽きてページを開かなかった（失敗・冷却・自動停止に数えない。翌JST日付に調べ直せる）。"""
+        if kind not in ("USER", "DAILY_LIMIT"):
+            raise ValueError("kind must be USER or DAILY_LIMIT")
         try:
             with self._app.get_session(claim.market) as conn, conn.begin():
                 self._lock_valid(conn, claim)
                 conn.execute(
-                    text("UPDATE collector_run SET status = 'INTERRUPTED', outcome = 'INTERRUPTED', interrupt_kind = 'USER', "
-                         "completed_at = clock_timestamp() WHERE id = :id"),
-                    {"id": claim.run_id},
+                    text("UPDATE collector_run SET status = 'INTERRUPTED', outcome = 'INTERRUPTED', interrupt_kind = :k, "
+                         "completed_at = clock_timestamp(), error_message = coalesce(:m, error_message) WHERE id = :id"),
+                    {"id": claim.run_id, "k": kind, "m": message[:500] if message else None},
                 )
             return True
         except LeaseLost:

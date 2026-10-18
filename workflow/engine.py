@@ -427,6 +427,9 @@ class Engine:
             return self._set(t, "WAITING", f"{market}でCAPTCHAが解消されませんでした。ブラウザで解いてから resume してください")
         if "LEASE_LOST" in bad:
             return self._set(t, "FAILED", "実行のleaseを失いました。resumeで再開できます")
+        if "DAILY_LIMIT" in bad and all(k in ("DAILY_LIMIT", "BLOCKED") for k in bad):  # 日次枠の不足は失敗ではない（翌JST日付に調べ直す）
+            return self._set(t, "HELD", f"本日(JST)のAmazon新規取得ページの上限（{self.cfg.daily.max_pages}）に達したため、残りの商品ページを"
+                                        "調べませんでした（失敗ではありません）。JST 0:00以降に再開します", retry_after=self._midnight(), daily_hold="pages")
         if bad and all(k == "BLOCKED" for k in bad):
             return self._set(t, "HELD", "調査が停止中・冷却中・実行中です（" + "; ".join(i.detail or "" for i in items if i.kind == "BLOCKED")[:200] + "）")
         if bad:
@@ -676,7 +679,8 @@ class Engine:
                             new.setdefault(r.source_id, r_)
                 bad = [k for k in kinds if k not in ("FOUND", "REUSED", "NOT_FOUND")]
                 done[str(sid)] = {"ok": not bad, "investigated": inv, "kinds": kinds}
-                statuses += ["CAPTCHA" if k == "CAPTCHA_UNSOLVED" else "BLOCKED" if k == "BLOCKED" else "FAILED" for k in bad]
+                statuses += ["CAPTCHA" if k == "CAPTCHA_UNSOLVED" else "BLOCKED" if k == "BLOCKED" else "DAILY" if k == "DAILY_LIMIT" else "FAILED"
+                             for k in bad]
                 t.result.update({"sources": list(sources.values()), "new_sources": list(new.values())})
                 self._save_task(t)
         t.result.update({"sources": list(sources.values()), "new_sources": list(new.values())})
