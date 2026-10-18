@@ -42,8 +42,15 @@ class Config:
     lease_seconds: int = 300
     captcha_lease_seconds: int = 1800
     cycle_max_age_days: int = 14   # 続き取得の一巡を放置してよい期間（超えたら新しい一巡へ）
-    overlap_pages: int = 1         # 続きの前に取り直す「前回の最後のページ」の数（ページ送りの有効性の確認）
-    max_cycle_restarts: int = 2    # 一巡が異常終了（BROKEN/期限切れ）したあと、先頭から取り直す連続回数の上限
+    overlap_pages: int = 1         # 続きの前に取り直す「前回の最後のページ」の数（0=確認しない / 1。実装が1ページしか取り直さないため2以上は設定エラー）
+    max_cycle_restarts: int = 2    # 一巡が異常終了（BROKEN）したあと、先頭から取り直す連続回数の上限（放置による期限切れは数えない）
+
+
+OVERLAP_PAGES_ALLOWED = (0, 1)
+
+
+class ConfigError(ValueError):
+    """acquisition_interval_config の値が、実装の扱える範囲外（黙って丸めない）。"""
 
 
 @dataclass(frozen=True)
@@ -69,6 +76,7 @@ class RunFact:
     last_page_url: str | None = None
     last_page_signature: str | None = None
     last_page_asins: tuple[str, ...] | None = None
+    end_reached: bool | None = None         # 1ページを正常に解析・保存し、そのページに次ページが無かった（末尾到達。ASIN保存と同じトランザクションで記録）
 
 
 @dataclass(frozen=True)
@@ -78,7 +86,7 @@ class CycleView:
     first_run_id: int
     last_run_id: int
     last_seq: int
-    state: str                       # OPEN / COMPLETE / BROKEN / EXPIRED（OPENのまま期限切れ）/ RUNNING
+    state: str                       # OPEN / COMPLETE / BROKEN / EXPIRED（OPENのまま期限切れ）/ END_REACHED（末尾到達を保存済みで終了確定前に止まった）/ RUNNING
     resume_url: str | None           # 続きの開始位置（保存済みの最後のページの次。1ページも無ければ、そのrunの開始URL）
     resume_page_no: int | None
     last_page_url: str | None        # 重なり確認（overlap）で取り直す、最後に保存したページ
@@ -86,13 +94,16 @@ class CycleView:
     last_page_asins: tuple[str, ...] | None
     ended_at: datetime | None
     restart_streak: int              # この一巡の最初のrunに記録された「異常終了後の取り直しの連続回数」
-    has_pages: bool = False          # この一巡で1ページでも保存済みか（保存が無い一巡は、続きではなく「やり直し」と同じ扱い）
+    has_pages: bool = False          # この一巡で1ページでも保存済みか（保存が無い一巡は、続きではなく1ページ目からの取得: RETRY_FIRST）
 
 
 def resolve_cycle(runs: list["RunFact"], as_of: datetime, cfg: "Config") -> CycleView | None:
     """純粋関数。cycle_idを持つrunが無ければNone（旧方式の出典）。
     決定規則: 最新の一巡 = cycle_idが最大。その一巡の最後のrun = cycle_seqが最大。状態は最後のrunのcycle_state。
-    OPENで最後のrunの終了から cycle_max_age_days を超えていればEXPIRED（COMPLETEにはしない）。"""
+    OPENで最後のrunの終了から cycle_max_age_days を超えていればEXPIRED（COMPLETEにはしない）。
+    OPENの最後のrunに末尾到達（end_reached）が記録されていれば END_REACHED（取得は不要。新しいrunで終了を確定する: FINALIZE）。
+    next_urlがNULLというだけでは末尾到達としない（開始前・1ページ目の失敗・旧行もNULLのため）。末尾到達は期限切れより優先する
+    （取り直す位置が無く、全ページの保存は済んでいるため）。"""
     cyc = [r for r in runs if r.cycle_id is not None]
     if not cyc:
         return None
@@ -105,6 +116,8 @@ def resolve_cycle(runs: list["RunFact"], as_of: datetime, cfg: "Config") -> Cycl
         state = "COMPLETE"   # 再開位置が無いので続きではない。取得間隔の扱いは_counts_as_successが従来どおり判定する
     if active:
         state = "RUNNING"
+    elif state == "OPEN" and last.end_reached and last.last_page_url and not last.next_url:
+        state = "END_REACHED"
     elif state == "OPEN" and last.completed_at is not None and as_of - last.completed_at > timedelta(days=cfg.cycle_max_age_days):
         state = "EXPIRED"
     page = next((r for r in reversed(mine) if r.last_page_url), None)
@@ -253,14 +266,17 @@ def decide(facts: SourceFacts, cfg: Config, as_of: datetime) -> Decision:
 
     # --- 続き取得（最新の一巡の状態）---
     cyc = resolve_cycle(facts.runs, as_of, cfg)
+    # OPEN: 保存済みページがあれば続き(CONTINUE)、無ければ1ページ目からの取得(RETRY_FIRST。同じ一巡の行として記録するが、取得・判定は初回と同じ)
     plan = "FRESH"
     if cyc is not None:
-        plan = {"OPEN": "CONTINUE", "EXPIRED": "RESTART_EXPIRED", "BROKEN": "RESTART_BROKEN", "COMPLETE": "FRESH", "RUNNING": None}[cyc.state]
-    if plan in ("RESTART_EXPIRED", "RESTART_BROKEN") and cyc.restart_streak + 1 > cfg.max_cycle_restarts \
-            and (facts.failure_streak_reset_at is None or cyc.ended_at is None or facts.failure_streak_reset_at < cyc.ended_at):
+        plan = {"OPEN": "CONTINUE" if cyc.has_pages else "RETRY_FIRST", "END_REACHED": "FINALIZE", "EXPIRED": "RESTART_EXPIRED",
+                "BROKEN": "RESTART_BROKEN", "COMPLETE": "FRESH", "RUNNING": None}[cyc.state]
+    # 取り直しの上限は、取得の異常終了（BROKEN）からの取り直しだけに適用する。放置による期限切れ（EXPIRED）は取得の失敗ではないので数えない
+    # （restart_streakも増やさない。lease.claim）。人の解除（failure_streak_reset_at が一巡の終了以後）があれば、同じ履歴では止めない。
+    if plan == "RESTART_BROKEN" and cyc.restart_streak + 1 > cfg.max_cycle_restarts and not cycle_restart_released(facts, cyc):
         blockers.append(Blocker(
             "CYCLE_RESTART_LIMIT",
-            f"一巡が異常終了（{cyc.state}）して先頭から取り直す回数が上限（{cfg.max_cycle_restarts}回）に達しています。"
+            f"一巡が異常終了（BROKEN）して先頭から取り直す回数が上限（{cfg.max_cycle_restarts}回）に達しています。"
             "原因を確認し、release-holdで明示的に解除してください（同じ状態で先頭から何度も取り直すループを防ぐ）"))
 
     # --- 取得間隔 ---
@@ -272,8 +288,8 @@ def decide(facts: SourceFacts, cfg: Config, as_of: datetime) -> Decision:
         if ts is not None and (gate_at is None or ts > gate_at):
             gate_at, gate_basis = ts, basis
     due_at = gate_at + interval if gate_at is not None else None
-    continuing = plan == "CONTINUE" and cyc is not None and cyc.has_pages
-    if due_at is not None and as_of < due_at and not continuing:  # 保存済みのページがある途中の継続取得には30日の待機を適用しない（他の判定は全て通す）
+    continuing = plan in ("CONTINUE", "FINALIZE")
+    if due_at is not None and as_of < due_at and not continuing:  # 保存済みのページがある途中の継続取得・末尾到達の確定には30日の待機を適用しない（他の判定は全て通す）
         blockers.append(
             Blocker(
                 "TOO_RECENT",
@@ -331,8 +347,13 @@ def decide(facts: SourceFacts, cfg: Config, as_of: datetime) -> Decision:
         should_auto_hold=(facts.status == "ACTIVE" and consecutive_failures >= cfg.max_consecutive_failures),
         cycle=cyc,
         plan=plan,
-        overlap_pages=cfg.overlap_pages if continuing and cyc.last_page_url else 0,
+        overlap_pages=cfg.overlap_pages if plan == "CONTINUE" and cyc.last_page_url else 0,
     )
+
+
+def cycle_restart_released(facts: SourceFacts, cyc: CycleView) -> bool:
+    """一巡が終わった後に、人が解除（release）したか。解除後は、同じ履歴で取り直しの上限に再び止められない。"""
+    return facts.failure_streak_reset_at is not None and cyc.ended_at is not None and facts.failure_streak_reset_at >= cyc.ended_at
 
 
 def db_now(conn: Connection) -> datetime:
@@ -349,6 +370,12 @@ def load_configs(conn: Connection, marketplace: str) -> dict[str, Config]:
         ),
         {"mp": marketplace},
     ).all()
+    for r in rows:
+        if r.overlap_pages not in OVERLAP_PAGES_ALLOWED:
+            raise ConfigError(
+                f"acquisition_interval_config（{marketplace}/{r.source_type}）の overlap_pages={r.overlap_pages} は扱えません。"
+                f"続きの前に取り直すのは前回の最後の1ページだけなので、0（確認しない）か1にしてください: "
+                f"python -m acquisition.cli set-cycle-config --market {marketplace} --type {r.source_type} --overlap-pages 1")
     return {
         r.source_type: Config(
             r.min_interval_days, r.empty_counts_as_success, r.truncated_counts_as_success,
@@ -386,7 +413,7 @@ def load_facts(conn: Connection, marketplace: str, source_ids: Iterable[int] | N
         text(
             "SELECT source_id, id, status, outcome, completed_at, lease_expires_at, interrupt_kind, completeness, "
             "cycle_id, cycle_seq, cycle_state, supersedes_cycle_id, cycle_start_reason, restart_streak, start_url, start_page_no, "
-            "next_url, next_page_no, last_page_url, last_page_signature, last_page_asins "
+            "next_url, next_page_no, last_page_url, last_page_signature, last_page_asins, end_reached "
             f"FROM collector_run WHERE source_id IS NOT NULL{run_where} ORDER BY id"
         ),
         params,
@@ -396,7 +423,7 @@ def load_facts(conn: Connection, marketplace: str, source_ids: Iterable[int] | N
                 RunFact(r.id, r.status, r.outcome, r.completed_at, r.lease_expires_at, r.interrupt_kind, r.completeness,
                         r.cycle_id, r.cycle_seq, r.cycle_state, r.supersedes_cycle_id, r.cycle_start_reason, r.restart_streak,
                         r.start_url, r.start_page_no, r.next_url, r.next_page_no, r.last_page_url, r.last_page_signature,
-                        tuple(r.last_page_asins) if r.last_page_asins is not None else None)
+                        tuple(r.last_page_asins) if r.last_page_asins is not None else None, r.end_reached)
             )
     blocked = {
         row.seller_id.strip().upper(): row.reason

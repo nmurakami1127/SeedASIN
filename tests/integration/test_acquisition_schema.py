@@ -51,7 +51,7 @@ def owner(superuser_url):
 def test_fresh_build_has_tables_rls_policies_seed_trigger_and_not_in_all_tables(owner):
     assert not set(ACQUISITION_RLS_TABLES) & set(ALL_TABLES)  # 0003/0004が実行時に読むタプルに入れない
     with owner.connect() as conn:
-        assert conn.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0017"
+        assert conn.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0018"
         rls = dict(conn.execute(text("SELECT relname, relrowsecurity FROM pg_class WHERE relname LIKE 'acquisition%' AND relkind = 'r'")).all())
         assert rls == {t: True for t in ACQUISITION_RLS_TABLES}
         pol = {r[0] for r in conn.execute(text("SELECT tablename FROM pg_policies WHERE tablename LIKE 'acquisition%'"))}
@@ -214,7 +214,7 @@ def test_downgrade_to_0015_and_upgrade_again_on_an_existing_db_preserves_legacy_
                for i, st in enumerate(("RUNNING", "COMPLETED", "FAILED", "CAPTCHA_WAIT"))]
     _alembic(superuser_url, "upgrade", "head")
     with owner.begin() as conn:
-        assert conn.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0017"
+        assert conn.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0018"
         rows = conn.execute(text("SELECT id, status, source_id, attempt_token, lease_expires_at, outcome FROM collector_run WHERE id = ANY(:ids) ORDER BY id"),
                             {"ids": ids}).all()
         assert [r.status for r in rows] == ["RUNNING", "COMPLETED", "FAILED", "CAPTCHA_WAIT"]
@@ -307,7 +307,7 @@ def test_0017_upgrade_from_0016_keeps_existing_runs_untouched_and_downgrade_keep
         conn.execute(text("INSERT INTO collector_asin (marketplace, collector_run_id, asin) VALUES ('US', :r, 'B0OLDRUN01'), ('US', :r, 'B0OLDRUN02')"), {"r": rid})
     _alembic(superuser_url, "upgrade", "head")
     with owner.begin() as conn:
-        assert conn.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0017"
+        assert conn.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0018"
         r = conn.execute(text("SELECT status, outcome, truncation_reason, cycle_id, cycle_seq, cycle_state, next_url, cursor_error FROM collector_run WHERE id = :i"),
                          {"i": rid}).one()
         assert (r.status, r.outcome, r.truncation_reason) == ("COMPLETED", "SUCCESS_TRUNCATED", "PAGE_LIMIT")
@@ -334,7 +334,7 @@ def test_0017_upgrade_from_0016_keeps_existing_runs_untouched_and_downgrade_keep
                 conn.execute(text("UPDATE collector_run SET pages_fetched = 9 WHERE id = :i"), {"i": rid})  # 0016の保護は維持
     _alembic(superuser_url, "upgrade", "head")
     with owner.begin() as conn:
-        assert conn.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0017"
+        assert conn.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0018"
         assert conn.execute(text("SELECT cycle_id FROM collector_run WHERE id = :i"), {"i": rid}).scalar_one() is None
 
 
@@ -349,3 +349,82 @@ def test_0017_upgrade_function_is_idempotent_when_rerun(owner):
             module.upgrade()
         n = conn.execute(text("SELECT count(*) FROM pg_trigger WHERE tgname IN ('trg_collector_run_cycle_init', 'trg_collector_run_guard')")).scalar_one()
     assert n == 2
+
+
+# ---------------------------------------------------------------- 0018（続き取得のレビュー対応）の移行
+
+def test_0018_upgrade_from_0017_keeps_rows_and_an_existing_overlap_above_one_is_not_rewritten(owner, superuser_url, app_role_factory, registry):
+    """0017適用済みの環境（test-db等）へ0018を増分で適用する。既存のrunは無傷でend_reachedはNULL（=末尾到達の記録なし）。
+    既に2以上が入っていたoverlap_pagesは書き換えず（制約はNOT VALID）、アプリが設定エラーとして止める。0/1へ直せば検証済みの制約にできる。"""
+    from acquisition.eligibility import ConfigError, load_configs
+
+    s = new_source(registry)
+    runs = make_runs(app_role_factory)
+    c = runs.claim("US", s.source_id)
+    runs.finish(c, "SUCCESS_TRUNCATED", truncation_reason="PAGE_LIMIT")  # 位置なしの打切り（CLOSED_NO_CURSOR）
+    _alembic(superuser_url, "downgrade", "0017")
+    with owner.begin() as conn:
+        assert conn.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0017"
+        cols = {r[0] for r in conn.execute(text("SELECT column_name FROM information_schema.columns WHERE table_name = 'collector_run'"))}
+        assert "end_reached" not in cols
+        conn.execute(text("UPDATE acquisition_interval_config SET overlap_pages = 3 WHERE marketplace = 'US' AND source_type = 'KEYWORD'"))
+        before = conn.execute(text("SELECT count(*) FROM collector_run")).scalar_one()
+    _alembic(superuser_url, "upgrade", "head")
+    with owner.begin() as conn:
+        assert conn.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0018"
+        assert conn.execute(text("SELECT count(*) FROM collector_run")).scalar_one() == before
+        r = conn.execute(text("SELECT status, cycle_state, end_reached FROM collector_run WHERE id = :i"), {"i": c.run_id}).one()
+        assert tuple(r) == ("COMPLETED", "CLOSED_NO_CURSOR", None)
+        assert conn.execute(text("SELECT overlap_pages FROM acquisition_interval_config WHERE marketplace = 'US' AND source_type = 'KEYWORD'")).scalar_one() == 3
+        assert conn.execute(text("SELECT convalidated FROM pg_constraint WHERE conname = 'ck_aic_overlap_pages'")).scalar_one() is False
+    with app_role_factory.get_session("US") as conn, conn.begin():
+        with pytest.raises(ConfigError, match="overlap_pages=3"):
+            load_configs(conn, "US")
+        conn.execute(text("UPDATE acquisition_interval_config SET overlap_pages = 1 WHERE marketplace = 'US' AND source_type = 'KEYWORD'"))
+    with owner.begin() as conn:
+        conn.execute(text("ALTER TABLE acquisition_interval_config VALIDATE CONSTRAINT ck_aic_overlap_pages"))
+        with pytest.raises(IntegrityError):
+            with conn.begin_nested():
+                conn.execute(text("UPDATE acquisition_interval_config SET overlap_pages = 2 WHERE marketplace = 'US' AND source_type = 'SELLER'"))
+
+
+def test_0018_downgrade_without_daily_limit_rows_restores_the_0017_constraints(owner, superuser_url):
+    with owner.begin() as conn:
+        assert conn.execute(text("SELECT count(*) FROM collector_run WHERE interrupt_kind = 'DAILY_LIMIT'")).scalar_one() == 0  # この順で先に実行する
+    _alembic(superuser_url, "downgrade", "0017")
+    with owner.begin() as conn:
+        assert "DAILY_LIMIT" not in conn.execute(text("SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conname = 'ck_collector_run_interrupt_values'")).scalar_one()
+        assert "3" in conn.execute(text("SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conname = 'ck_aic_overlap_pages'")).scalar_one()
+    _alembic(superuser_url, "upgrade", "head")
+
+
+def test_0018_downgrade_keeps_daily_limit_rows_unchanged_and_can_be_reapplied(owner, superuser_url, app_role_factory, registry):
+    s = new_source(registry)
+    runs = make_runs(app_role_factory)
+    c = runs.claim("US", s.source_id)
+    assert runs.interrupt(c, "DAILY_LIMIT", "日次枠")
+    with owner.begin() as conn:
+        before = conn.execute(text("SELECT status, outcome, interrupt_kind, error_message FROM collector_run WHERE id = :i"), {"i": c.run_id}).one()
+        n = conn.execute(text("SELECT count(*) FROM collector_run")).scalar_one()
+    _alembic(superuser_url, "downgrade", "0017")
+    with owner.begin() as conn:
+        assert conn.execute(text("SELECT count(*) FROM collector_run")).scalar_one() == n
+        assert conn.execute(text("SELECT status, outcome, interrupt_kind, error_message FROM collector_run WHERE id = :i"), {"i": c.run_id}).one() == before
+        assert "DAILY_LIMIT" in conn.execute(text("SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conname = 'ck_collector_run_interrupt_values'")).scalar_one()
+    _alembic(superuser_url, "upgrade", "head")
+    with owner.begin() as conn:
+        assert conn.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0018"
+        assert conn.execute(text("SELECT interrupt_kind FROM collector_run WHERE id = :i"), {"i": c.run_id}).scalar_one() == "DAILY_LIMIT"
+
+
+def test_0018_upgrade_function_is_idempotent_when_rerun(owner):
+    path = _ROOT / "alembic" / "versions" / "0018_continuation_followups.py"
+    spec = importlib.util.spec_from_file_location("mig0018", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    with owner.begin() as conn:
+        with Operations.context(MigrationContext.configure(conn)):
+            module.upgrade()
+            module.upgrade()
+        n = conn.execute(text("SELECT count(*) FROM pg_constraint WHERE conname IN ('ck_collector_run_end_reached', 'ck_collector_run_interrupt_values', 'ck_aic_overlap_pages')")).scalar_one()
+    assert n == 3

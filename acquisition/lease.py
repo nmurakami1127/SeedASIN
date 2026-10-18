@@ -24,7 +24,7 @@ from dataclasses import dataclass
 from sqlalchemy import Connection, text
 from sqlalchemy.exc import IntegrityError
 
-from acquisition.eligibility import Decision, db_now, decide, load_configs, load_facts
+from acquisition.eligibility import Decision, cycle_restart_released, db_now, decide, load_configs, load_facts
 from acquisition.locks import identity_lock
 from db.session import SessionFactory
 
@@ -77,6 +77,7 @@ class PageCursor:
     last_page_url: str
     last_page_signature: str
     last_page_asins: tuple[str, ...]
+    end_reached: bool = False   # このページを正常に解析し、次ページが無かった（末尾到達）。next_urlがNULLであることとは別に明示する
 
 
 @dataclass(frozen=True)
@@ -88,8 +89,8 @@ class Claim:
     lease_seconds: int
     captcha_lease_seconds: int
     # --- 続き取得（claim時にDBの状態から決まる）---
-    plan: str = "FRESH"                 # FRESH / CONTINUE / RESTART_EXPIRED / RESTART_BROKEN
-    cycle_id: int | None = None
+    plan: str = "FRESH"                 # FRESH / CONTINUE / FINALIZE / RETRY_FIRST / RESTART_EXPIRED / RESTART_BROKEN
+    cycle_id: int | None = None         # DBで確定した一巡の識別（新しい一巡はトリガーが自分のidを入れる。INSERT ... RETURNINGで受け取る）
     cycle_seq: int | None = None
     resume_url: str | None = None       # CONTINUE: 続きの開始位置
     resume_page_no: int | None = None
@@ -146,31 +147,37 @@ class AcquisitionRunService:
             plan, cyc = decision.plan or "FRESH", decision.cycle
             cols = {"cycle_seq": 1, "cycle_id": None, "continues_run_id": None, "supersedes_cycle_id": None, "cycle_start_reason": "FRESH",
                     "restart_streak": 0, "start_url": None, "start_page_no": None}
-            if plan == "CONTINUE":
+            if plan in ("CONTINUE", "FINALIZE", "RETRY_FIRST"):
+                # 同じ一巡の次の行（DB上の理由はCONTINUE。トリガーが直前のrunとの連鎖を検証する）。FINALIZEは取得せずに末尾到達を確定するだけ、
+                # RETRY_FIRSTは保存済みページが無いので1ページ目から（開始URLは取得時に記録する）。
+                cont = plan == "CONTINUE"
                 cols.update(cycle_seq=cyc.last_seq + 1, cycle_id=cyc.cycle_id, continues_run_id=cyc.last_run_id, cycle_start_reason="CONTINUE",
-                            restart_streak=None, start_url=cyc.resume_url, start_page_no=cyc.resume_page_no)
+                            restart_streak=None, start_url=cyc.resume_url if cont else None, start_page_no=cyc.resume_page_no if cont else None)
             elif plan in ("RESTART_EXPIRED", "RESTART_BROKEN"):
-                released = facts.failure_streak_reset_at is not None and cyc.ended_at is not None and facts.failure_streak_reset_at >= cyc.ended_at
+                # 取り直しの連続回数: 取得の異常終了(BROKEN)だけを数える。放置による期限切れ(EXPIRED)は取得の失敗ではないので増やさない（前の値のまま）。
+                # 人が解除した後は0から（同じ履歴で再び上限に止められない）。
+                released = cycle_restart_released(facts, cyc)
                 cols.update(supersedes_cycle_id=cyc.cycle_id, cycle_start_reason=plan,
-                            restart_streak=0 if released else cyc.restart_streak + 1)
+                            restart_streak=0 if released else cyc.restart_streak + (1 if plan == "RESTART_BROKEN" else 0))
             try:
-                run_id = conn.execute(
+                row = conn.execute(
                     text(
                         "INSERT INTO collector_run (marketplace, run_type, target, status, source_id, attempt_token, "
                         "heartbeat_at, lease_expires_at, lease_seconds, cycle_seq, cycle_id, continues_run_id, supersedes_cycle_id, "
                         "cycle_start_reason, restart_streak, start_url, start_page_no, cycle_state) "
                         "VALUES (:mp, :rt, :target, 'RUNNING', :sid, CAST(:tok AS uuid), clock_timestamp(), "
                         "clock_timestamp() + make_interval(secs => :ls), :ls, :cycle_seq, :cycle_id, :continues_run_id, :supersedes_cycle_id, "
-                        ":cycle_start_reason, :restart_streak, :start_url, :start_page_no, 'OPEN') RETURNING id"
+                        ":cycle_start_reason, :restart_streak, :start_url, :start_page_no, 'OPEN') RETURNING id, cycle_id"
                     ),
                     {"mp": marketplace, "rt": RUN_TYPE[facts.source_type], "target": target, "sid": source_id,
                      "tok": token, "ls": cfg.lease_seconds, **cols},
-                ).scalar_one()
+                ).one()
             except IntegrityError as exc:
                 raise NotEligible(decide(facts, cfg, db_now(conn))) from exc
+            run_id, cycle_id = row.id, row.cycle_id
         cont = plan == "CONTINUE"
         return Claim(run_id, token, source_id, marketplace, cfg.lease_seconds, cfg.captcha_lease_seconds,
-                     plan=plan, cycle_id=cols["cycle_id"] or (cyc.cycle_id if cont else None), cycle_seq=cols["cycle_seq"],
+                     plan=plan, cycle_id=cycle_id, cycle_seq=cols["cycle_seq"],
                      resume_url=cyc.resume_url if cont else None, resume_page_no=cyc.resume_page_no if cont else None,
                      last_page_url=cyc.last_page_url if cont else None, last_page_signature=cyc.last_page_signature if cont else None,
                      last_page_asins=cyc.last_page_asins if cont else None,
@@ -243,6 +250,8 @@ class AcquisitionRunService:
         回収と競合した場合は、回収後なら何も書かずに LeaseLost。
         cursorを渡すと、**ASINの保存と同じトランザクション**で再開位置（次ページ・最後に保存したページ）を更新する
         （保存済みのページと再開位置が食い違わない: どちらも書かれる/どちらも書かれない）。"""
+        if cursor is not None and cursor.end_reached and cursor.next_url is not None:
+            raise ValueError("末尾到達(end_reached)のページに次ページURLは持てません")
         with self._app.get_session(claim.marketplace) as conn, conn.begin():
             row = self._lock_valid_run(conn, claim)
             if asins:
@@ -251,10 +260,10 @@ class AcquisitionRunService:
                     [{"mp": claim.marketplace, "rid": claim.run_id, "asin": a} for a in asins],
                 )
             params = {"pages": pages, "n": len(asins), "ls": self._lease_expr(row.status, claim), "id": claim.run_id,
-                      "nu": None, "np": None, "lu": None, "ls2": None, "la": None, "has_cursor": cursor is not None}
+                      "nu": None, "np": None, "lu": None, "ls2": None, "la": None, "er": None, "has_cursor": cursor is not None}
             if cursor is not None:
                 params.update(nu=cursor.next_url, np=cursor.next_page_no, lu=cursor.last_page_url, ls2=cursor.last_page_signature,
-                              la=list(cursor.last_page_asins))
+                              la=list(cursor.last_page_asins), er=bool(cursor.end_reached))
             conn.execute(
                 text(
                     "UPDATE collector_run SET pages_fetched = coalesce(pages_fetched, 0) + :pages, "
@@ -264,7 +273,8 @@ class AcquisitionRunService:
                     "next_page_no = CASE WHEN :has_cursor THEN CAST(:np AS integer) ELSE next_page_no END, "
                     "last_page_url = CASE WHEN :has_cursor THEN CAST(:lu AS text) ELSE last_page_url END, "
                     "last_page_signature = CASE WHEN :has_cursor THEN CAST(:ls2 AS char(64)) ELSE last_page_signature END, "
-                    "last_page_asins = CASE WHEN :has_cursor THEN CAST(:la AS text[]) ELSE last_page_asins END "
+                    "last_page_asins = CASE WHEN :has_cursor THEN CAST(:la AS text[]) ELSE last_page_asins END, "
+                    "end_reached = CASE WHEN :has_cursor THEN CAST(:er AS boolean) ELSE end_reached END "
                     "WHERE id = :id"
                 ),
                 params,
@@ -394,19 +404,20 @@ class AcquisitionRunService:
                     held = decision
         return held
 
-    def interrupt(self, claim: Claim, kind: str = "USER") -> bool:
-        """実行者自身による中断（Ctrl+C等）。leaseが既に失われていれば何もしない（False）。"""
-        if kind not in ("USER", "USER_ABORT"):
-            raise ValueError("kind must be USER or USER_ABORT")
+    def interrupt(self, claim: Claim, kind: str = "USER", message: str | None = None) -> bool:
+        """実行者自身による中断（Ctrl+C等）。leaseが既に失われていれば何もしない（False）。
+        DAILY_LIMIT: 日次のページ枠が尽きて止めた（失敗ではない。連続失敗・冷却・自動保留に数えず、一巡はOPENのまま保存済みの位置から再開する）。"""
+        if kind not in ("USER", "USER_ABORT", "DAILY_LIMIT"):
+            raise ValueError("kind must be USER, USER_ABORT or DAILY_LIMIT")
         try:
             with self._app.get_session(claim.marketplace) as conn, conn.begin():
                 self._lock_valid_run(conn, claim)
                 conn.execute(
                     text(
                         "UPDATE collector_run SET status = 'INTERRUPTED', outcome = 'INTERRUPTED', "
-                        "interrupt_kind = :k, completed_at = clock_timestamp() WHERE id = :id"
+                        "interrupt_kind = :k, completed_at = clock_timestamp(), error_message = coalesce(:m, error_message) WHERE id = :id"
                     ),
-                    {"k": kind, "id": claim.run_id},
+                    {"k": kind, "id": claim.run_id, "m": message[:500] if message else None},
                 )
             return True
         except LeaseLost:

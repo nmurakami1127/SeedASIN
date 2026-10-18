@@ -174,7 +174,9 @@ def _print_batch(items) -> None:
         r = it.report
         extra = f" error={r.error_code}" if r.error_code else ""
         held = " 【連続失敗により自動保留】" if r.auto_held else ""
-        print(f"  source_id={it.source_id} run={r.run_id}: {r.outcome} ページ{r.pages} ASIN{r.asins}{extra}{held}"
+        cyc = f" cycle={r.cycle_id}({r.plan})" if r.cycle_id is not None else ""
+        done = " 一巡完了" if r.outcome in ("SUCCESS_NONEMPTY", "SUCCESS_EMPTY") else ""
+        print(f"  source_id={it.source_id} run={r.run_id}{cyc}: {r.outcome}{done} ページ{r.pages} ASIN{r.asins}{extra}{held}"
               + (f" {r.detail}" if r.detail and r.outcome != "SUCCESS_NONEMPTY" else ""))
 
 

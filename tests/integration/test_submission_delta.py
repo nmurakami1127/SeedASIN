@@ -121,7 +121,7 @@ def test_occupancy_is_pure_on_the_ledger_and_ignores_the_same_run(tmp_path):
     ledger = SubmissionLedger(tmp_path / "ledger.jsonl")
     phantom(ledger, tmp_path, "a", run_id=1, source_id=5, source_key="S", cycle_key="c1", asins=["B0A"], events=("SUBMIT_STARTED",))
     phantom(ledger, tmp_path, "b", run_id=2, source_id=5, source_key="S", cycle_key="c2", asins=["B0B"], events=())
-    by_cycle, others = _occupancy(ledger, run_id=2, source_id=5, direction="EXPORT", market="US")
+    by_cycle, others = _occupancy(ledger.all_states(), run_id=2, source_id=5, direction="EXPORT", market="US")
     assert by_cycle == {"c1": {"B0A"}} and others == []  # 自分のrun(2)は除く
-    by_cycle, others = _occupancy(ledger, run_id=3, source_id=6, direction="EXPORT", market="US")
+    by_cycle, others = _occupancy(ledger.all_states(), run_id=3, source_id=6, direction="EXPORT", market="US")
     assert by_cycle == {} and {o["source_id"] for o in others} == {5}

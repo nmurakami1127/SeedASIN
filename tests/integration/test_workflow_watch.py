@@ -636,8 +636,67 @@ def test_real_page_accesses_including_retries_never_exceed_the_daily_cap(app_rol
     seller_calls = [u for u in env.routing.urls if env.seller[r["o1"]] in u]
     used = env.engine().usage.used().get("pages", 0)
     assert used <= 3 and len(env.product_asins_fetched()) + len(seller_calls) <= 3  # 商品ページ1 + 出典の2アクセスで上限(3)に達し、再試行は打ち切られる
-    rec = next(iter(eng.st.tasks["acquire:US"].result["sources"].values()))
-    assert rec["mode"] == "FAILED" and rec["accesses"] == 2
+    sid, rec = next(iter(eng.st.tasks["acquire:US"].result["sources"].items()))
+    # 枠が尽きて止めたのは取得先の失敗ではない: 日次の保留（JST 0:00に再開）。DB上は INTERRUPTED(DAILY_LIMIT) で、失敗・冷却に数えない
+    assert (rec["mode"], rec["daily"], rec["outcome"], rec["accesses"]) == ("HELD", True, "DAILY_LIMIT", 2)
+    assert eng.st.tasks["acquire:US"].status == "HELD" and eng.st.tasks["acquire:US"].retry_after == eng._midnight()
+    d = _decision(app_role_factory, int(sid))
+    assert d.consecutive_failures == 0 and not any(b.code == "COOLDOWN" for b in d.blockers) and d.eligible
+    with app_role_factory.get_session("US") as conn, conn.begin():
+        row = conn.execute(text("SELECT status, interrupt_kind, cycle_state FROM collector_run WHERE id = :i"), {"i": rec["run_id"]}).one()
+    assert tuple(row) == ("INTERRUPTED", "DAILY_LIMIT", "OPEN")
+
+
+def _decision(factory, source_id, market="US"):
+    from acquisition.eligibility import db_now, decide, load_configs, load_facts
+
+    with factory.get_session(market) as conn, conn.begin():
+        f = load_facts(conn, market, [source_id])[0]
+        return decide(f, load_configs(conn, market)[f.source_type], db_now(conn))
+
+
+def test_daily_cap_mid_continuation_never_counts_as_a_failure_and_resumes_from_the_saved_position_next_jst_day(
+        app_role_factory, tmp_path, own, ranked_rows):
+    """続き取得の途中で日次枠が尽きた（5xxの再試行で枠を使い切る。CAPTCHA後の取り直しも同じ枠の確認を通る）→ 失敗にも冷却にも自動保留にも数えず、翌JST日付に、
+    保存済みの位置から続ける（取得済みのページを取り直さない）。日次の実アクセスは上限を超えない。"""
+    from acquisition.registry import SourceRegistry
+
+    r = ranked_rows
+    env = Env(app_role_factory, tmp_path, r["rows"][:1], cfg_extra={"daily": {"max_pages": 4}})
+    seller = env.seller[r["o1"]]
+    pages = [[asin10() for _ in range(3)] for _ in range(4)]
+    env.routing.seller_pages[seller] = pages
+    sid = SourceRegistry(app_role_factory, actor="tester").register_source("US", "SELLER", seller).source_id
+    a = env.engine().fetch_source("US", sid, 2)
+    assert (a["status"], a["outcome"], a["pages"]) == ("RAN", "SUCCESS_TRUNCATED", 2) and a["cycle_id"] == a["run_id"]  # DBで確定したcycle_id
+    seen = {"n": 0}
+
+    def busy_once(url):  # 続きの最初のページ（3ページ目）で1回だけ5xx → 再試行も実アクセス
+        if "page=3" in url and seen["n"] == 0:
+            seen["n"] += 1
+            env.routing.seller_503.add(seller)
+        else:
+            env.routing.seller_503.discard(seller)
+
+    env.routing.on_fetch = busy_once
+    b = env.engine().fetch_source("US", sid, 2)  # 残り枠2 = 重なり確認1 + 新規1。5xxの再試行で枠が尽きる
+    assert b["status"] == "DAILY_LIMIT" and b["outcome"] == "DAILY_LIMIT" and b["cycle_id"] == a["cycle_id"]
+    assert env.engine().usage.used()["pages"] == 4  # 実アクセスは上限(4)を超えない
+    d = _decision(app_role_factory, sid)
+    assert d.consecutive_failures == 0 and d.plan == "CONTINUE" and not d.blockers  # 失敗・冷却に数えない。同じ位置から続けられる
+    with app_role_factory.get_session("US") as conn, conn.begin():
+        assert conn.execute(text("SELECT status FROM acquisition_source WHERE source_id = :s"), {"s": sid}).scalar_one() == "ACTIVE"
+    c = env.engine().fetch_source("US", sid, 2)
+    assert c["status"] == "DAILY_LIMIT" and "accesses" not in c  # 同じ日のうちは開かない
+    env.routing.on_fetch = None
+    env.routing.seller_503.discard(seller)  # 再試行は枠の確認で止まり、サイトには届いていない
+    env.routing.urls.clear()
+    env.clock.t += timedelta(hours=14)  # 翌JST日付
+    e = env.engine().fetch_source("US", sid, 5)
+    assert (e["status"], e["outcome"], e["plan"]) == ("RAN", "SUCCESS_NONEMPTY", "CONTINUE"), (e["error_code"], e["detail"])
+    assert e["cycle_id"] == a["cycle_id"]
+    seller_urls = [u for u in env.routing.urls if seller in u]
+    assert not any("page=" not in u for u in seller_urls)  # 1ページ目は取り直さない（保存済みの位置から）
 
 
 def test_fetch_source_goes_through_the_daily_budget_and_counts_the_overlap(app_role_factory, tmp_path, own, ranked_rows):
@@ -659,3 +718,77 @@ def test_fetch_source_goes_through_the_daily_budget_and_counts_the_overlap(app_r
     assert d["status"] == "CAP_TOO_SMALL"  # overlap(1) + 新規1 > 総数の上限1
     seller_urls = [u for u in env.routing.urls if seller in u]
     assert len(seller_urls) == 5  # 実際のアクセスは5件のみ
+
+
+# ---------------------------------------------------------------- 続き取得のレビュー対応（DEVIATIONS #64）: 表示・末尾到達の確定
+
+def test_a_verified_zero_result_is_a_completed_cycle_not_a_failure(app_role_factory, tmp_path, own, ranked_rows):
+    r = ranked_rows
+    env = Env(app_role_factory, tmp_path, r["rows"][:1])
+    seller = env.seller[r["o1"]]
+    env.routing.seller_empty.add(seller)
+    eng = env.run()
+    t = eng.st.tasks["acquire:US"]
+    sid, rec = next(iter(t.result["sources"].items()))
+    assert (rec["mode"], rec["outcome"], rec["cycle_complete"], rec["truncated"]) == ("EMPTY", "SUCCESS_EMPTY", True, False)
+    assert rec["cycle_id"] == rec["run_id"]  # DBで確定したcycle_idを記録する
+    assert t.status == "DONE" and "正常な0件1件（一巡完了）" in t.detail
+    assert "新規取得(正常な0件)・一巡完了" in wcli.mode_summary(t) and "失敗" not in wcli.mode_summary(t)
+    assert not submit_tasks(eng)  # 投入するASINは無い（失敗ではない）
+    d = _decision(app_role_factory, int(sid))
+    assert d.consecutive_failures == 0 and d.state == "TOO_RECENT"  # 一巡完了から30日
+
+
+def test_a_cycle_whose_last_page_was_saved_before_a_crash_is_finalized_by_the_workflow_without_opening_amazon(
+        app_role_factory, tmp_path, own, ranked_rows):
+    from acquisition.lease import AcquisitionRunService
+    from asin_collector.source_runner import RunLimits, run_claimed_source
+    from tests.integration.acq_helpers import expire_run
+
+    r = ranked_rows
+    env = Env(app_role_factory, tmp_path, r["rows"][:1],
+              cfg_extra={"daily": {"max_pages": 100, "max_new_submissions_per_direction": 10}, "limits": {"pages_per_source": 1}})
+    seller = env.seller[r["o1"]]
+    env.routing.seller_pages[seller] = [[asin10() for _ in range(3)] for _ in range(2)]
+    w1 = env.run()  # 1ページ目で打切り（OPEN）、そのASINは投入済み
+    sid = int(next(iter(w1.st.tasks["acquire:US"].result["sources"])))
+    runs = AcquisitionRunService(app_role_factory, actor="tester")
+    claim = runs.claim("US", sid)
+    orig = runs.append_asins
+
+    def die_after_last(c, asins, pages=1, *, cursor=None):
+        n = orig(c, asins, pages, cursor=cursor)
+        if cursor and cursor.end_reached:
+            raise Crash()
+        return n
+
+    runs.append_asins = die_after_last
+    with pytest.raises(Crash):
+        run_claimed_source(runs, app_role_factory, env.routing, claim, limits=RunLimits(max_pages=5), sleep=lambda s: None)
+    expire_run(app_role_factory, "US", claim.run_id)
+    n_urls = len(env.routing.urls)
+    w2 = env.run()  # 回収 → 末尾到達の確定（FINALIZE）。Amazonのページは開かない
+    assert len(env.routing.urls) == n_urls
+    rec = w2.st.tasks["acquire:US"].result["sources"][str(sid)]
+    assert (rec["mode"], rec["plan"], rec["outcome"], rec["cycle_complete"], rec["accesses"]) == ("FETCHED", "FINALIZE", "SUCCESS_NONEMPTY", True, 0)
+    assert "(末尾到達の確定・取得なし)・一巡完了" in wcli.mode_summary(w2.st.tasks["acquire:US"])
+    from tool_submission.ledger import SubmissionLedger
+
+    led = SubmissionLedger(tmp_path / "sub" / "ledger.jsonl")
+    sent = [x for w in (w1, w2) for t in submit_tasks(w)
+            for x in __import__("pathlib").Path(led.state(t.result["key"]).manifest["input_file"]).read_text(encoding="utf-8").split() if x]
+    all_asins = [a for pg in env.routing.seller_pages[seller] for a in pg]
+    assert sorted(sent) == sorted(all_asins) and len(sent) == len(set(sent))  # 中断したrunが保存した末尾ページのASINも、1回だけ投入される
+
+
+def test_restart_limit_and_daily_hold_are_labelled_for_the_user():
+    from types import SimpleNamespace
+
+    t = SimpleNamespace(kind="acquire", result={"sources": {
+        "1": {"mode": "SKIPPED_POLICY", "codes": ["CYCLE_RESTART_LIMIT"], "needs_release": True},
+        "2": {"mode": "HELD", "daily": True, "outcome": "DAILY_LIMIT"},
+        "3": {"mode": "FETCHED", "plan": "RETRY_FIRST", "cycle_complete": False, "truncated": True},
+        "4": {"mode": "EMPTY", "plan": "FRESH", "cycle_complete": True}}})
+    s = wcli.mode_summary(t)
+    for want in ("要解除(release)", "保留(日次上限・翌日に続きから)", "新規取得(1ページ目から再試行)・上限打切り", "新規取得(正常な0件)・一巡完了"):
+        assert want in s, (want, s)

@@ -16,6 +16,10 @@ heartbeat は別スレッドで続け、CAPTCHAの人の待機中も切らさな
 - FAILED             1ページ目から取得できなかった（読み込み失敗・5xx・CAPTCHA未解決）
 - UNVERIFIED_EMPTY   0件に見えるが0件と確認できない（ウィジェット無し、または未検証の種別）。**成功にしない**
 - INTERRUPTED        実行者のCtrl+C（失敗に数えない）。leaseの失効は別系統（回収）
+- DAILY_LIMIT        日次のページ枠が尽きて止めた（INTERRUPTED(DAILY_LIMIT)として確定。失敗に数えず、保存済みの位置から再開する）
+
+続き取得（Claim.plan）: CONTINUE=保存済みの次ページから / FINALIZE=末尾到達を保存済みで終了確定前に止まった一巡を、取得せずに完了として確定 /
+RETRY_FIRST=保存済みページが無い一巡を1ページ目から（初回と同じ判定。確認済みの0件はSUCCESS_EMPTY）。
 
 **実ページで未検証のもの**: 0件ウィジェットでの0件判定が検証済みなのはSELLER（ストアフロント検索）だけ
 （docs/DEVIATIONS.md #53）。KEYWORD/BRAND_NAME/BRAND_STOREの0件は、ウィジェットがあっても UNVERIFIED_EMPTY
@@ -54,6 +58,11 @@ class CaptchaNotSolved(Exception):
     """CAPTCHAが待機時間内に解かれなかった（回避はしない。人の手動対応が必要）。"""
 
 
+class AccessBudgetExhausted(PageLoadError):
+    """日次のページ枠を使い切ったため、ページを開かなかった（取得先の失敗ではない）。
+    PageLoadErrorの派生にしているのは、商品ページの調査など、これを区別しない既存の呼び出し側が従来どおり動くため。"""
+
+
 @dataclass
 class FetchedPage:
     html: str
@@ -89,7 +98,7 @@ class RunReport:
     auto_held: bool = False
     overlap_pages: int = 0       # 続きの前に取り直したページ数（日次のページ使用量に含める）
     drift: bool = False          # 重なり確認で、検索結果の変化を検知した（欠落の可能性）
-    plan: str = "FRESH"          # FRESH / CONTINUE / RESTART_*
+    plan: str = "FRESH"          # FRESH / CONTINUE / FINALIZE / RETRY_FIRST / RESTART_*
     cycle_id: int | None = None
 
 
@@ -202,6 +211,11 @@ def run_claimed_source(
                 report.error_code, report.detail = stop.code, stop.detail
             if hb.lost.is_set():
                 raise LeaseLost("heartbeatでleaseの喪失を検知しました")
+            if outcome == "DAILY_LIMIT":  # 失敗ではない: 中断として確定し、一巡はOPENのまま（位置は保存済みの最後のページの次）
+                if not service.interrupt(claim, "DAILY_LIMIT", report.detail):
+                    raise LeaseLost("日次枠での中断の確定時に、leaseを失っていました")
+                report.outcome = "DAILY_LIMIT"
+                return report
             held = service.finish(claim, outcome, truncation_reason=trunc, error_code=report.error_code,
                                   error_message=report.detail, pages_fetched=report.pages)
             report.outcome, report.auto_held = outcome, held is not None
@@ -234,6 +248,8 @@ def _get(service, fetcher, claim, url, limits, sleep, hb, pages_saved: int) -> F
             raise LeaseLost("取得中にleaseを失いました")
         try:
             page = fetcher.fetch(url)
+        except AccessBudgetExhausted as exc:
+            raise _Stop("DAILY_LIMIT", "DAILY_LIMIT", str(exc)[:300]) from exc
         except PageLoadError as exc:
             raise _Stop(fail_outcome, "PAGE_LOAD_FAILED", str(exc)[:300]) from exc
         if html_is_captcha(page.html):
@@ -265,6 +281,11 @@ def _crawl(service, fetcher, claim, src, start_url, limits, sleep, hb, report: R
     続き(CONTINUE)では、前回の最後に保存したページを `overlap_pages` だけ取り直して（ASINは入れない）ページ送りが有効か確認し、
     保存済みの次ページから続ける。取得済みのASINは重ねて保存しない。ループする次ページ・繰り返すページ・無効な次ページは
     BROKEN（一巡を完了にも正常な0件にもしない）。検索結果は時間で変わるため、これで欠落が無いとは保証できない（driftとして記録する）。"""
+    if claim.plan == "FINALIZE":
+        # 前回のrunが末尾のページを正常に解析・保存し（end_reached）、終了確定の前に止まった。取得し直さずに、この一巡を完了として確定する
+        # （30日間隔の起点は、この確定の時刻）。前回のrunの行は書き換えない（終了後の行は保護トリガーで不変）。
+        return "SUCCESS_NONEMPTY", None
+    # 途中の継続取得は、保存済みページがある一巡だけ（RETRY_FIRSTは保存済みページが無いので、1ページ目から初回と同じ判定をする）
     continuing = claim.plan == "CONTINUE" and bool(claim.resume_url)
     seen: set[str] = service.cycle_asins(claim) if continuing else set()
     visited: set[str] = set()
@@ -314,7 +335,7 @@ def _crawl(service, fetcher, claim, src, start_url, limits, sleep, hb, report: R
             raise _Stop("PARTIAL", "NO_NEW_ASINS_LOOP", "新しいASINが2ページ続けて0件でした（ループの疑い）")
         seen.update(new)
         nxt = find_next_url(page.html, page.url)
-        cursor = PageCursor(nxt, page_no + 1 if nxt else None, page.url, sig, tuple(cards))
+        cursor = PageCursor(nxt, page_no + 1 if nxt else None, page.url, sig, tuple(cards), end_reached=not nxt)
         service.append_asins(claim, new, pages=1, cursor=cursor)  # lease・トークンを確認し、ASIN保存と再開位置を同じトランザクションで保存
         report.pages += 1
         report.asins += len(new)
@@ -452,7 +473,7 @@ def run_batch(
         report = run_claimed_source(service, app, fetcher, claim, limits=limits, sleep=sleep,
                                     heartbeat_interval=heartbeat_interval)
         items.append(BatchItem(sid, str(sid), "RAN", report))
-        if report.outcome == "LEASE_LOST":
+        if report.outcome in ("LEASE_LOST", "DAILY_LIMIT"):  # 日次枠が尽きた: 残りも開けない（失敗には数えない）
             break
         streak = 0 if report.outcome.startswith("SUCCESS") else streak + 1
         if streak >= stop_after_failures:

@@ -472,3 +472,306 @@ def test_cycle_settings_are_configurable_and_default_to_the_approved_values(app_
         assert tuple(conn.execute(text("SELECT cycle_max_age_days, overlap_pages, max_cycle_restarts FROM acquisition_interval_config "
                                        "WHERE marketplace = 'US' AND source_type = 'SELLER'")).one()) == (7, 0, 2)
     assert _cmd_set_cycle_config(types.SimpleNamespace(market="US", type="SELLER", cycle_max_age_days=999, overlap_pages=None, max_cycle_restarts=None), ctx) == 2  # 範囲外は拒否
+
+
+# ================================================================ レビュー指摘への対応（DEVIATIONS #64、マイグレーション0018）
+
+from sqlalchemy import create_engine  # noqa: E402
+
+from acquisition.eligibility import ConfigError  # noqa: E402
+from asin_collector.check_recommendations import NO_RESULTS_MARKER  # noqa: E402
+from tests.integration.acq_helpers import set_config  # noqa: E402
+
+
+def backdate(superuser_url, run_ids, days):
+    """終了済みのrunの時刻を過去へ動かす（使い捨てtest-db専用。終了後の行は保護トリガーで書き換えられないため、このセッションだけトリガーを止める）。"""
+    eng = create_engine(superuser_url)
+    with eng.begin() as conn:
+        conn.execute(text("SET LOCAL session_replication_role = replica"))
+        conn.execute(text("UPDATE collector_run SET started_at = started_at - make_interval(days => :d), "
+                          "completed_at = completed_at - make_interval(days => :d) WHERE id = ANY(:ids)"), {"d": days, "ids": list(run_ids)})
+    eng.dispose()
+
+
+def run_ids_of_source(factory, source_id):
+    with factory.get_session("US") as conn, conn.begin():
+        return [r[0] for r in conn.execute(text("SELECT id FROM collector_run WHERE source_id = :s ORDER BY id"), {"s": source_id})]
+
+
+def end_row(factory, run_id):
+    with factory.get_session("US") as conn, conn.begin():
+        return conn.execute(text("SELECT status, outcome, interrupt_kind, cycle_state, end_reached, next_url, last_page_url, error_code "
+                                 "FROM collector_run WHERE id = :i"), {"i": run_id}).one()
+
+
+def plan_input(factory, run_id, tmp_path):
+    from tool_submission.planner import build_items
+
+    items, files = build_items(factory, "US", run_id, out_dir=tmp_path / "out", direction_override="EXPORT")
+    return items, [a for f in files for a in f.decode().split()]
+
+
+# ---------------------------------------------------------------- 1. 最終ページ保存後・finish前の停止
+
+@pytest.mark.parametrize("how", ["process_death", "lease_expired", "finish_failed"])
+def test_stop_after_saving_the_last_page_finalizes_without_refetching_or_going_back_to_the_start(
+        app_role_factory, registry, runs, fast_cfg, tmp_path, how):
+    pages = mk_pages(3)
+    src, site = new_site(app_role_factory, registry, pages)
+    c1, _ = go(runs, app_role_factory, site, src.source_id, pages=1)  # 1ページ目 → OPEN
+    claim = runs.claim("US", src.source_id)  # 続き: 2,3ページ目（3ページ目が末尾）
+    assert claim.plan == "CONTINUE"
+    orig_append, orig_finish = runs.append_asins, runs.finish
+    if how == "process_death":
+        def append_then_die(c, asins, pages=1, *, cursor=None):
+            n = orig_append(c, asins, pages, cursor=cursor)
+            if cursor and cursor.end_reached:
+                raise Crash()  # 末尾のページを保存した直後、finishの前にプロセスが死ぬ
+            return n
+        runs.append_asins = append_then_die
+        with pytest.raises(Crash):
+            run_claimed_source(runs, app_role_factory, site, claim, limits=RunLimits(max_pages=9), sleep=lambda s: None)
+    elif how == "lease_expired":
+        def append_then_expire(c, asins, pages=1, *, cursor=None):
+            n = orig_append(c, asins, pages, cursor=cursor)
+            if cursor and cursor.end_reached:
+                expire_run(app_role_factory, "US", c.run_id)  # 保存後にleaseが切れた（finishは拒否される）
+            return n
+        runs.append_asins = append_then_expire
+        rep = run_claimed_source(runs, app_role_factory, site, claim, limits=RunLimits(max_pages=9), sleep=lambda s: None)
+        assert rep.outcome == "LEASE_LOST"
+    else:
+        state = {"n": 0}
+
+        def finish_fails_once(c, outcome, **kw):
+            state["n"] += 1
+            if state["n"] == 1:
+                raise RuntimeError("DB接続が切れた（疑似）")  # 終了確定そのものが失敗 → 既存の失敗処理がPARTIALで確定する
+            return orig_finish(c, outcome, **kw)
+        runs.finish = finish_fails_once
+        rep = run_claimed_source(runs, app_role_factory, site, claim, limits=RunLimits(max_pages=9), sleep=lambda s: None)
+        assert (rep.outcome, rep.error_code) == ("PARTIAL", "EXCEPTION")
+    runs.append_asins, runs.finish = orig_append, orig_finish
+    if how != "finish_failed":
+        expire_run(app_role_factory, "US", claim.run_id)
+        assert runs.reap_expired("US") == [claim.run_id]  # 回収は既存の経路（INTERRUPTED/LEASE_EXPIRED）
+    r = end_row(app_role_factory, claim.run_id)
+    assert r.cycle_state == "OPEN" and r.end_reached is True and r.next_url is None and r.last_page_url == site.u(3)
+    assert r.status == ("FAILED" if how == "finish_failed" else "INTERRUPTED")
+    d = decision(app_role_factory, src.source_id)
+    assert (d.plan, d.state, d.overlap_pages) == ("FINALIZE", "ELIGIBLE_CONTINUATION", 0)
+    site.urls.clear()
+    c3, rep3 = go(runs, app_role_factory, site, src.source_id, pages=5)
+    assert site.urls == []  # 先頭にも途中にも戻らず、ページを開かない
+    assert (rep3.outcome, rep3.plan, rep3.pages, rep3.cycle_id) == ("SUCCESS_NONEMPTY", "FINALIZE", 0, c1.run_id)
+    z = row(app_role_factory, c3.run_id)
+    assert (z.cycle_state, z.cycle_seq, z.continues_run_id, z.cycle_start_reason) == ("COMPLETE", 3, claim.run_id, "CONTINUE")
+    assert end_row(app_role_factory, claim.run_id) == r  # 前のrunの行は変わらない（終了後の行は不変。旧プロセスの書き込みを復活させない）
+    with pytest.raises(LeaseLost):
+        runs.append_asins(claim, ["B0LATE0001"], cursor=PageCursor(None, None, site.u(3), "c" * 64, ("B0LATE0001",), end_reached=True))
+    with pytest.raises(LeaseLost):
+        runs.finish(claim, "SUCCESS_NONEMPTY")
+    d = decision(app_role_factory, src.source_id)
+    assert d.state == "TOO_RECENT" and d.gate_basis == "RUN" and d.plan == "FRESH"  # 一巡完了: ここから30日
+    # 中断したrunが保存した末尾のページのASINは、次の使える取得runの入力に引き継がれる（どこからも投入されない、を防ぐ）
+    items, sent = plan_input(app_role_factory, c3.run_id, tmp_path)
+    assert sorted(sent) == sorted(pages[1] + pages[2]) and items[0].carried_from_runs == [claim.run_id]
+    _, sent1 = plan_input(app_role_factory, c1.run_id, tmp_path)
+    assert sent1 == pages[0]  # 1回目のrunは自分のASINだけ（引き継ぎ無し）
+
+
+def test_null_next_url_alone_is_not_treated_as_the_end(app_role_factory, registry, runs, fast_cfg):
+    """next_urlがNULLでも、末尾到達の記録(end_reached)が無ければ完了扱いにしない（1ページ目の失敗・保存前の中断）。"""
+    src, site = new_site(app_role_factory, registry, mk_pages(2))
+    site.captcha_pages = {1}
+    c1, rep = go(runs, app_role_factory, site, src.source_id)
+    r = end_row(app_role_factory, c1.run_id)
+    assert rep.outcome == "FAILED" and (r.next_url, r.end_reached, r.cycle_state) == (None, None, "OPEN")
+    assert decision(app_role_factory, src.source_id).plan == "RETRY_FIRST"
+    s2, site2 = new_site(app_role_factory, registry, mk_pages(3, prefix="B0Q"))
+    go(runs, app_role_factory, site2, s2.source_id, pages=1)
+    c = runs.claim("US", s2.source_id)  # 続きのrunが1ページも保存せずに中断 → next_urlはNULLだが末尾ではない
+    expire_run(app_role_factory, "US", c.run_id)
+    runs.reap_expired("US")
+    assert end_row(app_role_factory, c.run_id).end_reached is None
+    assert decision(app_role_factory, s2.source_id).plan == "CONTINUE"
+
+
+def test_end_reached_requires_a_saved_last_page_without_a_next_url(app_role_factory, registry, runs):
+    src = new_source(registry, "US")
+    claim = runs.claim("US", src.source_id)
+    with pytest.raises(ValueError):
+        runs.append_asins(claim, ["B0A0000009"], cursor=PageCursor("https://x/2", 2, "https://x/1", "a" * 64, ("B0A0000009",), end_reached=True))
+    with pytest.raises(DBAPIError):  # アプリを通さない書き込みもDBの制約で拒否する
+        with app_role_factory.get_session("US") as conn, conn.begin():
+            conn.execute(text("UPDATE collector_run SET end_reached = true WHERE id = :i"), {"i": claim.run_id})  # 最後に保存したページが無い
+    assert asins_of(app_role_factory, claim.run_id) == []
+
+
+# ---------------------------------------------------------------- 2. 取り直しの上限・期限切れ・解除
+
+def test_expired_cycles_restart_through_claim_and_the_trigger_without_counting_toward_the_limit(
+        app_role_factory, registry, runs, fast_cfg, superuser_url):
+    src, site = new_site(app_role_factory, registry, mk_pages(4))
+    for i in range(4):  # 放置による期限切れを、上限(2)を超えて繰り返しても止めない（取得の失敗ではない）
+        c, rep = go(runs, app_role_factory, site, src.source_id, pages=1)
+        assert rep.outcome == "SUCCESS_TRUNCATED"
+        y = row(app_role_factory, c.run_id)
+        if i:
+            assert (y.cycle_start_reason, y.restart_streak, y.cycle_seq) == ("RESTART_EXPIRED", 0, 1)  # 取り直しの連続回数は増やさない
+        backdate(superuser_url, [c.run_id], 15)
+        d = decision(app_role_factory, src.source_id)
+        assert (d.plan, d.state) == ("RESTART_EXPIRED", "ELIGIBLE_RESTART") and not d.blockers
+    with app_role_factory.get_session("US") as conn, conn.begin():
+        chain = conn.execute(text("SELECT supersedes_cycle_id FROM collector_run WHERE source_id = :s AND cycle_seq = 1 ORDER BY id"),
+                             {"s": src.source_id}).scalars().all()
+    assert chain[0] is None and all(x is not None for x in chain[1:])  # 旧一巡は完了にせず、理由つきで置き換えた（DBのトリガーを通過）
+
+
+def _broken_cycle(runs, factory, base, source_id, tag):
+    """1ページ取得 → 続きで重なりが合わずBROKEN、を1回起こす。"""
+    site = Site(mk_pages(4, prefix=f"B0{tag}"), base)
+    go(runs, factory, site, source_id, pages=1)
+    site.override[1] = site.html([f"B0X{tag}{j:05d}"[:10] for j in range(3)], 1)
+    _, rep = go(runs, factory, site, source_id, pages=1)
+    assert rep.error_code == "OVERLAP_MISMATCH"
+
+
+def test_limit_is_reached_only_by_broken_restarts_then_held_and_release_does_not_stop_it_again_on_the_same_history(
+        app_role_factory, registry, runs, fast_cfg, superuser_url):
+    src = new_source(registry, "US")
+    base = source_url("US", load_source(app_role_factory, "US", src.source_id))
+    _broken_cycle(runs, app_role_factory, base, src.source_id, "R1")  # streak 0 → BROKEN
+    _broken_cycle(runs, app_role_factory, base, src.source_id, "R2")  # streak 1 → BROKEN
+    # 途中で放置による期限切れを挟んでも、連続回数は増えも減りもしない
+    site = Site(mk_pages(4, prefix="B0R3"), base)
+    c, _ = go(runs, app_role_factory, site, src.source_id, pages=1)
+    assert row(app_role_factory, c.run_id).restart_streak == 2
+    backdate(superuser_url, [c.run_id], 15)
+    c2, _ = go(runs, app_role_factory, site, src.source_id, pages=1)
+    assert (row(app_role_factory, c2.run_id).cycle_start_reason, row(app_role_factory, c2.run_id).restart_streak) == ("RESTART_EXPIRED", 2)
+    site.override[1] = site.html(["B0XGONE001", "B0XGONE002", "B0XGONE003"], 1)
+    _, rep = go(runs, app_role_factory, site, src.source_id, pages=1)  # 3回目のBROKEN → 上限
+    assert rep.error_code == "OVERLAP_MISMATCH" and rep.auto_held
+    with app_role_factory.get_session("US") as conn, conn.begin():
+        st = conn.execute(text("SELECT status, hold_reason FROM acquisition_source WHERE source_id = :s"), {"s": src.source_id}).one()
+    assert tuple(st) == ("ON_HOLD", "AUTO_CYCLE_RESTARTS")
+    d = decision(app_role_factory, src.source_id)
+    assert d.state == "ON_HOLD" and "CYCLE_RESTART_LIMIT" in [b.code for b in d.blockers]
+    registry.release("US", src.source_id, "原因を確認した")
+    d = decision(app_role_factory, src.source_id)
+    assert (d.state, d.plan) == ("ELIGIBLE_RESTART", "RESTART_BROKEN") and not d.blockers
+    _broken_cycle(runs, app_role_factory, base, src.source_id, "R4")  # 解除後の取り直しは0から: もう一度BROKENでも、同じ履歴で即座に止めない
+    with app_role_factory.get_session("US") as conn, conn.begin():
+        assert conn.execute(text("SELECT status FROM acquisition_source WHERE source_id = :s"), {"s": src.source_id}).scalar_one() == "ACTIVE"
+        streaks = conn.execute(text("SELECT restart_streak FROM collector_run WHERE source_id = :s AND cycle_seq = 1 ORDER BY id"),
+                               {"s": src.source_id}).scalars().all()
+    assert streaks[-1] == 0
+    assert decision(app_role_factory, src.source_id).state == "ELIGIBLE_RESTART"
+
+
+def test_a_limit_shown_on_an_active_source_can_be_released_with_the_usual_command(app_role_factory, registry, runs, fast_cfg):
+    """自動保留を経ずに上限に達した出典（上限の設定を下げた等）も、案内どおり release で解除できる。保留でも上限でもない出典の release は従来どおり拒否。"""
+    src = new_source(registry, "US")
+    base = source_url("US", load_source(app_role_factory, "US", src.source_id))
+    _broken_cycle(runs, app_role_factory, base, src.source_id, "S1")
+    _broken_cycle(runs, app_role_factory, base, src.source_id, "S2")  # streak 1 → BROKEN（上限2なので保留しない）
+    set_config(app_role_factory, "US", "SELLER", max_cycle_restarts=1)  # 上限を下げた
+    d = decision(app_role_factory, src.source_id)
+    assert d.state == "CYCLE_RESTART_LIMIT"
+    with pytest.raises(NotEligible):
+        runs.claim("US", src.source_id)
+    registry.release("US", src.source_id, "上限を下げたので確認した")
+    d = decision(app_role_factory, src.source_id)
+    assert (d.state, d.plan) == ("ELIGIBLE_RESTART", "RESTART_BROKEN")
+    c = runs.claim("US", src.source_id)
+    assert row(app_role_factory, c.run_id).restart_streak == 0
+    with app_role_factory.get_session("US") as conn, conn.begin():
+        ev = conn.execute(text("SELECT event_type, detail FROM acquisition_source_event WHERE source_id = :s ORDER BY event_id DESC LIMIT 1"),
+                          {"s": src.source_id}).one()
+    assert ev.event_type == "RELEASE" and "CYCLE_RESTART_LIMIT" in ev.detail
+    other = new_source(registry, "US")
+    with pytest.raises(ValueError, match="保留・除外されていません"):
+        registry.release("US", other.source_id, "対象外")
+
+
+# ---------------------------------------------------------------- 3. 保存済みページが無い一巡の再試行
+
+def test_a_cycle_without_saved_pages_retries_from_the_first_page_and_a_verified_zero_completes_it(app_role_factory, registry, runs, fast_cfg):
+    src, site = new_site(app_role_factory, registry, mk_pages(2))
+    site.captcha_pages = {1}
+    c1, rep = go(runs, app_role_factory, site, src.source_id)  # 1ページ目でCAPTCHA未解決 → 保存なしでOPEN
+    assert rep.outcome == "FAILED"
+    d = decision(app_role_factory, src.source_id)
+    assert (d.plan, d.state, d.overlap_pages) == ("RETRY_FIRST", "ELIGIBLE_NEVER", 0)
+    site.captcha_pages = set()
+    site.override[1] = f'<html><body><div {NO_RESULTS_MARKER}>no results</div></body></html>'  # 出品が0件になった（確認済みの0件）
+    site.urls.clear()
+    c2, rep2 = go(runs, app_role_factory, site, src.source_id)
+    assert (rep2.outcome, rep2.error_code, rep2.plan) == ("SUCCESS_EMPTY", None, "RETRY_FIRST")  # CURSOR_INVALIDにしない
+    assert site.urls == [site.u(1)]
+    z = row(app_role_factory, c2.run_id)
+    assert (z.cycle_state, z.cycle_seq, z.continues_run_id, z.cycle_id, z.start_url) == ("COMPLETE", 2, c1.run_id, c1.run_id, site.u(1))
+    assert rep2.cycle_id == c1.run_id
+    assert decision(app_role_factory, src.source_id).state == "TOO_RECENT"
+
+
+def test_retry_first_with_results_saves_from_page_one_while_a_mid_cycle_continuation_still_rejects_an_empty_cursor(
+        app_role_factory, registry, runs, fast_cfg):
+    src, site = new_site(app_role_factory, registry, mk_pages(3))
+    site.captcha_pages = {1}
+    go(runs, app_role_factory, site, src.source_id)
+    site.captcha_pages = set()
+    site.urls.clear()
+    c, rep = go(runs, app_role_factory, site, src.source_id, pages=1)
+    assert (rep.plan, rep.outcome, rep.overlap_pages) == ("RETRY_FIRST", "SUCCESS_TRUNCATED", 0) and site.urls == [site.u(1)]
+    site.override[2] = "<html><body>該当なし</body></html>"
+    _, rep2 = go(runs, app_role_factory, site, src.source_id, pages=1)  # 保存済みページがある途中の続きは、0件を位置の無効として扱う（従来どおり）
+    assert (rep2.plan, rep2.error_code) == ("CONTINUE", "CURSOR_INVALID")
+
+
+# ---------------------------------------------------------------- overlap_pages 0/1 と 2以上の拒否・cycle_id
+
+def test_overlap_zero_skips_the_recheck_and_values_above_one_are_rejected(app_role_factory, registry, runs, fast_cfg, superuser_url):
+    import types
+
+    from acquisition.cli import _cmd_set_cycle_config
+
+    set_config(app_role_factory, "US", "SELLER", overlap_pages=0)
+    src, site = new_site(app_role_factory, registry, mk_pages(6))
+    go(runs, app_role_factory, site, src.source_id, pages=2)
+    assert decision(app_role_factory, src.source_id).overlap_pages == 0
+    site.urls.clear()
+    c2, rep = go(runs, app_role_factory, site, src.source_id, pages=2)
+    assert site.urls == [site.u(3), site.u(4)] and rep.overlap_pages == 0 and row(app_role_factory, c2.run_id).overlap_pages is None
+    ctx = types.SimpleNamespace(app_factory=app_role_factory)
+    for bad in (2, 3):
+        a = types.SimpleNamespace(market="US", type="SELLER", cycle_max_age_days=None, overlap_pages=bad, max_cycle_restarts=None)
+        assert _cmd_set_cycle_config(a, ctx) == 2  # 黙って1に丸めない
+    with pytest.raises(DBAPIError):  # CLIを通さない書き込みもDBの制約で拒否する
+        set_config(app_role_factory, "US", "SELLER", overlap_pages=2)
+    # 制約より前から2以上が入っていた環境（0018はNOT VALIDで付け、値を書き換えない）: 読み込み時に設定エラーとして止める
+    eng = create_engine(superuser_url)
+    with eng.begin() as conn:
+        conn.execute(text("SET LOCAL session_replication_role = replica"))
+        conn.execute(text("ALTER TABLE acquisition_interval_config DROP CONSTRAINT ck_aic_overlap_pages"))
+        conn.execute(text("UPDATE acquisition_interval_config SET overlap_pages = 2 WHERE marketplace = 'US' AND source_type = 'SELLER'"))
+        conn.execute(text("ALTER TABLE acquisition_interval_config ADD CONSTRAINT ck_aic_overlap_pages CHECK (overlap_pages BETWEEN 0 AND 1) NOT VALID"))
+    eng.dispose()
+    with pytest.raises(ConfigError, match="overlap_pages=2"):
+        decision(app_role_factory, src.source_id)
+    with pytest.raises(ConfigError):
+        runs.claim("US", src.source_id)
+    a = types.SimpleNamespace(market="US", type="SELLER", cycle_max_age_days=None, overlap_pages=1, max_cycle_restarts=None)
+    assert _cmd_set_cycle_config(a, ctx) == 0  # 案内どおり0/1へ直せば使える
+    assert decision(app_role_factory, src.source_id).plan == "CONTINUE"
+
+
+def test_claim_returns_the_cycle_id_confirmed_by_the_database(app_role_factory, registry, runs, fast_cfg):
+    src, site = new_site(app_role_factory, registry, mk_pages(3))
+    c1 = runs.claim("US", src.source_id)
+    assert c1.cycle_id == c1.run_id == row(app_role_factory, c1.run_id).cycle_id  # 新しい一巡: トリガーが確定したid
+    rep = run_claimed_source(runs, app_role_factory, site, c1, limits=RunLimits(max_pages=1), sleep=lambda s: None)
+    assert rep.cycle_id == c1.run_id
+    c2, rep2 = go(runs, app_role_factory, site, src.source_id, pages=1)
+    assert c2.cycle_id == rep2.cycle_id == c1.run_id

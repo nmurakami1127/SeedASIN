@@ -112,6 +112,7 @@ class SubmissionItem:
     same_cycle_excluded: int = 0  # 同じ一巡で既に投入（送信開始済み・結果不明・投入予約を含む）したため、この入力から除いたASIN数
     fetched_from: dict | None = None  # 実際の取得記録（取得run・出典・一巡）。collector_asinにある事実
     also_from: list[dict] = field(default_factory=list)  # 他の出典の投入入力にも同じASINがある（台帳の入力から推定した参照情報。取得記録ではない）
+    carried_from_runs: list[int] = field(default_factory=list)  # 同じ一巡で中断・失敗に終わったrunが保存したASINを、この入力に引き継いだ（取得記録のrun id）
 
     @property
     def status(self) -> str:

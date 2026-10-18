@@ -225,6 +225,12 @@ def _cmd_set_cycle_config(a, ctx) -> int:
 
     cols = {"cycle_max_age_days": a.cycle_max_age_days, "overlap_pages": a.overlap_pages, "max_cycle_restarts": a.max_cycle_restarts}
     cols = {k: v for k, v in cols.items() if v is not None}
+    from acquisition.eligibility import OVERLAP_PAGES_ALLOWED
+
+    if "overlap_pages" in cols and cols["overlap_pages"] not in OVERLAP_PAGES_ALLOWED:
+        print(f"[中止] --overlap-pages は 0（重なり確認なし）か 1 だけを指定できます（指定: {cols['overlap_pages']}）。"
+              "続きの前に取り直すのは前回の最後の1ページだけです")
+        return 2
     if not cols:
         print("[中止] 更新する項目を指定してください")
         return 2
@@ -523,7 +529,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp = add("set-cycle-config", _cmd_set_cycle_config, "続き取得の設定（一巡の放置期限・重なり確認のページ数・取り直しの上限）を更新する")
     sp.add_argument("--type", required=True, choices=["SELLER", "BRAND_NAME", "BRAND_STORE", "KEYWORD"])
     sp.add_argument("--cycle-max-age-days", type=int, default=None, help="既定14（1〜365）")
-    sp.add_argument("--overlap-pages", type=int, default=None, help="既定1（0〜3。0=重なり確認なし）")
+    sp.add_argument("--overlap-pages", type=int, default=None, help="既定1（0または1。0=重なり確認なし。2以上は設定エラー）")
     sp.add_argument("--max-cycle-restarts", type=int, default=None, help="既定2（1〜10）")
     sp = add("abort-run", _cmd_abort_run, "新方式の実行を人が中断として確定する（旧経路の行は対象外）")
     sp.add_argument("--run-id", required=True, type=int)

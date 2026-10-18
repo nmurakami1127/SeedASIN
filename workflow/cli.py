@@ -40,6 +40,10 @@ def overall(st: State) -> str:
     return "IN_PROGRESS"
 
 
+PLAN_LABEL = {"CONTINUE": "(続き)", "FINALIZE": "(末尾到達の確定・取得なし)", "RETRY_FIRST": "(1ページ目から再試行)",
+              "RESTART_BROKEN": "(取り直し:位置を信頼できない)", "RESTART_EXPIRED": "(取り直し:放置期限切れ)"}
+
+
 def mode_summary(t) -> str:
     """工程ごとの 再利用／新規実行／スキップ／待機 の内訳。"""
     c: dict[str, int] = {}
@@ -58,11 +62,16 @@ def mode_summary(t) -> str:
                 add("スキップ(上限)")
     elif t.kind in ("acquire", "acquire_x"):
         for r in t.result.get("sources", {}).values():
-            lab = {"REUSED": "再利用(保存済みの取得結果)", "FETCHED": "新規取得", "HELD": "保留", "CAPTCHA": "待機(CAPTCHA)",
-                   "FAILED": "失敗", "SKIPPED_AT_CLAIM": "スキップ", "SKIPPED_POLICY": "枝をスキップ(除外/保留/期間内)"}.get(r["mode"], r["mode"])
-            if r["mode"] == "FETCHED":
-                lab += "(続き)" if r.get("plan") == "CONTINUE" else ""
+            lab = {"REUSED": "再利用(保存済みの取得結果)", "FETCHED": "新規取得", "EMPTY": "新規取得(正常な0件)", "HELD": "保留",
+                   "CAPTCHA": "待機(CAPTCHA)", "FAILED": "失敗", "SKIPPED_AT_CLAIM": "スキップ",
+                   "SKIPPED_POLICY": "枝をスキップ(除外/保留/期間内)"}.get(r["mode"], r["mode"])
+            if r["mode"] in ("FETCHED", "EMPTY"):
+                lab += PLAN_LABEL.get(r.get("plan"), "")
                 lab += "・一巡完了" if r.get("cycle_complete") else "・上限打切り" if r.get("truncated") else ""  # 打切りと取得完了を区別する
+            elif r["mode"] == "HELD" and r.get("daily"):
+                lab += "(日次上限・翌日に続きから)" if r.get("outcome") == "DAILY_LIMIT" else "(日次上限)"
+            elif r["mode"] == "SKIPPED_POLICY" and r.get("needs_release"):
+                lab += "・要解除(release)"
             elif r.get("truncated"):
                 lab += "・上限打切り"
             add(lab)

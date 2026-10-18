@@ -63,8 +63,12 @@ class SubmissionLedger:
         return [json.loads(line) for line in self.path.read_text(encoding="utf-8").splitlines() if line.strip()]
 
     def state(self, key: str) -> LedgerState:
+        return self._fold(key, self.events())
+
+    @staticmethod
+    def _fold(key: str, events: list[dict]) -> LedgerState:
         st = LedgerState(key)
-        for e in self.events():
+        for e in events:
             if e["key"] != key:
                 continue
             st.events.append(e)
@@ -101,7 +105,11 @@ class SubmissionLedger:
         return st
 
     def all_states(self) -> dict[str, LedgerState]:
-        return {k: self.state(k) for k in dict.fromkeys(e["key"] for e in self.events())}
+        events = self.events()  # ファイルは1回だけ読む（キーごとに読み直さない）。呼び出しのたびに最新の内容を読む
+        by_key: dict[str, list[dict]] = {}
+        for e in events:
+            by_key.setdefault(e["key"], []).append(e)
+        return {k: self._fold(k, evs) for k, evs in by_key.items()}
 
     def identified_run_ids(self, except_key: str | None = None) -> set[int]:
         """他の投入に割り当て済みの統合ツール実行ID（新しい行の候補から除く）。"""

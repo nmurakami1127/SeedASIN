@@ -1,4 +1,6 @@
-# 上限で打ち切った出典の「続き取得」設計（実装済み・test-dbで検証済み・実DB未適用。最終仕様は docs/DEVIATIONS.md #63）
+# 上限で打ち切った出典の「続き取得」設計（実装済み・test-dbで検証済み・実DB未適用。最終仕様は docs/DEVIATIONS.md #63・#64）
+
+> 2026-10-18 追記: レビュー指摘への対応（末尾到達の確定FINALIZE、保存なし一巡のRETRY_FIRST、取り直し上限はBROKENだけで数える、日次枠での中断DAILY_LIMIT、overlap_pagesは0/1、マイグレーション0018）は docs/DEVIATIONS.md #64 が優先する。
 
 2026-10-18。DEVIATIONS #62 の具体化。**承認後に実装した（#63）。実装では次を追加・変更している: 状態`CLOSED_NO_CURSOR`、列`cycle_start_reason`/`restart_streak`/`supersedes_cycle_id`/`last_page_asins`ほか、異常終了後の取り直し上限（`AUTO_CYCLE_RESTARTS`）、投入のrepeat入力、DBの連鎖制約とトリガー。以下は当初の設計案で、差異は#63が優先。**
 既存の `SUCCESS_TRUNCATED` の履歴・30日制限は変更しない（後述の「既存履歴の扱い」）。

@@ -242,13 +242,27 @@ class SourceRegistry:
             self._event(conn, source_id, marketplace, "HOLD" if status == "ON_HOLD" else "EXCLUDE", reason.strip())
 
     def release(self, marketplace: str, source_id: int, reason: str) -> None:
-        """保留・除外・自動保留を明示的に解除する。以降、それ以前の失敗は連続失敗に数えない。"""
+        """保留・除外・自動保留を明示的に解除する。以降、それ以前の失敗は連続失敗に数えない。
+        保留されていない（ACTIVE）出典でも、一巡の取り直しの上限（CYCLE_RESTART_LIMIT）で止まっている場合は解除できる
+        （上限を設定で下げた・0018より前の記録などで、自動保留を経ずに上限に達した出典。表示の案内どおり release で解除できるようにする）。
+        解除の記録（failure_streak_reset_at）が一巡の終了より後になるため、同じ履歴で再び上限に止められない。"""
         if not reason or not reason.strip():
             raise ValueError("理由が必須です")
         with self._app.get_session(marketplace) as conn, conn.begin():
             row = self._locked_source(conn, marketplace, source_id)
             if row.status == "ACTIVE":
-                raise ValueError("保留・除外されていません")
+                from acquisition.eligibility import db_now, decide, load_configs, load_facts
+
+                facts = load_facts(conn, marketplace, [source_id])[0]
+                d = decide(facts, load_configs(conn, marketplace)[facts.source_type], db_now(conn))
+                if not any(b.code == "CYCLE_RESTART_LIMIT" for b in d.blockers):
+                    raise ValueError("保留・除外されていません")
+                conn.execute(
+                    text("UPDATE acquisition_source SET failure_streak_reset_at = clock_timestamp() WHERE source_id = :id"),
+                    {"id": source_id},
+                )
+                self._event(conn, source_id, marketplace, "RELEASE", f"ACTIVE/CYCLE_RESTART_LIMIT → 取り直しの上限を解除: {reason.strip()}")
+                return
             conn.execute(
                 text(
                     "UPDATE acquisition_source SET status = 'ACTIVE', hold_reason = NULL, hold_detail = NULL, "

@@ -101,7 +101,7 @@ def usage(st: "State") -> dict:
     """この実行（workflow全体）で新しく使った量。状態から数えるので、resumeでリセットされない。保存済み結果の再利用は数えない。"""
     src = sum(int(r["accesses"]) if "accesses" in r else int(r.get("pages", 0)) + int(r.get("overlap_pages", 0))
               for t in st.tasks.values() if t.kind in ("acquire", "acquire_x")
-              for r in t.result.get("sources", {}).values() if r.get("mode") == "FETCHED")
+              for r in t.result.get("sources", {}).values() if r.get("mode") in ("FETCHED", "EMPTY") or "accesses" in r and r.get("daily"))
     prod = sum(int(t.result.get("product_pages", 0)) for t in st.tasks.values() if t.kind in ("discover", "cross"))
     new_src = {(s["market"], s["source_id"]) for t in st.tasks.values() if t.kind in ("discover", "cross") for s in t.result.get("new_sources", [])}
     subs = [t for t in st.tasks.values() if t.kind == "submit"]

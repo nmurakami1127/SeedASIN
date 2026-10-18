@@ -46,21 +46,24 @@ from workflow.store import DONE_STATES, State, Task, WorkflowStore, now_iso, usa
 
 SUCCESS = tuple(USABLE_FETCH_OUTCOMES)
 POLICY_CODES = ("EXCLUDED", "ON_HOLD", "TOO_RECENT", "REVIEW_LEGACY", "CYCLE_RESTART_LIMIT")  # 方針による枝のスキップ（自動で再試行しない）
+DONE_BRANCH_MODES = ("FETCHED", "REUSED", "EMPTY")  # 枝の完了（EMPTY=確認済みの正常な0件。一巡完了だが投入・展開するASINは無い）
+CYCLE_COMPLETE_OUTCOMES = ("SUCCESS_NONEMPTY", "SUCCESS_EMPTY")  # 最後のページまで正常に到達した（一巡完了）
 KIND_LABEL = {"discover": "発見", "acquire": "取得", "cross": "反対側展開", "acquire_x": "反対側の取得", "expand": "投入計画", "submit": "投入"}
 
 
 class _BudgetFetcher:
     """実際のページ取得（fetch呼び出し）を数え、確保した日次枠を超える取得は、追加の枠を確保できた時だけ許す（5xxの再試行・CAPTCHA後の取り直しも
-    実アクセスなので数える）。確保できなければ取得せず失敗として止める。これにより、overlapや再試行を含む実アクセスが日次上限を超えない。"""
+    実アクセスなので数える）。確保できなければ取得せずに止める（AccessBudgetExhausted。出典の取得失敗には数えず、INTERRUPTED(DAILY_LIMIT)
+    として確定して保存済みの位置から翌日に再開する）。これにより、overlapや再試行を含む実アクセスが日次上限を超えない。"""
 
     def __init__(self, base, reserved: int, extra) -> None:
         self._b, self.reserved, self._extra, self.calls = base, reserved, extra, 0
 
     def fetch(self, url: str):
-        from asin_collector.source_runner import PageLoadError
+        from asin_collector.source_runner import AccessBudgetExhausted
 
         if self.calls >= self.reserved and not self._extra():
-            raise PageLoadError("日次のページ上限に達したため、これ以上取得しません（確保した枠を使い切りました）")
+            raise AccessBudgetExhausted("日次のページ上限に達したため、これ以上取得しません（確保した枠を使い切りました）")
         self.calls += 1
         return self._b.fetch(url)
 
@@ -300,10 +303,17 @@ class Engine:
                      "blockers": [f"{b.code}: {b.detail}" for b in d.blockers]}
         if not d.eligible:
             return {**out, "status": "NOT_ELIGIBLE"}
+        self.st = State(f"manual-{market}-{source_id}", now_iso(), self.cfg.to_dict(), self.cfg.sha256())
+        if d.plan == "FINALIZE":  # 末尾到達を保存済み: ページを開かずに一巡の完了を確定する（日次の枠を使わない・ブラウザを開かない）
+            rp = run_batch(self.runs, self.factory, _NoFetch(), market, [source_id], sleep=self.sleep)[0]
+            if rp.result == "SKIPPED":
+                return {**out, "status": "NOT_CLAIMED", "reason": rp.reason}
+            r = rp.report
+            return {**out, "status": "RAN", "run_id": r.run_id, "cycle_id": r.cycle_id, "outcome": r.outcome, "pages": 0, "accesses": 0,
+                    "new_asins": 0, "error_code": r.error_code, "detail": r.detail}
         new_pages = max_pages if total_cap is None else min(max_pages, total_cap - d.overlap_pages)
         if new_pages < 1:
             return {**out, "status": "CAP_TOO_SMALL"}
-        self.st = State(f"manual-{market}-{source_id}", now_iso(), self.cfg.to_dict(), self.cfg.sha256())
         task = SimpleNamespace(id="manual-fetch")
         rid = f"manual-fetch:{market}:{source_id}:{uuid.uuid4().hex[:10]}"
         granted = self._grant_pages(rid, new_pages + d.overlap_pages, task)
@@ -321,9 +331,12 @@ class Engine:
             return {**out, "status": "NOT_CLAIMED", "reason": it.reason}
         rp = it.report
         self.usage.commit(rid, {"pages": min(bf.calls, granted)})
-        return {**out, "status": "RAN", "run_id": rp.run_id, "outcome": rp.outcome, "pages": rp.pages, "overlap_pages_fetched": rp.overlap_pages,
-                "accesses": bf.calls, "new_asins": rp.asins, "drift": rp.drift, "error_code": rp.error_code, "detail": rp.detail,
-                "reserved": granted, "daily_used": self.usage.used().get("pages", 0), "daily_cap": self.cfg.daily.max_pages}
+        res = {**out, "status": "RAN", "run_id": rp.run_id, "cycle_id": rp.cycle_id, "outcome": rp.outcome, "pages": rp.pages,
+               "overlap_pages_fetched": rp.overlap_pages, "accesses": bf.calls, "new_asins": rp.asins, "drift": rp.drift, "error_code": rp.error_code,
+               "detail": rp.detail, "reserved": granted, "daily_used": self.usage.used().get("pages", 0), "daily_cap": self.cfg.daily.max_pages}
+        if rp.outcome == "DAILY_LIMIT":  # 失敗ではない: 保存済みの位置から、JST 0:00以降に続けられる
+            res.update(status="DAILY_LIMIT", retry_after=self._midnight())
+        return res
 
     # ------------------------------------------------------------------ 発見
 
@@ -442,17 +455,27 @@ class Engine:
             return self._set(t, "HELD", str(exc))
         entries = {e.facts.source_id: e for es in plan.sections.values() for e in es}
         blocked = {f.source_id: d for f, d in plan.blocked}
-        for s_ in sources:  # 完了(取得/再利用)以外の記録は、毎回DBの状態から評価し直す（除外・保留が解除されていれば取得できる）
-            if recs.get(str(s_["source_id"]), {}).get("mode") not in ("FETCHED", "REUSED"):
+        for s_ in sources:  # 完了(取得/再利用/正常な0件)以外の記録は、毎回DBの状態から評価し直す（除外・保留が解除されていれば取得できる）
+            if recs.get(str(s_["source_id"]), {}).get("mode") not in DONE_BRANCH_MODES:
                 recs.pop(str(s_["source_id"]), None)
         todo = [s_ for s_ in sources if str(s_["source_id"]) not in recs]
         lim = self.cfg.limits
         fetch_ids = [s_["source_id"] for s_ in todo if s_["source_id"] in entries]
+        # 末尾到達を保存済みの一巡（FINALIZE）は、ページを開かずに完了を確定するだけ（日次の枠を使わない・ブラウザを開かない）
+        finalize_ids = [sid for sid in fetch_ids if entries[sid].decision.plan == "FINALIZE"]
+        fetch_ids = [sid for sid in fetch_ids if sid not in finalize_ids]
         cap = self.cfg.daily.max_pages
         if fetch_ids and cap is not None and cap - self.usage.used().get("pages", 0) <= 0:  # ブラウザを開く前に日次上限を確認する
             for sid in fetch_ids:
                 recs[str(sid)] = {"mode": "HELD", "daily": True, "reason": f"本日(JST)のAmazon新規取得ページの上限（{cap}）に達しています"}
             fetch_ids = []
+        for sid in finalize_ids:
+            it = run_batch(self.runs, self.factory, _NoFetch(), market, [sid], sleep=self.sleep)[0]
+            if it.result == "SKIPPED":
+                recs[str(sid)] = {"mode": "HELD", "reason": f"claimできませんでした: {it.reason}"}
+            else:
+                self._record_fetch(recs, sid, it.report, 0)
+            self._save_task(t)
         if fetch_ids:
             with self._fetcher(market, True) as fetcher:
                 for sid in fetch_ids:
@@ -481,19 +504,13 @@ class Engine:
                         continue
                     rp = it.report
                     self.usage.commit(rid, {"pages": min(bf.calls, granted)})
-                    base = {"run_id": rp.run_id, "plan": rp.plan, "pages": rp.pages, "overlap_pages": rp.overlap_pages, "asins": rp.asins,
-                            "drift": rp.drift, "accesses": bf.calls}
-                    if rp.outcome in SUCCESS:
-                        recs[str(sid)] = {"mode": "FETCHED", "outcome": rp.outcome, **base, "truncated": rp.outcome == "SUCCESS_TRUNCATED",
-                                          "cycle_complete": rp.outcome == "SUCCESS_NONEMPTY"}
-                    elif rp.error_code and "CAPTCHA" in rp.error_code:
-                        recs[str(sid)] = {"mode": "CAPTCHA", **base, "reason": "CAPTCHAが解消されませんでした"}
-                    elif rp.outcome == "LEASE_LOST":
-                        recs[str(sid)] = {"mode": "FAILED", **base, "reason": "leaseを失いました"}
-                    else:
-                        recs[str(sid)] = {"mode": "FAILED", "outcome": rp.outcome, **base, "reason": rp.detail or rp.error_code or rp.outcome,
-                                          "error_code": rp.error_code}
+                    self._record_fetch(recs, sid, rp, bf.calls)
                     self._save_task(t)
+                    if rp.outcome == "DAILY_LIMIT":  # 日次枠が尽きた: 残りの出典も今日は開かない（失敗には数えない）
+                        for rest in fetch_ids[fetch_ids.index(sid) + 1:]:
+                            recs[str(rest)] = {"mode": "HELD", "daily": True,
+                                               "reason": f"本日(JST)のAmazon新規取得ページの上限（{self.cfg.daily.max_pages}）に達しています"}
+                        break
         for s_ in todo:  # 取得しない出典: 保存済みの結果を使うか、枝をスキップするか、一時的に保留するか
             sid = s_["source_id"]
             if str(sid) in recs:
@@ -507,8 +524,12 @@ class Engine:
                 recs[str(sid)] = {"mode": "REUSED", **reuse}
             elif policy_only:
                 until = max((b.until for b in d.blockers if b.until), default=None)
+                # 取り直しの上限（CYCLE_RESTART_LIMIT）は、時間では解けない: 人が原因を確認して release で解除するまで止まる（要対応として表示）
+                needs_release = "CYCLE_RESTART_LIMIT" in codes or "ON_HOLD" in codes
                 recs[str(sid)] = {"mode": "SKIPPED_POLICY", "codes": codes, "permanent": "EXCLUDED" in codes,
-                                  "reeval_at": until.strftime("%Y-%m-%dT%H:%M:%SZ") if until and "EXCLUDED" not in codes else None,
+                                  "needs_release": needs_release,
+                                  "release_cmd": f"python -m acquisition.cli release --market {market} --source-id {sid} --reason ..." if needs_release else None,
+                                  "reeval_at": until.strftime("%Y-%m-%dT%H:%M:%SZ") if until and "EXCLUDED" not in codes and not needs_release else None,
                                   "reason": "; ".join(f"{b.code}({b.detail})" for b in d.blockers)[:300]}
             else:
                 why = "; ".join(f"{b.code}" + (f"({b.detail})" if b.detail else "") for b in (d.blockers if d else [])) or "取得できる状態ではありません"
@@ -520,15 +541,21 @@ class Engine:
         t.result["usable"] = usable
         modes = [r["mode"] for r in recs.values()]
         skipped = modes.count("SKIPPED_POLICY")
+        needs_release = sum(1 for r in recs.values() if r["mode"] == "SKIPPED_POLICY" and r.get("needs_release"))
         t.result["branches"] = {"skipped_policy": skipped, "permanent": sum(1 for r in recs.values() if r.get("permanent")),
+                                "needs_release": needs_release, "empty": modes.count("EMPTY"),
                                 "held": modes.count("HELD"), "captcha": modes.count("CAPTCHA"), "failed": modes.count("FAILED")}
         summary = f"使える取得結果{usable}件（取得{modes.count('FETCHED')}・保存済みの再利用{modes.count('REUSED')}）" \
-                  f"／保留{modes.count('HELD')}・CAPTCHA{modes.count('CAPTCHA')}・失敗{modes.count('FAILED')}" \
-                  + (f"／枝のスキップ{skipped}件（除外{t.result['branches']['permanent']}・保留/期間内{skipped - t.result['branches']['permanent']}）" if skipped else "")
+                  + (f"／正常な0件{modes.count('EMPTY')}件（一巡完了）" if modes.count("EMPTY") else "") \
+                  + f"／保留{modes.count('HELD')}・CAPTCHA{modes.count('CAPTCHA')}・失敗{modes.count('FAILED')}" \
+                  + (f"／枝のスキップ{skipped}件（除外{t.result['branches']['permanent']}・保留/期間内{skipped - t.result['branches']['permanent']}）" if skipped else "") \
+                  + (f"／要解除{needs_release}件（取り直しの上限・保留。原因を確認して acquisition.cli release）" if needs_release else "")
         pending = modes.count("HELD") + modes.count("CAPTCHA") + modes.count("FAILED")
         if not sources:
             return self._set(t, "DONE", "取得する出典がありません")
         if pending == 0:
+            if usable == 0 and modes.count("EMPTY"):  # 取得は正常に完了したが、出品が0件だった（投入するものは無い）
+                return self._set(t, "DONE", summary)
             if usable == 0:  # 全ての枝が除外・保留・期間内: 失敗でも完了でもない。他の候補の処理は止めない
                 return self._set(t, "SKIPPED", summary + "。この枝は処理しません（状態が変われば次の候補選択で再評価されます）")
             return self._set(t, "DONE", summary)
@@ -547,6 +574,28 @@ class Engine:
             retry = None
         return self._set(t, "HELD", summary + ("。JST 0:00以降に再開します" if daily else f"。再実行可能: {retry}" if retry else ""), retry_after=retry,
                          **({"daily_hold": "pages"} if daily else {}))
+
+    def _record_fetch(self, recs: dict, sid: int, rp, accesses: int) -> None:
+        """1出典の取得結果を、枝の記録に変換する。正常な0件(SUCCESS_EMPTY)は一巡完了（投入するASINは無い）、日次枠での中断は
+        失敗ではなく日次の保留（JST 0:00以降に、保存済みの位置から続ける）。"""
+        base = {"run_id": rp.run_id, "cycle_id": rp.cycle_id, "plan": rp.plan, "pages": rp.pages, "overlap_pages": rp.overlap_pages,
+                "asins": rp.asins, "drift": rp.drift, "accesses": accesses}
+        if rp.outcome in SUCCESS:
+            recs[str(sid)] = {"mode": "FETCHED", "outcome": rp.outcome, **base, "truncated": rp.outcome == "SUCCESS_TRUNCATED",
+                              "cycle_complete": rp.outcome in CYCLE_COMPLETE_OUTCOMES}
+        elif rp.outcome == "SUCCESS_EMPTY":
+            recs[str(sid)] = {"mode": "EMPTY", "outcome": rp.outcome, **base, "truncated": False, "cycle_complete": True}
+        elif rp.outcome == "DAILY_LIMIT":
+            recs[str(sid)] = {"mode": "HELD", "daily": True, **base, "outcome": rp.outcome, "retry_at": self._midnight(),
+                              "reason": f"本日(JST)のAmazon新規取得ページの上限（{self.cfg.daily.max_pages}）に達したため取得を止めました"
+                                        "（失敗ではありません。JST 0:00以降に保存済みの位置から続けます）"}
+        elif rp.error_code and "CAPTCHA" in rp.error_code:
+            recs[str(sid)] = {"mode": "CAPTCHA", **base, "reason": "CAPTCHAが解消されませんでした"}
+        elif rp.outcome == "LEASE_LOST":
+            recs[str(sid)] = {"mode": "FAILED", **base, "reason": "leaseを失いました"}
+        else:
+            recs[str(sid)] = {"mode": "FAILED", "outcome": rp.outcome, **base, "reason": rp.detail or rp.error_code or rp.outcome,
+                              "error_code": rp.error_code}
 
     def _save_task(self, t: Task) -> None:
         t.updated_at = now_iso()

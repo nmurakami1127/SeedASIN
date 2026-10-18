@@ -1215,3 +1215,47 @@ PERMANENTLY_EXCLUDEDは引き続き完全除外のまま変更しない。
 6. 初回の続き取得の試行案は最終報告を参照。
 
 **7. 検証**: test-dbで全テスト成功（空DB・0016からの移行・0017のdowngrade/再upgrade・再実行の冪等・既存の取得/発見/投入/workflowテストの維持）。既存の2テストは意図した仕様変更に合わせて更新した（再開位置を保存した打切りは`truncated_counts_as_success`ではなく`ELIGIBLE_CONTINUATION`、中断は続きを取れる）。**未検証**: 実Amazonでの続き取得（ページ送りURLの有効期間、検索結果の変化の大きさ）、実画面での投入、長期運用。
+
+
+## 64. 続き取得（#63）のレビュー指摘への対応: 末尾到達の確定・取り直しの上限と解除・保存なし一巡の再試行・日次枠での中断（Phase 4, 2026-10-18）
+
+承認済み（2026-10-18、レビュー指摘に基づく修正とテスト追加。工程ごとの再承認は不要との指示）。**実DBへのマイグレーション適用と実地取得は、この変更でも行っていない**（クラウドの使い捨てPostgreSQL 16でのみ検証）。
+
+**0. DB（マイグレーション0018。`alembic/versions/0018_continuation_followups.py`）**: 0017はtest-dbに適用済みの環境があるため、0017を書き換えず**増分**で追加。既存行は書き換えない・削除しない。
+- `collector_run.end_reached BOOLEAN`（NULL可）: 1ページを正常に解析・保存し、そのページに次ページが無かったことを、ASIN・再開位置の保存と同じトランザクションで記録する。制約: TRUEのときは続き取得の行で、`next_url`なし・`last_page_url`ありに限る。既存行はNULL（=末尾到達の記録なし）。
+- `interrupt_kind` に `DAILY_LIMIT` を追加。
+- `acquisition_interval_config.overlap_pages` を0/1に制限（`ck_aic_overlap_pages`）。既に2以上の行がある環境では値を書き換えず`NOT VALID`で付け、アプリが読み込み時に設定エラー（`ConfigError`、直し方の案内つき）で止める。0/1へ直した後に`VALIDATE CONSTRAINT`できる。
+- downgrade: 行は削除・変更しない。`end_reached`列（の値）を外し、overlapの制約を0017の定義に戻す。interrupt_kindの制約は、`DAILY_LIMIT`の行が無ければ0017の定義に戻し、あれば行を書き換えずに`DAILY_LIMIT`を許す定義のまま残す（0017のコードはINTERRUPTEDを失敗に数えないので、そのまま読める）。
+
+**1. 最終ページ保存後・finish前の停止（末尾到達の確定 FINALIZE）**
+- 一巡の最新runが`cycle_state='OPEN'`で`end_reached=TRUE`（かつ`next_url`なし・`last_page_url`あり）なら、判定は`END_REACHED` → plan `FINALIZE`（状態`ELIGIBLE_CONTINUATION`、30日待機を適用しない。除外・保留・冷却・leaseは従来どおり先に効く）。**next_urlがNULLというだけでは末尾到達としない**（開始前・1ページ目の失敗・保存前の中断・旧行もNULLのため。それらは従来どおり続き/1ページ目から）。
+- FINALIZEは、通常のclaim（ロック・期限切れ回収・再判定・DBトリガーによる連鎖の検証）で同じ一巡の次の行（理由CONTINUE）を作り、**ページを開かずに**`SUCCESS_NONEMPTY`で確定して一巡を`COMPLETE`にする（30日間隔の起点はこの確定時刻）。止まった前のrunの行は書き換えない（終了後の行は保護トリガーで不変。旧プロセスの追記・終了確定はLeaseLostで拒否されたまま）。workflowはFINALIZEの出典にブラウザを開かず、日次の枠も使わない。
+- 末尾到達は放置の期限切れより優先する（取り直す位置が無く、全ページの保存は済んでいるため）。
+- 対象: 保存直後のプロセス死（leaseの期限切れで回収）、lease失効（finishがLeaseLost）、finish自体の失敗（既存の失敗処理でPARTIAL/EXCEPTIONとして確定。冷却は従来どおり適用）。
+- **関連して直した欠落**: 中断・失敗に終わったrun（INTERRUPTED/FAILED）が保存したASINは、続きでは取り直さないため、従来はどこからも投入されなかった。投入計画（`build_items`）は、同じ一巡で直前の使える取得runより後に中断・失敗で終わったrunのASINを、次の使える取得runの入力に引き継ぐ（`carried_from_runs`。マニフェストの`fetched_from`にも記録）。同じ出典・方向の差分規則（同じ一巡で投入済みは再送しない）はそのまま効く。
+
+**2. 取り直しの上限と解除（採用した規則）**
+- **取り直しの連続回数（`restart_streak`）は、取得の異常終了（BROKEN: 位置の無効・ループ・繰り返し・重なり不足など）からの取り直し（`RESTART_BROKEN`）だけで1増やす。** 放置による期限切れ（`RESTART_EXPIRED`）は取得の失敗ではないので増やさない（前の値のまま。0にも戻さない）。一巡が最後まで到達（COMPLETE）すれば、次の新しい一巡は0から。
+- 上限（`CYCLE_RESTART_LIMIT`）は`RESTART_BROKEN`にだけ適用する。上限に達するのはBROKENのrunの終了確定（finish）のときなので、その同じトランザクションで自動保留（`ON_HOLD`/`AUTO_CYCLE_RESTARTS`）にする（従来どおり）。判定関数`decide()`・planは読み取り専用で、DBを更新しない。
+- 自動保留を経ずに上限の判定だけが出る場合（`max_cycle_restarts`を下げた、0018より前の記録など）も、表示の案内どおり`acquisition.cli release`で解除できる（ACTIVEの出典でも`CYCLE_RESTART_LIMIT`がある時だけ受け付け、`failure_streak_reset_at`を記録し、`RELEASE`イベントを残す。保留でも上限でもない出典のreleaseは従来どおり拒否）。
+- 解除後は、解除時刻が一巡の終了以後になるため、同じ履歴では上限に止められない。次の取り直しの連続回数は0から（もう一度BROKENになっても、すぐには止まらない）。
+- workflowの表示: 枝のスキップ（`SKIPPED_POLICY`）のうち、取り直しの上限・保留は「要解除(release)」として、解除コマンドの例と件数を表示する（時間では解けないので再評価時刻は付けない）。
+
+**3. 保存済みページが無い一巡の再試行（RETRY_FIRST）**
+- OPENの一巡で、まだ1ページも保存していない（1ページ目のCAPTCHA・読み込み失敗・保存前の中断）場合は plan `RETRY_FIRST`。DB上は同じ一巡の次の行（理由CONTINUE。OPENの一巡が残る出典に新しい一巡は始められないトリガーのため）だが、**取得・判定は初回と同じ**: 出典の開始URLから、重なり確認なし、確認済みの0件は`SUCCESS_EMPTY`（一巡完了）。`CURSOR_INVALID`にはしない。30日間隔は初回と同じく適用する。
+- 途中ページまで保存済みの続き（`CONTINUE`）で、続きのURLが0件なら従来どおり`CURSOR_INVALID`（BROKEN）。
+
+**4. 日次枠の不足（DAILY_LIMIT）**
+- workflowの取得で、確保した日次枠を使い切り、追加の枠も取れない場合（5xxの再試行・CAPTCHA後の取り直しなど）は、ページを開かずに止め（`AccessBudgetExhausted`）、runを`INTERRUPTED`/`interrupt_kind='DAILY_LIMIT'`で確定する。**失敗ではない**: 連続失敗・冷却・自動保留に数えない。一巡はOPENのままで、再開位置は保存済みの最後のページの次。
+- 枝の記録は日次の保留（`HELD`、`daily`、再実行可能時刻=次のJST 0:00）。同じ取得工程の残りの出典も、その日は開かない。翌JST日付に、保存済みの位置から続ける（取得済みページを取り直さない）。`workflow.cli fetch-source`は`status=DAILY_LIMIT`と`retry_after`を返す。
+- 実アクセス（overlap・再試行・CAPTCHA後の取り直しを含む）は、従来どおり日次上限を超えない。商品ページの調査で枠が尽きた場合の扱い（LOAD_FAILED）は変更していない。
+
+**5. その他**
+- `overlap_pages`は0/1だけ（`set-cycle-config --overlap-pages`も0/1以外は明確なエラー。黙って1に丸めない）。
+- 正常な0件（`SUCCESS_EMPTY`）を、workflowで「新規取得(正常な0件)・一巡完了」（枝の状態`EMPTY`）として表示する。従来は失敗として表示・扱われていた。投入・反対側展開の対象にはしない。
+- `claim`は`INSERT ... RETURNING id, cycle_id`でDBが確定した`cycle_id`を返し、`RunReport`・workflowの枝の記録・`fetch-source`・`collect-source`の表示に載せる。
+- 投入計画: 台帳（JSON Lines）は1回の計画作成ごとに1回だけ読み、入力ファイルの内容はその計画作成の中だけで再利用する（ファイルは内容のハッシュで名前が決まり書き換えない。台帳の状態は毎回読み直すので、送信前の最新状態の確認は省略しない）。台帳の`all_states()`はファイルを1回だけ読んで畳み込む（従来はキーの数だけ読み直していた）。
+
+**6. 実DBへの適用手順（未実施。実DBは現在0016）**: #63の6と同じ手順で、`alembic upgrade head`により0017と0018をまとめて適用する（確認時の`alembic current`は0018）。0018は既存行を変更しない。戻す場合は`alembic downgrade 0016`（0018→0017→0016の順に戻り、行は削除されない）。0017だけ適用済みの環境では、`alembic upgrade head`で0018だけが追加される。
+
+**7. 検証（クラウドの使い捨てPostgreSQL 16。実データなし）**: 全テストを実行（結果は最終報告）。追加したテスト: 最終ページ保存直後の停止3通り（プロセス死・lease失効・finish失敗）からのFINALIZE（ページを開かない・前の行は不変・旧claimの書き込み拒否・30日の起点・中断runのASINの引き継ぎ）／next_urlがNULLだけでは末尾としない／end_reachedのDB制約／期限切れの取り直しをclaimとトリガー経由で上限を超えて繰り返しても止まらない／BROKENでだけ上限→自動保留→解除→同じ履歴で再停止しない／ACTIVEの上限のrelease／保存なし一巡の再試行で確認済み0件がSUCCESS_EMPTY（途中の続きのCURSOR_INVALIDは維持）／overlap 0の動作と2以上の拒否（CLI・DB制約・NOT VALIDの既存値）／DBで確定したcycle_id／日次枠の不足が失敗回数を増やさず翌JST日付に保存済みの位置から再開／workflowでの正常0件・FINALIZE・要解除の表示／0018の移行（0017からのupgrade・既存の2以上の値・downgradeで行を保持・冪等）。**未検証**: 実Amazon・実統合ツールでの動作、実DBへの適用。

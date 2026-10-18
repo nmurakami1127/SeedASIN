@@ -60,6 +60,7 @@ class Routing:
         self.captcha_products: set[str] = set()
         self.seller_pages: dict[str, list[list[str]]] = {}
         self.seller_503: set[str] = set()
+        self.seller_empty: set[str] = set()  # 「検索結果0件」ウィジェット付きの0件（確認済みの正常な0件）
         self.product_offers: dict[str, tuple] = {}
         self.on_fetch = None
 
@@ -76,6 +77,9 @@ class Routing:
         if m:
             if m.group(1) in self.seller_503:
                 return FetchedPage('<html><body><div id="cs_503_logo"></div></body></html>', url, 503)
+            if m.group(1) in self.seller_empty:
+                from asin_collector.check_recommendations import NO_RESULTS_MARKER
+                return FetchedPage(f'<html><body><div {NO_RESULTS_MARKER}>no results</div></body></html>', url, 200)
             pages = self.seller_pages.get(m.group(1))
             if pages:  # 複数ページの出品者一覧（次ページは &page=N+1）
                 pm = re.search(r"[?&]page=(\d+)", url)
