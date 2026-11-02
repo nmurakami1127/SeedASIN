@@ -1362,3 +1362,26 @@ Amazonのナビゲーションはdomcontentloadedで待機し、第三者リソ�
 利用者の確認により、#76の「失敗・1時間停滞時に端数を計画化する」例外を撤回。batch_target_asins=5000の計画では、cycle_state=COMPLETEが確定するまで満杯の5,000件単位だけを返す。OPEN・BROKEN・CLOSED_NO_CURSOR・旧取得で完了状態不明の場合も、小さな端数を末尾到達として扱わない。PARTIALの保存済み結果は5,000件以上の部分だけ利用し、端数とエラー記録・再開位置を保持する。旧flush_buffer引数は互換性のため受け取るが、この条件を迂回できない。
 
 同じ取得先市場・出典・方向・一巡での蓄積、重複・送信済み・結果不明の占有を維持。末尾到達時は残りの端数を扱う。探索と登録の分離・ログイン監視停止は維持し、今回の変更ではどちらも起動しない。既存の未送信非重複計画は0件で、実データの取り消し・書換えは不要だった。
+
+## 79. 止まりの検知・出典ごとの新規ASIN率・稼働の可視化（2026-11-03）
+
+背景: 2026-10-28〜10-30にUSがほぼ止まった（日次の初見ASIN 393→2→54。JPは同期間6,000〜14,000）のに気付けなかった。原因は、discoverの商品ページ取得のSERVER_ERRORの連続（10/28はdiscover 87件中57件が失敗スキップ）と、BROKEN後の取り直し上限（`max_cycle_restarts=2`）による「要解除」（CYCLE_RESTART_LIMIT / ON_HOLD）。また出典ごとの新規率を見る手段がなく、24時間の集計（取得ページ3,640・保存行58,020・重複なしASIN25,992・初見16,927）を手作業で行った。
+
+**スキーマ変更なし**（新テーブル・列・マイグレーション・インデックスは追加していない。追記専用テーブルは読み取りのみ）。Amazonへのアクセスは増やさない。
+
+追加したもの:
+- `workflow/stall.py`（新）: 市場ごと（US/JPは別々のDB接続・失敗は市場ごとに隔離）の止まりの検知。(1) 要解除の出典（`acquisition.eligibility.decide`のCYCLE_RESTART_LIMIT/ON_HOLD。`workflow/engine.py`の`needs_release`と同じ定義）の件数と一覧、(2) 商品ページ取得（`collector_run.run_type='ASIN_PAGE'`）のSERVER_ERROR連続回数、(3) 直近24時間の初見ASINが直近7日の日次中央値のN%未満か。`workflow/watch.py`が最短10分ごとに呼び、`watch_status.json`の`stall`と、ターミナルの`[停止の兆候]`に出す。既存の人手待ちと同じ`watch.notify_minutes`で繰り返しを抑える。**人手待ち（`human`）・watchの状態は変えない**（表示が増えるだけ）。`workflow/cli.py`の`status`表示にも出す。
+- `workflow/config.py`: `stall`項目（`server_error_streak`既定5・範囲1〜1000、`new_asin_min_percent`既定30・範囲1〜100）。項目が無い設定・保存済みスナップショットは既定値で読める。**注意**: `WorkflowConfig.to_dict()`に`stall`が増えるため、新しく作るworkflowの`config_sha256`の値は変わる（表示用で、比較・拒否には使っていない。既存の保存済み状態の動作は変わらない）。
+- `workflow/watch_events.py`（新）: `exports/workflow/watch_events.jsonl`（追記専用のJSONL）に、watch起動・人手待ちの表示・停止要求・停止の兆候の警告を記録する。従来は画面表示だけで日ごとの回数を出せなかったため。書き込み失敗でもwatchは止めない。
+- `seller_performance/source_yield.py`（新）と`seller_performance.cli source-yield`: 出典ごとの新規ASIN率。画面とCSV（`exports/source_yield/`、UTF-8 BOM）。
+- `seller_performance/watch_activity.py`（新）と`seller_performance.cli watch-activity`: 日ごとの稼働時間・停止要求・人手待ち（過去7日）。取れない項目は「記録なし」。
+
+定義・判断（利用者に確認してほしい点を含む）:
+- **初見ASIN** = 対象期間（`started_at`が[終了-N時間, 終了)のrun）のASINのうち、その市場の`collector_asin`に、対象期間より前（`started_at <`期間の開始）のrunの行が無いもの。出典ごとの数は出典内で重複を除く（同じASINを複数の出典が取れば各出典に数える）。合計行は市場全体で数え直す。`ASIN_PAGE`のrunは出典ではないので表から除く。
+- **日次の窓**: 直近24時間と、その前の7つの24時間（as_ofから遡る）。「直近7日間の日次の中央値」は**直近24時間を含めず、その前の7日間**とした（停止中の日が基準を下げ、停止に気付けなくなるのを避けるため）。**7日分が足りない**は、その市場の最も古い取得runが8日前より新しい場合。中央値が0のときは比べられないので警告しない。ちょうど30%は警告しない（「30%未満」）。SERVER_ERRORはちょうど設定回数で警告する（「N回以上」）。
+- SERVER_ERROR連続は、`ASIN_PAGE`の終了済み（COMPLETED/FAILED）の調査を新しい順に見て、先頭から`error_code='SERVER_ERROR'`が続く数。中断（INTERRUPTED。日次枠の不足など）は数えず、成功・別のエラー・解除（release）の行で途切れる。
+- 稼働の市場別は、ページ枠の確保の工程名（`discover:US`など）の末尾＝工程の起点側の市場。`page_market`が起点と違う設定ではずれ得る。
+- 停止要求は市場に属さない（全体）。人手待ちは`watch_events.jsonl`に記録され始めた日以降のみ数えられる（それ以前は「記録なし」）。
+- `source-yield`の実行時間: 合成データ（collector_asin 30万行・インデックスは既存のまま）で、24時間 約0.7秒・168時間 約2.3秒（Worker環境のPostgreSQL 16.15）。実DBでの時間は未計測。遅い場合のインデックス案（**作成していない・案のみ**）: `collector_asin (collector_run_id)`、`collector_asin (marketplace, asin)`、`collector_run (marketplace, started_at)`。
+
+テスト: `tests/unit/test_stall_and_yield.py`（しきい値の境界・7日分不足・設定の範囲・通知の間引き・CSVのUTF-8 BOM・稼働の集計）、`tests/integration/test_source_yield_and_stall.py`（実PostgreSQL。初見／既知の判定と境界、市場の分離とRLS、要解除・SERVER_ERROR連続・初見ASIN急減の検出、市場ごとの失敗の隔離、CLI）。

@@ -8,6 +8,8 @@
     python -m seller_performance.cli history --marketplace=US --seller-id=A29NE8W0SWJRBU
     python -m seller_performance.cli export-all
     python -m seller_performance.cli export-all --output-dir=C:\tmp\analysis
+    python -m seller_performance.cli source-yield --marketplace=US --hours 24
+    python -m seller_performance.cli watch-activity --days 7
 
 recommendは、前回の取得（tool_execution_link.requested_atの最新値と、
 storefront_blocked_sellerの保留記録日（COMPETITOR_SAME_SERVICE・RETRY_LATERの
@@ -78,6 +80,11 @@ US/JP両方のRLSを越えて全データを見るため`kpi_report_role`（BYPA
 出力先は`--output-dir`省略時`exports/analysis/<yyyyMMdd_HHmmss>/`（無ければ自動作成）。
 対話式メニューcli.pyへの追加は無い（ユーザー指定）。詳細は
 seller_performance/export_all.pyのモジュールdocstring参照。
+
+source-yieldは、出典（acquisition_source）ごとの新規ASIN率を、対象期間（既定は直近24時間）について市場別に集計する読み取り専用コマンド
+（docs/DEVIATIONS.md #79）。出力は画面とCSV（exports/source_yield/、UTF-8 BOM付き）。定義は
+seller_performance/source_yield.pyのモジュールdocstring参照。watch-activityは、exports/workflowのログから日ごとの稼働時間・停止要求・
+人手待ちの回数を表示する（DBには接続しない。seller_performance/watch_activity.py参照）。
 """
 from __future__ import annotations
 
@@ -217,6 +224,24 @@ def _cmd_export_all(args: argparse.Namespace) -> None:
     print(f"出力先: {result.output_dir}")
 
 
+def _cmd_source_yield(args: argparse.Namespace) -> None:
+    from seller_performance.source_yield import EXPORT_DIR, compute_source_yield, format_report, write_csv
+
+    factory = SessionFactory.for_app_role()
+    # 読み取りのみ。US/JPは指定した市場のRLSの範囲だけを見る（横断集計はしない）
+    with factory.get_session(args.marketplace) as conn, conn.begin():
+        report = compute_source_yield(conn, args.marketplace, args.hours)
+    print("\n".join(format_report(report)))
+    path = write_csv(report, Path(args.output_dir) if args.output_dir else EXPORT_DIR)
+    print(f"CSVを{path}に書き出しました")
+
+
+def _cmd_watch_activity(args: argparse.Namespace) -> None:
+    from seller_performance.watch_activity import build_activity, format_activity
+
+    print("\n".join(format_activity(build_activity(args.state_dir, days=args.days))))
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="python -m seller_performance.cli")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -258,6 +283,24 @@ def build_parser() -> argparse.ArgumentParser:
         "--output-dir", default=None, help=f"省略時は{_EXPORT_ALL_BASE_DIR}/<yyyyMMdd_HHmmss>/"
     )
     p_export_all.set_defaults(func=_cmd_export_all)
+
+    p_yield = subparsers.add_parser(
+        "source-yield",
+        help="出典ごとの新規ASIN率（run数・ページ数・保存行数・重複なしASIN・初見ASIN）を集計する"
+        "（読み取り専用。画面とCSV exports/source_yield/）",
+    )
+    p_yield.add_argument("--marketplace", required=True, choices=["US", "JP"])
+    p_yield.add_argument("--hours", type=float, default=24, help="対象期間（直近N時間。既定24）")
+    p_yield.add_argument("--output-dir", default=None, help="CSVの出力先。省略時はexports/source_yield/")
+    p_yield.set_defaults(func=_cmd_source_yield)
+
+    p_act = subparsers.add_parser(
+        "watch-activity",
+        help="日ごとの稼働時間・停止要求・人手待ちの回数を市場別に表示する（exports/workflowのログから。DBには接続しない）",
+    )
+    p_act.add_argument("--days", type=int, default=7, help="表示する日数（今日を含む。既定7）")
+    p_act.add_argument("--state-dir", default="exports/workflow", help="workflowのstate_dir（既定exports/workflow）")
+    p_act.set_defaults(func=_cmd_watch_activity)
 
     return parser
 

@@ -72,6 +72,13 @@ class Watch:
 
 
 @dataclass
+class Stall:
+    """止まりの検知（watch_status.jsonとターミナルの警告。workflow/stall.py、docs/DEVIATIONS.md #79）。表示が増えるだけで、探索・登録の動作は変えない。"""
+    server_error_streak: int = 5       # 商品ページの取得がSERVER_ERRORで何回連続したら警告にするか
+    new_asin_min_percent: int = 30     # 直近24時間の初見ASINが、直近7日の日次の中央値のこの%未満なら警告
+
+
+@dataclass
 class Cross:
     enabled: bool = True
     fetch_discovered: bool = False  # 反対側で新たに発見した出典の自動取得（初期OFF。再帰的な探索はしない）
@@ -83,6 +90,7 @@ class WorkflowConfig:
     limits: Limits = field(default_factory=Limits)
     totals: Totals = field(default_factory=Totals)
     cross: Cross = field(default_factory=Cross)
+    stall: Stall = field(default_factory=Stall)
     brand_enabled: bool = False     # 未検証のブランド取得（初期OFF。SELLERから開始）
     tool_max_asins: int = 5000      # 統合ツールの1回の入力（画面の案内は5,000件まで）
     result_max_age_days: int = 30   # 保存済みの取得結果を投入に使ってよい鮮度
@@ -154,6 +162,10 @@ class WorkflowConfig:
             v = getattr(self.watch, name)
             if not isinstance(v, int) or not 1 <= v <= 7 * 24 * 60:
                 raise ConfigError(f"watch.{name} は1〜10080（分）")
+        for name, lo, hi in (("server_error_streak", 1, 1000), ("new_asin_min_percent", 1, 100)):
+            v = getattr(self.stall, name)
+            if isinstance(v, bool) or not isinstance(v, int) or not lo <= v <= hi:
+                raise ConfigError(f"stall.{name} は{lo}〜{hi}の整数で指定してください（指定: {v!r}）")
         if not isinstance(self.page_revisit_days, int) or not 1 <= self.page_revisit_days <= 365:
             raise ConfigError("page_revisit_days は1〜365")
         mn = self.totals.max_new_submissions_per_direction
@@ -174,7 +186,7 @@ def config_from_dict(d: dict) -> WorkflowConfig:
         lanes = {m: Lane(**v) for m, v in (d.get("lanes") or {}).items()}
         cfg = WorkflowConfig(
             lanes=lanes, limits=Limits(**d.get("limits", {})), totals=Totals(**d.get("totals", {})), cross=Cross(**d.get("cross", {})),
-            daily=Daily(**d.get("daily", {})), watch=Watch(**d.get("watch", {})),
+            daily=Daily(**d.get("daily", {})), watch=Watch(**d.get("watch", {})), stall=Stall(**d.get("stall", {})),
             **{k: d[k] for k in ("brand_enabled", "tool_max_asins", "result_max_age_days", "state_dir", "submission_dir",
                                  "page_revisit_days", "profile", "listing_feedback", "skip_failures", "batch_target_asins",
                                  "submission_enabled", "tool_session_monitor") if k in d},

@@ -138,6 +138,37 @@ def _latest(store: WorkflowStore, wid: str | None) -> str:
     return ids[-1]
 
 
+def stall_status_lines(st: dict | None, jst=lambda x: x or "-") -> list[str]:
+    """止まりの検知（workflow/stall.py）の表示。状態ファイルに無い（古いwatch・未確認）なら何も出さない。"""
+    if not st:
+        return []
+    lines = [f"  停止の兆候の確認（最終 {jst(st.get('checked_at'))}）"]
+    if st.get("error"):
+        lines.append(f"    ! 確認に失敗: {st['error']}")
+    for m, mk in sorted((st.get("markets") or {}).items()):
+        if mk.get("error"):
+            lines.append(f"    [{m}] 確認に失敗: {mk['error']}")
+            continue
+        na = mk.get("new_asin") or {}
+        if na.get("status") == "UNKNOWN":
+            new = f"初見ASIN 直近24時間{na.get('last24')}件（判定不能: {na.get('reason') or '7日分の日次データが足りません'}）"
+        elif na.get("median7d") is None or not na.get("median7d"):
+            new = f"初見ASIN 直近24時間{na.get('last24')}件（直近7日の日次の中央値が0のため比較なし）"
+        else:
+            new = (f"初見ASIN 直近24時間{na.get('last24')}件／直近7日の日次中央値{na.get('median7d'):g}件"
+                   f"（{na.get('percent_of_median'):.0f}%・{na.get('threshold_percent')}%未満で警告）")
+        lines.append(f"    [{m}] 要解除{mk.get('needs_release_count', 0)}件 ・ 商品ページSERVER_ERROR連続{mk.get('server_error_streak', 0)}回 ・ {new}")
+        for it in (mk.get("needs_release") or [])[:10]:
+            lines.append(f"        要解除 #{it['source_id']} {it['source_type']} {it['name']}（{'/'.join(it['codes'])}"
+                         f"{'・' + it['hold_reason'] if it.get('hold_reason') else ''}）")
+        extra = mk.get("needs_release_count", 0) - min(10, len(mk.get("needs_release") or []))
+        if extra > 0:
+            lines.append(f"        ほか{extra}件（python -m acquisition.cli で確認）")
+        for w in mk.get("warnings") or []:
+            lines.append(f"    ! {w}")
+    return lines
+
+
 def watch_status_lines(d: dict | None) -> list[str]:
     if not d:
         return ["常駐(watch): 未起動（または状態ファイルなし）"]
@@ -156,6 +187,7 @@ def watch_status_lines(d: dict | None) -> list[str]:
         lines.append(f"    [{k}] {v}")
     for h in d.get("human") or []:
         lines.append(f"    ! 人手対応待ち: {h}（対応後に次回確認で自動再開。すぐ再開するなら `workflow.cli resume`※watch停止中のみ）")
+    lines.extend(stall_status_lines(d.get("stall"), jst))
     u, s_, c = d.get("usage_today", {}), d.get("usage_session", {}), d.get("caps", {})
     lines.append(f"  本日(JST {d.get('today_jst')})の使用量: ページ{u.get('pages', 0)}/{c.get('pages') or '無制限'} ・ 輸出{u.get('submit:EXPORT', 0)}・輸入{u.get('submit:IMPORT', 0)}"
                  f"/{c.get('submit_per_direction') or '無制限'}件 ・ ASIN{u.get('asins', 0)}/{c.get('asins') or '無制限'}")

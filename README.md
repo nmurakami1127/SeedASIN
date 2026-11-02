@@ -320,6 +320,33 @@ python -m workflow.cli backup  --out backups/wf.zip   /   restore --zip backups/
 - 統合ツールは混み合い（2026-10-17 13時台に待機18件、投入2件が数時間待機）、**消化速度は未計測**。処理量はここで決まるため、**最初の1週間は投入を控えめ（例: 5件/方向/日）にして、投入ごとの待機→取得完了までの時間（ログ画面の時刻）と、CAPTCHA・失敗の頻度を記録し、上限を見直す**。目安: 100ページあたりのCAPTCHA/失敗が5%未満で、投入が数時間以内に消化されるなら倍にする。
 - 上限打切り（`SUCCESS_TRUNCATED`）の取得は「一部の取得」であり取得完了とは区別して表示する。0017・0018適用後は次ページの位置を保存し、次回は重なり確認を挟んで続きから取得する（下記参照）。検索結果自体の変化による欠落まで保証するものではない。
 
+### 止まりの検知・出典ごとの新規ASIN率・稼働の可視化（読み取りのみ。docs/DEVIATIONS.md #79）
+
+Amazonへのアクセスは増えません。DBの読み取りと、`exports/workflow` のログの表示だけです。マイグレーション（スキーマ変更）はありません。
+
+**止まりの検知（watchの状態表示とターミナルの警告）**: watch が市場ごとに（US/JPは別々のDB接続。一方の失敗は他方を止めない）、最短10分おきに次を調べ、`python -m workflow.cli status`（`exports/workflow/watch_status.json` の `stall`）に出し、警告はターミナルに `[停止の兆候]` として表示する。同じ警告は `watch.notify_minutes`（既定360分）以内には繰り返さない。人手待ち（`human`）とは別で、watchの状態（稼働中／待機／人手対応待ち）は変えない。
+- 要解除の出典（取り直しの上限 `CYCLE_RESTART_LIMIT`／保留 `ON_HOLD`）の件数と一覧。解除は `python -m acquisition.cli release --market <US|JP> --source-id <ID> --reason ...`。
+- 商品ページ取得（discover）が `SERVER_ERROR` で何回連続したか。`stall.server_error_streak`（既定5）回以上で警告。途中の中断（日次枠の不足）は数えず、成功や別のエラーで連続は途切れる。
+- 直近24時間の初見ASIN数が、その前の7日間の日次（24時間ごと）の中央値の `stall.new_asin_min_percent`%（既定30）**未満**なら警告。7日分のデータが足りない市場（最も古い取得runが8日前より新しい）は警告せず「判定不能」と表示。中央値が0のときも警告しない。
+- 設定は `config/workflow.json` の `stall` 項目（例: `"stall": {"server_error_streak": 5, "new_asin_min_percent": 30}`）。範囲は `server_error_streak` 1〜1000、`new_asin_min_percent` 1〜100の整数。省略すれば既定値（既存の設定ファイルはそのまま使える）。
+
+**出典ごとの新規ASIN率**（読み取り専用。USとJPは別々に実行）:
+
+```
+python -m seller_performance.cli source-yield --marketplace=US            # 直近24時間
+python -m seller_performance.cli source-yield --marketplace=JP --hours 72  # 直近72時間
+```
+
+出典ごとに、run数・ページ数・保存行数・重複なしASIN数・初見ASIN数・既知ASIN数・初見ASIN/ページを表示し、末尾に合計と「保存行のうち重複なしの割合」「重複なしASINのうち初見の割合」を出す。CSVは `exports/source_yield/source_yield_<市場>_<時間>h_<日時>.csv`（UTF-8 BOM付き。`--output-dir` で出力先を変更）。**初見ASIN** = 対象期間より前のrunに、その市場のDB全体で一度も無いASIN。出典ごとの数は出典内の重複を除いたもので、複数の出典が同じASINを取得していれば各出典に数えるため、合計行（市場全体で数え直し）より出典の合計が大きくなることがある。商品ページ調査（`ASIN_PAGE`）は出典ではないので表から除き、件数だけ参考に表示する。実行時間も表示する。
+
+**稼働の可視化**（DBには接続しない）:
+
+```
+python -m seller_performance.cli watch-activity --days 7
+```
+
+日ごと（Asia/Tokyo）の、取得の記録がある時間数（市場別・全体）、停止要求の回数、人手待ちの回数（市場別）。稼働時間は `daily_usage.jsonl`、停止要求・人手待ちは `watch_events.jsonl`（この機能以降のwatchが追記する）から数える。ログが無い／記録が始まる前の日は「記録なし」と表示する（0とは区別する）。
+
 ### 上限で打ち切った出典の続き取得（マイグレーション0017）と除外・保留の枝
 
 - 上限（ページ数・ASIN数）で打ち切った出典は、**次ページ位置をASINの保存と同じトランザクションで保存**し、次の実行で続きから取得する。続きでは前回の最後のページを`overlap_pages`（初期1。0/1のみ）だけ取り直して、ページ送りが有効か確認する（変化は`drift`として記録。**検索結果は時間で変わるため、欠落が無いとは保証できない**）。取得済みページは繰り返さない。最後のページまで正常に到達（一巡完了）した時点から30日間隔。途中の続きは30日を待たないが、除外・保留・旧証拠・冷却・lease・日次上限は通る。一巡を`cycle_max_age_days`（初期14日）以上放置した場合や、次ページ位置を信頼できない場合（無効なURL・ループ・繰り返しページ・重なり不足）は、旧一巡を完了にせず、理由を記録して先頭から新しい一巡を始める。取り直しが続く場合は自動保留（`release`で解除）。設定: `python -m acquisition.cli set-cycle-config --market US --type SELLER --cycle-max-age-days 14 --overlap-pages 1`。

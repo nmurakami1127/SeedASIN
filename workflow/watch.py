@@ -6,6 +6,8 @@
 - 市場ごとに別のworkflowにする。一方が人手待ち（ログイン・CAPTCHA等）や保留でも、独立した他方の市場を進める。
 - 失敗した工程は`retry_after`（失敗の冷却）が来るまで再試行しない。連続3回失敗した工程は自動保留にして、手動の`resume`まで再試行しない。
   人手待ちの表示は同じ内容を`notify_minutes`以内には繰り返さない。
+- 止まりの検知（`workflow.stall`。要解除の出典・商品ページのSERVER_ERROR連続・初見ASINの急減。市場ごと・DBの読み取りのみ）の警告も、同じ`notify_minutes`で
+  繰り返しを抑える。人手待ち（`human`）とは別に`stall`として状態ファイルに出し、watchの状態（running/idle/waiting_human）は変えない。
 - Ctrl+Cで安全に終了（状態を保存。下位の取得・調査は中断として確定済み。次回watchで続きから再開）。
 - PCが停止中・スリープ中は動かない（OSへの常駐・自動起動の登録はしない）。
 """
@@ -19,12 +21,15 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable
 
-from workflow.config import WorkflowConfig, config_from_dict
+from workflow.config import OPPOSITE, WorkflowConfig, config_from_dict
 from workflow.daily_usage import JST, DailyUsage, jst_day, next_jst_midnight
 from workflow.engine import Engine
+from workflow.stall import check_all
 from workflow.store import DONE_STATES, State, WorkflowStore, pid_alive
+from workflow.watch_events import append_event
 
 AUTO_HOLD_AFTER = 3
+STALL_CHECK_MIN_MINUTES = 10  # 止まりの検知のDB確認の最短間隔（続きの候補を5秒ごとに確認する間も、毎回は調べない）
 
 
 def _iso(ts: datetime) -> str:
@@ -48,12 +53,14 @@ class CycleResult:
     state: str = "idle"                 # running / idle / waiting_human
     lanes: dict = field(default_factory=dict)  # 市場 → 説明
     human: list = field(default_factory=list)  # 人手対応待ち（表示用）
+    stall: list = field(default_factory=list)  # 止まりの兆候の警告（表示用。人手待ちとは別で、stateには影響しない）
     next_check: datetime | None = None
 
 
 class Watcher:
     def __init__(self, cfg: WorkflowConfig, factory, ports, *, now: Callable[[], datetime] | None = None,
-                 sleep: Callable[[float], None] = time.sleep, out: Callable[[str], None] = print, min_gap_seconds: float = 5.0) -> None:
+                 sleep: Callable[[float], None] = time.sleep, out: Callable[[str], None] = print, min_gap_seconds: float = 5.0,
+                 stall_check: Callable | None = None) -> None:
         self.cfg, self.factory, self.ports = cfg, factory, ports
         self.now = now or (lambda: datetime.now(timezone.utc))
         self.sleep, self.out, self.min_gap = sleep, out, min_gap_seconds
@@ -65,6 +72,10 @@ class Watcher:
         self.started = self.now()
         self.cycles = 0
         self._notified: dict[str, datetime] = {}
+        self._stall_check = stall_check or check_all  # (factory, markets, cfg.stall, now) → {市場: MarketStall}。テストで差し替える
+        self._stall_checked_at: datetime | None = None
+        self._stall_snapshot: dict | None = None   # watch_status.jsonの"stall"
+        self._stall_warnings: dict[str, list] = {}  # 市場 → [(種類のキー, 表示文)]（通知の間引き用。状態ファイルには出さない）
         self._last_state = "starting"
         self._feedback_versions = {}
         if hasattr(self.ports, "keep_tool_open"):
@@ -80,7 +91,7 @@ class Watcher:
              "usage_session": self.usage.used_since(_iso(self.started)), "usage_today": today, "today_jst": jst_day(self.now()),
              "caps": {"pages": self.cfg.daily.max_pages, "submit_per_direction": self.cfg.daily.max_new_submissions_per_direction,
                       "asins": self.cfg.daily.max_submit_asins},
-             "interval_minutes": self.cfg.watch.interval_minutes}
+             "interval_minutes": self.cfg.watch.interval_minutes, "stall": self._stall_snapshot}
         self.status_path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.status_path.with_suffix(".tmp")
         tmp.write_text(json.dumps(d, ensure_ascii=False, indent=1), encoding="utf-8")
@@ -175,12 +186,53 @@ class Watcher:
         if changed:
             self.store.save(st)
 
-    def _notify(self, key: str, msg: str, res: CycleResult) -> None:
+    def _notify(self, key: str, msg: str, res: CycleResult, lane: str | None = None) -> None:
         res.human.append(msg)
         last = self._notified.get(key)
         if last is None or self.now() - last >= timedelta(minutes=self.cfg.watch.notify_minutes):
             self._notified[key] = self.now()
             self._say("[人手対応待ち] " + msg)
+            append_event(self.cfg.state_dir, self.now(), "human_wait", lane, detail=msg[:200])
+
+    # ------------------------------------------------------------------ 止まりの検知（読み取りのみ）
+    def _stall_markets(self) -> list[str]:
+        ms = set(self.cfg.lanes) | {self.cfg.page_market(lane) for lane in self.cfg.lanes}
+        if self.cfg.cross.enabled:
+            ms |= {OPPOSITE[m] for m in ms}
+        return sorted(ms)
+
+    def _check_stalls(self, res: CycleResult) -> None:
+        """要解除の出典・SERVER_ERRORの連続・初見ASINの急減を調べ、警告を状態ファイルとターミナルに出す。
+        確認は最短STALL_CHECK_MIN_MINUTES分ごと（間の周期は前回の結果を使う）。失敗しても本来の処理は止めない。"""
+        if self.factory is None:
+            return
+        now = self.now()
+        if self._stall_checked_at is None or now - self._stall_checked_at >= timedelta(minutes=STALL_CHECK_MIN_MINUTES):
+            self._stall_checked_at = now
+            try:
+                found = self._stall_check(self.factory, self._stall_markets(), self.cfg.stall, now)
+                self._stall_snapshot = {"checked_at": _iso(now), "markets": {m: s.to_dict() for m, s in found.items()}}
+                self._stall_warnings = {m: list(s.warnings) for m, s in found.items()}
+            except Exception as exc:  # noqa: BLE001 - 検知の失敗でwatchを止めない
+                self._stall_snapshot = {"checked_at": _iso(now), "markets": {}, "error": f"{type(exc).__name__}: {exc}"[:200]}
+                self._stall_warnings = {}
+        snap = self._stall_snapshot or {}
+        for m, mk in (snap.get("markets") or {}).items():
+            if mk.get("error"):
+                self._notify_stall(f"stall:{m}:error", f"{m}: 止まりの確認に失敗しました（{mk['error']}）", m, res)
+        for m, warnings in self._stall_warnings.items():
+            for key, text in warnings:
+                self._notify_stall(f"stall:{m}:{key}", text, m, res)
+        if snap.get("error"):
+            self._notify_stall("stall:*:error", f"止まりの確認に失敗しました（{snap['error']}）", None, res)
+
+    def _notify_stall(self, key: str, msg: str, market: str | None, res: CycleResult) -> None:
+        res.stall.append(msg)
+        last = self._notified.get(key)
+        if last is None or self.now() - last >= timedelta(minutes=self.cfg.watch.notify_minutes):
+            self._notified[key] = self.now()
+            self._say("[停止の兆候] " + msg)
+            append_event(self.cfg.state_dir, self.now(), "stall_warning", market, detail=msg[:200])
 
     def cycle(self) -> CycleResult:
         res = CycleResult(next_check=self.now() + timedelta(minutes=self.cfg.watch.interval_minutes))
@@ -263,7 +315,7 @@ class Watcher:
                 if t.kind == "submit" and not self.cfg.submission_enabled:
                     continue
                 if t.status in ("WAITING", "UNKNOWN"):
-                    self._notify(f"{wid}:{t.id}:{t.detail}", f"{t.lane} {t.id}: {t.detail}", res)
+                    self._notify(f"{wid}:{t.id}:{t.detail}", f"{t.lane} {t.id}: {t.detail}", res, t.lane)
                 elif t.status in ("FAILED", "HELD"):
                     res.lanes.setdefault(t.lane, f"{t.id} {t.status}（再試行 {t.retry_after or '-'}）: {t.detail[:80]}")
         # 2. 次の実行可能な候補（市場ごとに別のworkflow）
@@ -304,7 +356,8 @@ class Watcher:
                 if t.kind == "submit" and not self.cfg.submission_enabled:
                     continue
                 if t.status in ("WAITING", "UNKNOWN"):
-                    self._notify(f"{eng.st.workflow_id}:{t.id}:{t.detail}", f"{t.lane} {t.id}: {t.detail}", res)
+                    self._notify(f"{eng.st.workflow_id}:{t.id}:{t.detail}", f"{t.lane} {t.id}: {t.detail}", res, t.lane)
+        self._check_stalls(res)
         res.state = "running" if res.worked else ("waiting_human" if res.human else "idle")
         if res.worked:
             res.next_check = self.now() + timedelta(seconds=self.min_gap)  # 続きの候補があるかをすぐ確認する（外部に出る前にDBで判定）
@@ -316,6 +369,7 @@ class Watcher:
             if self.stop_path.exists():
                 self.stop_path.unlink()  # 前回の停止要求の残り
             self._say(f"watchを開始します（再確認の間隔 {self.cfg.watch.interval_minutes}分。Ctrl+C または `workflow.cli stop` で終了。PCが停止中は動きません）")
+            append_event(self.cfg.state_dir, self.now(), "watch_start")
             self._write_status("running", "起動時の状態確認")
             reason_stop = "停止しました"
             try:
@@ -328,6 +382,7 @@ class Watcher:
                         self._say(f"待機: {reason}（次回確認 {res.next_check.astimezone(JST):%H:%M} JST。Amazon・統合ツールは開いていません）")
                     if self.stop_requested():
                         reason_stop = "停止要求（stop）を受けて、安全な区切りで停止しました"
+                        append_event(self.cfg.state_dir, self.now(), "stop_request")
                         break
                     if max_cycles is not None and self.cycles >= max_cycles:
                         reason_stop = f"指定した確認回数（{max_cycles}回）を終えたので停止しました"
@@ -335,6 +390,7 @@ class Watcher:
                     self._wait(res.next_check)
                     if self.stop_requested():
                         reason_stop = "停止要求（stop）を受けて停止しました"
+                        append_event(self.cfg.state_dir, self.now(), "stop_request")
                         break
             except KeyboardInterrupt:
                 reason_stop = "Ctrl+Cで停止しました"
