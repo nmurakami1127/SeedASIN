@@ -55,3 +55,6 @@ run_ai_worker.sh
 
 # workflow: 運用値(import_id等)を含む実設定はGit管理しない（例は config/workflow.example.json）
 config/workflow.json
+
+# Claude Code の Worker の作業ツリー（.claude/ 全体は除外しない）
+.claude/worktrees/
