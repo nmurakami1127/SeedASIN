@@ -30,7 +30,7 @@ _SERVER_ERROR_MARKERS = ("cs_503_logo", "cs_503_link", "something went wrong")
 
 
 @contextmanager
-def open_browser(marketplace: str) -> Iterator[BrowserContext]:
+def open_browser(marketplace: str, *, playwright=None) -> Iterator[BrowserContext]:
     """marketplace別の永続プロファイルでheadedブラウザを起動する。
 
     郵便番号等の配送先地域は、このプロファイルディレクトリに人が事前に手動で
@@ -38,12 +38,16 @@ def open_browser(marketplace: str) -> Iterator[BrowserContext]:
     """
     profile_dir = _PROFILE_ROOT / marketplace.lower()
     profile_dir.mkdir(parents=True, exist_ok=True)
-    with sync_playwright() as p:
-        context = p.chromium.launch_persistent_context(str(profile_dir), headless=False)
-        try:
-            yield context
-        finally:
-            context.close()
+    if playwright is None:
+        with sync_playwright() as runtime:
+            with open_browser(marketplace, playwright=runtime) as context:
+                yield context
+        return
+    context = playwright.chromium.launch_persistent_context(str(profile_dir), headless=False)
+    try:
+        yield context
+    finally:
+        context.close()
 
 
 def html_is_captcha(content: str) -> bool:

@@ -17,7 +17,7 @@ SELECTION_MODES = ("ordered_only", "ordered_then_zero", "zero_only")
 
 # 安全な範囲（これを超える設定は拒否する）。出典発見側の上限（acquisition.discovery.HARD_CAPS）と同じか、より厳しい。
 HARD = {
-    "origin_asins": 10, "sources_per_origin": 10, "pages_per_source": 20, "cross_asins": 5, "cross_sources_per_asin": 5,
+    "origin_asins": 10, "sources_per_origin": 10, "pages_per_source": 200, "cross_asins": 5, "cross_sources_per_asin": 5,
     "max_total_pages": 200, "max_new_sources": 100, "max_submit_asins": 50000, "tool_max_asins": 5000,
 }
 
@@ -92,6 +92,11 @@ class WorkflowConfig:
     daily: Daily = field(default_factory=Daily)
     watch: Watch = field(default_factory=Watch)
     profile: str = "trial"          # 表示用の名前（trial=試運転 / standard=通常運用）。動作は上の値だけで決まる
+    listing_feedback: bool = False  # 出品確定実績のあるセラーを辿れる起点を優先。候補の足切りはしない
+    skip_failures: bool = False  # 利用者の指示で失敗をスキップ。結果不明は履歴・占有を残して追跡取り下げ
+    batch_target_asins: int = 0  # 0=従来方式。続き取得を同一出典・方向でこの件数まで蓄積し、一巡完了時に端数を送る
+    submission_enabled: bool = True  # False=探索と投入計画の保存のみ。登録は独立した手動実行
+    tool_session_monitor: bool = False  # ログインの定期監視・維持アクセスは明示的に有効化した場合だけ
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -111,6 +116,9 @@ class WorkflowConfig:
         return self.lanes[lane].page_market or lane
 
     def validate(self) -> "WorkflowConfig":
+        for name in ("submission_enabled", "tool_session_monitor"):
+            if not isinstance(getattr(self, name), bool):
+                raise ConfigError(f"{name} はtrue/falseで指定してください")
         if not self.lanes:
             raise ConfigError("lanes（市場ごとの起点レポート）が空です")
         for m, ln in self.lanes.items():
@@ -155,6 +163,8 @@ class WorkflowConfig:
             raise ConfigError(f"tool_max_asins は1〜{HARD['tool_max_asins']}（統合ツールの1回の入力）")
         if not isinstance(self.result_max_age_days, int) or not 1 <= self.result_max_age_days <= 365:
             raise ConfigError("result_max_age_days は1〜365")
+        if not isinstance(self.batch_target_asins, int) or not 0 <= self.batch_target_asins <= self.tool_max_asins:
+            raise ConfigError("batch_target_asins は0〜tool_max_asinsで指定してください")
         return self
 
 
@@ -166,7 +176,8 @@ def config_from_dict(d: dict) -> WorkflowConfig:
             lanes=lanes, limits=Limits(**d.get("limits", {})), totals=Totals(**d.get("totals", {})), cross=Cross(**d.get("cross", {})),
             daily=Daily(**d.get("daily", {})), watch=Watch(**d.get("watch", {})),
             **{k: d[k] for k in ("brand_enabled", "tool_max_asins", "result_max_age_days", "state_dir", "submission_dir",
-                                 "page_revisit_days", "profile") if k in d},
+                                 "page_revisit_days", "profile", "listing_feedback", "skip_failures", "batch_target_asins",
+                                 "submission_enabled", "tool_session_monitor") if k in d},
         )
     except TypeError as exc:
         raise ConfigError(f"設定に未知の項目があります: {exc}") from exc

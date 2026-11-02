@@ -125,6 +125,35 @@ def ledger(tmp_path):
 NOSLEEP = lambda s: None  # noqa: E731
 
 
+@pytest.mark.parametrize("uncertain_event", ["OUTCOME_UNKNOWN", "AMBIGUOUS"])
+def test_abandon_unknown_preserves_history_and_never_touches_browser(ledger, uncertain_event):
+    from tool_submission.runner import pending_others
+    from tool_submission.planner import OCCUPYING
+
+    ledger.append("k1", "SUBMIT_STARTED", before_run_ids=[123])
+    ledger.append("k1", uncertain_event, candidate=124, candidates=[124, 125])
+    before = ledger.events()
+    ledger.abandon_unknown("k1", reason="ユーザーが特定の追跡取り下げを指示")
+    st = ledger.state("k1")
+    assert st.state == "ABANDONED" and st.attempts == 1
+    assert st.before_run_ids == [123] and st.tool_run_id is None
+    assert ledger.events()[:-1] == before
+    assert pending_others(ledger, "next") == []
+    assert st.state in OCCUPYING  # 同じASINの予約を開放しない
+    result = submit_item(ledger, object(), item(), Path("unused.csv"))
+    assert result.kind == "REFUSED"
+    assert ledger.state("k1").attempts == 1
+
+
+def test_abandon_requires_unknown_state_and_reason(ledger):
+    with pytest.raises(ValueError):
+        ledger.abandon_unknown("k1", reason="取り下げ")
+    ledger.append("k1", "OUTCOME_UNKNOWN")
+    with pytest.raises(ValueError):
+        ledger.abandon_unknown("k1", reason=" ")
+    assert ledger.state("k1").state == "UNKNOWN"
+
+
 def run(ledger, page, it=None, **kw):
     return submit_item(ledger, page, it or item(), Path("x.csv"), sleep=NOSLEEP, **kw)
 
@@ -524,6 +553,38 @@ def test_adapter_log_reading_set_memo_and_unreadable_detection():
     assert ("fill", 'tr[data-seq="7300006"]>>textarea.memo') in pg.calls
     clicks = [c for c in pg.calls if c[0] == "click"]
     assert len(clicks) == 1 and clicks[0][1].startswith('tr[data-seq="7300006"]') and clicks[0][2] == {"no_wait_after": True}
+
+
+def test_adapter_waits_for_slow_response_without_a_second_save(tmp_path):
+    from types import SimpleNamespace
+
+    class SlowPage(PwPage):
+        def __init__(self):
+            super().__init__()
+            self.handlers = {}
+            self.ticks = 0
+
+        def on(self, event, callback):
+            self.handlers[event] = callback
+
+        def remove_listener(self, event, callback):
+            assert self.handlers.pop(event) == callback
+
+        def wait_for_timeout(self, ms):
+            self.ticks += 1
+            if self.ticks == 1:
+                self.handlers["request"](SimpleNamespace(url="https://example.invalid/start_search4.php", method="POST", post_data='{"url":"B000000001"}'))
+            if self.ticks == 40:  # 従来の15秒を超えた応答
+                self.handlers["response"](SimpleNamespace(url="https://example.invalid/start_search4.php", status=200, text=lambda: "success"))
+
+    path = tmp_path / "input.csv"
+    path.write_text("B000000001\n", encoding="utf-8")
+    page = SlowPage()
+    result = ImportToolPage(page).submit(item(n=1), path)
+    assert result.evidence["response"] == "success"
+    assert result.evidence["status"] == 200
+    assert len([c for c in page.calls if c[0] == "click"]) == 1
+    assert page.handlers == {}
 
 
 def test_adapter_submit_clicks_save_once_and_maps_failures_to_phases(tmp_path):

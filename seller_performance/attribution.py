@@ -24,21 +24,31 @@ class AttributionService:
     def attribute(self, conn: Connection, marketplace: str) -> int:
         """未確定のASINについてseller_attributionへ記録する。戻り値は新規に記録した件数。"""
         with conn.begin():
+            # RLSのcurrent_setting条件で候補数が過少推定されると、数百万の取得行を
+            # 起点ごとに繰り返し走査してしまう。この集計のトランザクション内だけ
+            # ハッシュ/マージ結合を使う（接続やDB全体の設定には残さない）。
+            conn.execute(text("SET LOCAL enable_nestloop = off"))
             result = conn.execute(
                 text(
                     """
-                    WITH earliest_source AS (
+                    WITH earliest_listing AS (
+                        SELECT w.marketplace, w.asin, MIN(w.snapshot_date) AS listed_at
+                        FROM weekly_listing_snapshot w
+                        WHERE w.marketplace = :mp
+                          AND NOT EXISTS (
+                              SELECT 1 FROM seller_attribution a
+                              WHERE a.marketplace = w.marketplace AND a.asin = w.asin
+                          )
+                        GROUP BY w.marketplace, w.asin
+                    ),
+                    earliest_source AS (
                         SELECT DISTINCT ON (o.marketplace, o.asin)
                             o.marketplace, o.asin, o.tool_run_id
                         FROM tool_output_asin o
+                        JOIN earliest_listing el
+                            ON el.marketplace = o.marketplace AND el.asin = o.asin
                         WHERE o.marketplace = :mp
                         ORDER BY o.marketplace, o.asin, o.acquired_at ASC
-                    ),
-                    earliest_listing AS (
-                        SELECT marketplace, asin, MIN(snapshot_date) AS listed_at
-                        FROM weekly_listing_snapshot
-                        WHERE marketplace = :mp
-                        GROUP BY marketplace, asin
                     )
                     INSERT INTO seller_attribution
                         (marketplace, asin, seller_id, first_seen_via_tool_run_id, listed_at)

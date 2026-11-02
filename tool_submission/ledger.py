@@ -6,6 +6,7 @@ DBのスキーマは変えない暫定の置き場（DBに置く案は docs/DEVI
 - PLANNED          計画済み（まだ送信していない。手動投入の基準(BASELINE_RECORDED)だけ記録済みでもここ）
 - SUBMITTING       送信を開始した（SAVEのクリックの前に記録する。完了の記録が無いまま残ったら結果不明として扱う）
 - UNKNOWN          **結果不明**（SAVE後に実行IDを一意に特定できない）。再送しない。メモも付けない
+- ABANDONED        人の指示で追跡を取り下げた。送信済みの可能性を残し、再送・メモ保存はしない
 - AMBIGUOUS        新規行が複数あり、送信結果との対応を一意に確認できない。適当な行にメモを付けず、人が確認する
 - RUN_IDENTIFIED   **実行ID確定・メモ未保存**。ASINは再投入せず、この実行IDのメモ保存から再開する
 - MEMO_SAVED       実行IDの行にメモが保存され、再読込で確認できた
@@ -62,6 +63,15 @@ class SubmissionLedger:
             return []
         return [json.loads(line) for line in self.path.read_text(encoding="utf-8").splitlines() if line.strip()]
 
+    def abandon_unknown(self, key: str, *, reason: str) -> None:
+        """結果不明の追跡だけを取り下げる。外部ジョブを取消したという意味ではない。"""
+        if not reason.strip():
+            raise ValueError("取り下げ理由が必要です")
+        with self.key_lock(key):
+            if self.state(key).state not in ("UNKNOWN", "AMBIGUOUS"):
+                raise ValueError("UNKNOWN/AMBIGUOUSの投入だけを取り下げられます")
+            self.append(key, "TRACKING_ABANDONED", reason=reason)
+
     def state(self, key: str) -> LedgerState:
         return self._fold(key, self.events())
 
@@ -74,7 +84,7 @@ class SubmissionLedger:
             st.events.append(e)
             ev = e["event"]
             if ev == "PLANNED":
-                if st.state in ("NONE", "PLANNED"):  # 送信が始まった後は、計画の内容を書き換えない
+                if st.state in ("NONE", "PLANNED", "WITHDRAWN"):  # 送信が始まった後は、計画の内容を書き換えない
                     st.manifest = e.get("manifest")
                     st.state = "PLANNED"
             elif ev == "BASELINE_RECORDED":  # 手動投入の前に控えた、送信前のログID一覧
@@ -89,6 +99,10 @@ class SubmissionLedger:
                 st.evidence = e.get("evidence")
             elif ev == "OUTCOME_UNKNOWN":
                 st.state = "UNKNOWN"
+            elif ev == "TRACKING_ABANDONED":
+                st.state = "ABANDONED"
+            elif ev == "PLAN_WITHDRAWN" and st.state == "PLANNED" and st.attempts == 0:
+                st.state = "WITHDRAWN"  # 未送信の小口計画だけを再編成。履歴・入力ファイルは残す
             elif ev == "AMBIGUOUS":
                 st.state = "AMBIGUOUS"
             elif ev == "RUN_IDENTIFIED":

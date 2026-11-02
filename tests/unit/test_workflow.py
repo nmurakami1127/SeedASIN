@@ -31,6 +31,53 @@ def test_defaults_are_small_and_validated():
         config_from_dict({"lanes": {}})
 
 
+def test_skip_failures_keeps_evidence_and_does_not_skip_human_waits(tmp_path):
+    from types import SimpleNamespace
+    from tool_submission.ledger import SubmissionLedger
+    from tool_submission.runner import pending_others
+    from workflow.watch import Watcher
+
+    store = WorkflowStore(tmp_path / "workflow")
+    st = State("wf-skip", "now", {}, "h")
+    st.tasks["failed"] = Task("failed", "acquire", "US", status="FAILED", detail="通信失敗", attempts=1)
+    st.tasks["unknown"] = Task("unknown", "submit", "US", status="WAITING", detail="ログイン待ち", result={"key": "k"})
+    st.tasks["captcha"] = Task("captcha", "discover", "JP", status="WAITING", detail="CAPTCHA")
+    ledger = SubmissionLedger(tmp_path / "submission/ledger.jsonl")
+    ledger.append("k", "PLANNED", manifest={"asin_count": 157})
+    ledger.append("k", "SUBMIT_STARTED", before_run_ids=[1])
+    ledger.append("k", "OUTCOME_UNKNOWN", candidate=2)
+    watcher = Watcher.__new__(Watcher)
+    watcher.store, watcher.cfg = store, SimpleNamespace(submission_dir=ledger.path.parent)
+    watcher._say = lambda _: None
+    watcher._skip_failures(st)
+    assert store.load(st.workflow_id).tasks["failed"].status == "SKIPPED"
+    assert st.tasks["failed"].result["skipped_failure"]["detail"] == "通信失敗"
+    assert st.tasks["unknown"].status == "SKIPPED"
+    assert st.tasks["captcha"].status == "WAITING"
+    assert ledger.state("k").state == "ABANDONED" and ledger.state("k").attempts == 1
+    assert pending_others(ledger, "next") == []
+    count = len(ledger.events())
+    watcher._skip_failures(st)
+    assert len(ledger.events()) == count
+
+
+def test_skipped_failure_unblocks_waiting_descendants(tmp_path):
+    from types import SimpleNamespace
+    from datetime import datetime, timezone
+    from workflow.watch import Watcher
+    st = State("wf-deps", "now", {}, "h")
+    st.tasks["acquire"] = Task("acquire", "acquire", "US", status="FAILED", retry_after="9999-01-01T00:00:00Z")
+    st.tasks["expand"] = Task("expand", "expand", "US", deps=["acquire"], detail="acquire がFAILEDのため待機")
+    w = Watcher.__new__(Watcher)
+    w.now = lambda: datetime.now(timezone.utc)
+    assert not w._due(st)
+    st.tasks["acquire"].status = "SKIPPED"
+    assert w._due(st)
+    st.tasks["acquire"].status = "FAILED"
+    st.tasks["acquire"].result["usable"] = 1
+    assert w._due(st)
+
+
 def test_state_roundtrip_atomic_save_and_bak_fallback(tmp_path):
     store = WorkflowStore(tmp_path)
     _state(store)

@@ -1,12 +1,13 @@
 """日次使用量（JST区切り・確保/確定/解放・永続・同時確保）の単体テスト。"""
 from __future__ import annotations
 
-import threading
+import os
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 
 import pytest
 
-from workflow.daily_usage import DailyUsage, jst_day, next_jst_midnight
+from workflow.daily_usage import DailyUsage, UsageBusy, jst_day, next_jst_midnight
 
 CAPS = {"pages": 5, "submit:EXPORT": 2, "asins": 100}
 
@@ -61,16 +62,49 @@ def test_usage_switches_at_the_jst_midnight_and_a_commit_stays_on_the_reservatio
 
 def test_concurrent_reservations_never_exceed_the_cap(tmp_path):
     clock = Clock("2026-10-17T01:00:00Z")
-    results = []
-
     def worker(i):
         u = DailyUsage(tmp_path / "u.jsonl", now=clock.now)  # 別プロセスを模した別インスタンス
-        results.append(u.reserve(f"r{i}", {"pages": 1}, {"pages": 5})[0])
+        return u.reserve(f"r{i}", {"pages": 1}, {"pages": 5})[0]
 
-    ts = [threading.Thread(target=worker, args=(i,)) for i in range(20)]
-    [t.start() for t in ts]
-    [t.join() for t in ts]
+    # mapの結果を全件読むことで、ワーカーの例外もテスト失敗にする。
+    with ThreadPoolExecutor(max_workers=20) as pool:
+        results = list(pool.map(worker, range(20)))
+    assert len(results) == 20
     assert sum(results) == 5 and DailyUsage(tmp_path / "u.jsonl", now=clock.now).used() == {"pages": 5}
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windowsの削除中ロックのアクセス拒否")
+def test_lock_retries_transient_windows_permission_error(tmp_path, monkeypatch):
+    real_open = os.open
+    calls = []
+
+    def transient_open(*args):
+        calls.append(args)
+        if len(calls) == 1:
+            raise PermissionError(13, "lock is being deleted")
+        return real_open(*args)
+
+    monkeypatch.setattr(os, "open", transient_open)
+    u = DailyUsage(tmp_path / "u.jsonl")
+    assert u.reserve("a", {"pages": 1}, {"pages": 1})[0]
+    assert len(calls) == 2 and u.used() == {"pages": 1}
+    assert not u.path.with_suffix(".lock").exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windowsのアクセス拒否を期限付きで待つ")
+def test_lock_permission_error_times_out_without_removing_existing_lock(tmp_path, monkeypatch):
+    u = DailyUsage(tmp_path / "u.jsonl")
+    lock = u.path.with_suffix(".lock")
+    lock.write_text("another owner")
+
+    def denied_open(*args):
+        raise PermissionError(13, "access denied")
+
+    monkeypatch.setattr(os, "open", denied_open)
+    with pytest.raises(UsageBusy):
+        u._lock(timeout=0)
+    assert lock.read_text() == "another owner"
+    assert not u.path.exists()
 
 
 def test_used_since_sums_this_session_across_days(tmp_path):

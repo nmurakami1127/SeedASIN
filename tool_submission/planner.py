@@ -28,7 +28,8 @@ from tool_submission.model import (
 )
 
 USABLE_OUTCOMES = ("SUCCESS_NONEMPTY", "SUCCESS_TRUNCATED")
-PARTIAL_REASON = {"SUCCESS_TRUNCATED": "上限打切りの取得（一部のASINのみ。ページ数・ASIN数の上限で止めた）"}
+PARTIAL_REASON = {"SUCCESS_TRUNCATED": "上限打切りの取得（一部のASINのみ。ページ数・ASIN数の上限で止めた）",
+                  "PARTIAL": "取得失敗前に保存済みのASINのみ。取得は未完了で、失敗履歴・再開位置を保持"}
 
 
 def _path_dict(p) -> dict:
@@ -36,7 +37,7 @@ def _path_dict(p) -> dict:
             "origin_asin": p.origin_asin, "origin_units": p.origin_units, "via_source_id": p.via_source_id, "via_asin": p.via_asin}
 
 
-OCCUPYING = ("PLANNED", "SUBMITTING", "UNKNOWN", "AMBIGUOUS", "RUN_IDENTIFIED", "MEMO_SAVED", "LINKED")  # 未送信の予約・送信開始済み・結果不明を含む
+OCCUPYING = ("PLANNED", "SUBMITTING", "UNKNOWN", "ABANDONED", "AMBIGUOUS", "RUN_IDENTIFIED", "MEMO_SAVED", "LINKED")  # 追跡取り下げも送信済みの可能性を残す
 
 
 def _cycle_key(cycle_id: int | None, run_id: int) -> str:
@@ -77,20 +78,25 @@ def _occupancy(states: dict, run_id: int, source_id: int, direction: str, market
 
 
 def build_items(app: SessionFactory, fetch_market: str, run_id: int, *, out_dir: Path, direction_override: str | None = None,
-                max_per_input: int = MAX_ASINS_PER_INPUT, ledger: SubmissionLedger | None = None) -> tuple[list[SubmissionItem], list[bytes]]:
+                max_per_input: int = MAX_ASINS_PER_INPUT, ledger: SubmissionLedger | None = None,
+                batch_target: int = 0, allow_saved_partial: bool = False,
+                flush_buffer: bool = False) -> tuple[list[SubmissionItem], list[bytes]]:
     """計画と、各入力ファイルの内容を返す。書き込みはしない。
     ledgerを渡すと、**同じ出典・業務方向**の投入差分を管理する:
     - 同じ一巡で既に投入（送信開始済み・結果不明・未送信の投入計画への予約を含む）したASINは、この入力から除く（再送しない）。
     - 過去の別の一巡で投入済みのASINは、新しいASINとは**別の入力**（repeat_of_earlier_cycle）にして、明示許可があるまで投入しない
       （黙って再送もしない・永久に除外もしない。新しいASINの投入は、その判断を待たずに進められる）。
     - 別の出典・別の業務方向は別に判定する。別の出典の入力にも同じASINがある場合は、参照情報(also_from)として残す。"""
+    if not 0 <= batch_target <= max_per_input:
+        raise SubmissionError("batch_target は0〜max_per_inputで指定してください")
     with app.get_session(fetch_market) as conn, conn.begin():
         run = conn.execute(
-            text("SELECT id, marketplace, source_id, status, outcome, truncation_reason, pages_fetched, completed_at, cycle_id, cycle_seq "
+            text("SELECT id, marketplace, source_id, status, outcome, truncation_reason, pages_fetched, completed_at, cycle_id, cycle_seq, cycle_state "
                  "FROM collector_run WHERE id = :id AND source_id IS NOT NULL"), {"id": run_id}).one_or_none()
         if run is None:
             raise SubmissionError(f"run={run_id} は市場{fetch_market}の出典取得として存在しません")
-        if run.status != "COMPLETED" or run.outcome not in USABLE_OUTCOMES:
+        saved_partial = allow_saved_partial and run.status == "FAILED" and run.outcome == "PARTIAL"
+        if not saved_partial and (run.status != "COMPLETED" or (run.outcome not in USABLE_OUTCOMES and not (batch_target and run.outcome == "SUCCESS_EMPTY"))):
             raise SubmissionError(f"run={run_id} は入力に使えません（状態={run.status} 結果={run.outcome}。成功または上限打切りのみ）")
         src = conn.execute(
             text("SELECT source_id, source_type, key_primary, display_primary FROM acquisition_source WHERE source_id = :s"),
@@ -99,6 +105,11 @@ def build_items(app: SessionFactory, fetch_market: str, run_id: int, *, out_dir:
             text("SELECT stage, direction, origin_marketplace, origin_import_id, origin_asin, origin_units, via_source_id, via_asin "
                  "FROM acquisition_path WHERE source_id = :s ORDER BY path_id"), {"s": run.source_id}).all()
         carried_runs = _carried_runs(conn, run)
+        if batch_target and run.cycle_id is not None:
+            carried_runs = [r[0] for r in conn.execute(text(
+                "SELECT id FROM collector_run WHERE marketplace=:m AND source_id=:s AND cycle_id=:c "
+                "AND cycle_seq<:q AND status NOT IN ('RUNNING','CAPTCHA_WAIT') ORDER BY cycle_seq"
+            ), {"m": fetch_market, "s": run.source_id, "c": run.cycle_id, "q": run.cycle_seq})]
         raw = [r[0] for r in conn.execute(
             text("SELECT ca.asin FROM collector_asin ca WHERE ca.collector_run_id = ANY(:rs) "
                  "ORDER BY array_position(CAST(:rs AS bigint[]), ca.collector_run_id), ca.id"),
@@ -116,7 +127,7 @@ def build_items(app: SessionFactory, fetch_market: str, run_id: int, *, out_dir:
     if not directions:
         raise SubmissionError(f"出典{src.source_id}の経路に業務方向がありません（手動登録・起点なし）。--direction で明示してください")
     key_name = src.key_primary if src.source_type == "SELLER" else src.display_primary
-    partial = run.outcome == "SUCCESS_TRUNCATED"
+    partial = run.outcome in ("SUCCESS_TRUNCATED", "PARTIAL")
     ckey = _cycle_key(run.cycle_id, run_id)
     states = ledger.all_states() if ledger is not None else {}  # 台帳は計画作成ごとに読み直す（方向ごとに読み直さない）
     file_cache: dict = {}
@@ -144,6 +155,13 @@ def build_items(app: SessionFactory, fetch_market: str, run_id: int, *, out_dir:
         for is_repeat, part in ((False, new_part), (True, repeat_part)):
             if not part:
                 continue
+            if batch_target and run.cycle_state != "COMPLETE":
+                # 失敗・停滞・再開位置の消失は末尾到達ではない。
+                # flush_bufferは旧呼び出しとの互換用に受け取るだけで、端数を放出しない。
+                # 同じ出典・方向・一巡で満杯になるまで残りを持ち越す。
+                part = part[:len(part) // batch_target * batch_target]
+                if not part:
+                    continue
             chunks_d = split_asins(part, max_per_input)
             items_d, files_d = _items_for(d, part, chunks_d, is_repeat, run_id, fetch_market, src, key_name, run, partial, asins, raw, paths,
                                           dpaths, best, directions, prior, out_dir, ckey, len(asins) - len(remaining), fetched_from, also_from,
@@ -215,9 +233,9 @@ def write_plan(items: list[SubmissionItem], files: list[bytes], ledger: Submissi
         manifest["status"] = item.status
         mpath = path.parent / f"manifest_{item.key}.json"
         st = ledger.state(item.key)
-        if st.state in ("NONE", "PLANNED"):
+        if st.state in ("NONE", "PLANNED", "WITHDRAWN"):
             mpath.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
-        if st.state in ("NONE", "PLANNED") and st.manifest != manifest:
+        if st.state in ("NONE", "PLANNED", "WITHDRAWN") and (st.state == "WITHDRAWN" or st.manifest != manifest):
             ledger.append(item.key, "PLANNED", manifest=manifest)
             results.append((item, "新規" if st.state == "NONE" else "更新"))
         else:

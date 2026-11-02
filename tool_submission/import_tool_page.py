@@ -129,21 +129,32 @@ class ImportToolPage:
                 except Exception:  # noqa: BLE001
                     cap["response"] = ""
 
+        def on_dialog(dialog) -> None:
+            cap["alerts"].append(dialog.message[:80])
+            dialog.dismiss()
+
         try:
             self._p.on("request", on_request)
             self._p.on("response", on_response)
-            self._p.on("dialog", lambda d: (cap["alerts"].append(d.message[:80]), d.dismiss()))
+            self._p.on("dialog", on_dialog)
         except Exception:  # noqa: BLE001 - 疑似ページ等で購読できない場合は根拠なし（呼び出し側が断定しない）
             pass
         try:
             self._p.locator(s.asin_save_button).click(no_wait_after=True)  # SAVEは1回だけ。待機のタイムアウトで再クリックしない
         except Exception as exc:  # noqa: BLE001 - クリックしたかもしれない
             raise SubmitFailed("UNKNOWN", f"{type(exc).__name__}: {exc}") from exc
-        try:  # 応答を最大15秒待つ（待つだけ。再クリックしない）
-            for _ in range(30):
+        try:  # 遅い応答を最大120秒待つ。ログ画面への移動で応答を中断しない。SAVEは繰り返さない。
+            for _ in range(240):
                 if "response" in cap:
                     break
                 self._p.wait_for_timeout(500)
         except Exception:  # noqa: BLE001
             pass
-        return SubmitResponse(evidence=cap if "body" in cap and "response" in cap else None)
+        finally:
+            for event, callback in (("request", on_request), ("response", on_response), ("dialog", on_dialog)):
+                try:
+                    self._p.remove_listener(event, callback)
+                except Exception:  # noqa: BLE001 - 疑似ページ・切断済みページ
+                    pass
+        # 部分的な記録も残す。成功判定は従来どおり本文・応答の両方を検証する。
+        return SubmitResponse(evidence=cap)

@@ -221,6 +221,22 @@ def test_daily_page_cap_is_checked_before_the_browser_and_survives_new_workflows
     assert len(env.routing.urls) > n and statuses(eng2)["discover:US"] == "DONE"
 
 
+def test_unknown_submission_does_not_stop_new_exploration_or_allow_another_send(app_role_factory, tmp_path, own, ranked_rows):
+    r = ranked_rows
+    env = Env(app_role_factory, tmp_path, r["rows"][:2])
+    env.tool.timeout_after_save = True
+    watcher = Watcher(env.cfg, env.f, env.ports, now=env.clock.now, sleep=env.clock.sleep, out=lambda _: None)
+    watcher.cycle()
+    store = WorkflowStore(env.cfg.state_dir)
+    first_id, = store.list_ids()
+    assert any(t.status == "UNKNOWN" for t in submit_tasks(type("E", (), {"st": store.load(first_id)})()))
+    assert env.tool.submits == 1
+    watcher.cycle()
+    assert len(store.list_ids()) == 2
+    assert len(set(env.product_asins_fetched())) == 2
+    assert env.tool.submits == 1  # 結果不明の照合が済むまで新しい送信は禁止
+
+
 def test_daily_submission_cap_counts_an_unknown_result_as_used_and_never_resends(app_role_factory, tmp_path, own, ranked_rows):
     r = ranked_rows
     env = Env(app_role_factory, tmp_path, r["rows"][:2], cfg_extra={"daily": {"max_new_submissions_per_direction": 1}})
@@ -362,6 +378,61 @@ def test_failed_step_is_not_retried_every_loop_and_is_auto_held_after_three_fail
     (wid,) = store.list_ids()
     t = store.load(wid).tasks["acquire:US"]
     assert t.status == "HELD" and "自動保留" in t.detail
+
+
+def test_failed_product_in_cooldown_does_not_block_next_origin_in_same_market(app_role_factory, tmp_path, own, ranked_rows):
+    r = ranked_rows
+    env = Env(app_role_factory, tmp_path, [r["rows"][0], r["rows"][1]])
+    env.routing.product_503 = {r["o2"]}
+    watcher = Watcher(env.cfg, env.f, env.ports, now=env.clock.now, sleep=env.clock.sleep, out=lambda _: None)
+    watcher.cycle()
+    store = WorkflowStore(env.cfg.state_dir)
+    (failed_id,) = store.list_ids()
+    failed = store.load(failed_id).tasks["discover:US"]
+    assert failed.status == "FAILED" and failed.attempts == 1
+
+    # workflowの再試行期限にもDBの起点冷却にも達していないが、別の起点は処理できる。
+    watcher.cycle()
+    assert store.load(failed_id).tasks["discover:US"].attempts == 1
+    assert len(store.list_ids()) == 2
+    other_id = next(wid for wid in store.list_ids() if wid != failed_id)
+    other = store.load(other_id)
+    assert all(t.status in ("DONE", "SKIPPED") for t in other.tasks.values())
+    assert other.tasks["discover:US"].result["selection"]["picked"][0]["asin"] == r["o1"]
+    assert env.product_asins_fetched().count(r["o1"]) == 1
+
+
+@pytest.mark.parametrize("failed_kind", ["acquire", "cross"])
+def test_failed_acquisition_or_cross_does_not_block_other_origin_or_bypass_cooldown(app_role_factory, tmp_path, own, ranked_rows, failed_kind):
+    r = ranked_rows
+    env = Env(app_role_factory, tmp_path, [r["rows"][0], r["rows"][1]], cfg_extra={"cross": {"enabled": failed_kind == "cross"}})
+    if failed_kind == "acquire":
+        env.routing.seller_503 = {env.seller[r["o2"]]}
+    else:
+        env.ports.routing["JP"].product_503 = set(env.sasins[env.seller[r["o2"]]])
+    watcher = Watcher(env.cfg, env.f, env.ports, now=env.clock.now, sleep=env.clock.sleep, out=lambda _: None)
+    watcher.cycle()
+    store = WorkflowStore(env.cfg.state_dir)
+    (failed_id,) = store.list_ids()
+    task_id = f"{failed_kind}:US"
+    assert store.load(failed_id).tasks[task_id].status == "FAILED"
+    first_requests = list(env.routing.urls)
+    first_cross_requests = list(env.ports.routing["JP"].urls)
+
+    watcher.cycle()
+    assert store.load(failed_id).tasks[task_id].attempts == 1
+    other_ids = set(store.list_ids()) - {failed_id}
+    assert len(other_ids) == 1
+    other = store.load(other_ids.pop())
+    assert all(t.status in ("DONE", "SKIPPED") for t in other.tasks.values())
+    assert other.tasks["discover:US"].result["selection"]["picked"][0]["asin"] == r["o1"]
+    assert env.product_asins_fetched().count(r["o2"]) == 1
+    if failed_kind == "acquire":
+        target = env.seller[r["o2"]]
+        assert sum(target in u for u in env.routing.urls) == sum(target in u for u in first_requests)
+    else:
+        failed_asins = env.sasins[env.seller[r["o2"]]]
+        assert sum(any(a in u for a in failed_asins) for u in env.ports.routing["JP"].urls) == len(first_cross_requests)
 
 
 def test_a_human_wait_in_one_market_does_not_stop_the_other_and_is_not_repeated(app_role_factory, tmp_path, own):

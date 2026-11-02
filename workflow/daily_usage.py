@@ -42,13 +42,10 @@ class DailyUsage:
     def _lock(self, timeout: float = 15.0):
         lp = self.path.with_suffix(".lock")
         lp.parent.mkdir(parents=True, exist_ok=True)
-        t0 = time.time()
+        t0 = time.monotonic()
         while True:
             try:
                 fd = os.open(str(lp), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-                os.write(fd, str(os.getpid()).encode())
-                os.close(fd)
-                return lp
             except FileExistsError:
                 try:
                     if time.time() - lp.stat().st_mtime > 60:  # 持ち主が落ちたロックは奪う（クリティカルセクションは数ミリ秒）
@@ -56,9 +53,21 @@ class DailyUsage:
                         continue
                 except OSError:
                     pass
-                if time.time() - t0 > timeout:
-                    raise UsageBusy("日次使用量のロックを取得できません")
-                time.sleep(0.02)
+            except PermissionError:
+                # Windowsでは他スレッド/プロセスが削除中のファイルを
+                # CREATE_NEWで開くと、一時的にアクセス拒否になることがある。
+                # 存在確認や削除はせず、同じ期限内で排他的な作成を再試行する。
+                if os.name != "nt":
+                    raise
+            else:
+                try:
+                    os.write(fd, str(os.getpid()).encode())
+                finally:
+                    os.close(fd)
+                return lp
+            if time.monotonic() - t0 >= timeout:
+                raise UsageBusy("日次使用量のロックを取得できません")
+            time.sleep(0.02)
 
     def _events(self) -> list[dict]:
         if not self.path.exists():

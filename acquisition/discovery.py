@@ -509,21 +509,29 @@ class DiscoveryService:
     # ---- 起点の選択
     def select_origins(self, origin_import_id: int, page_market: str, limits: DiscoveryLimits, include_zero_units: bool = False,
                        after_rank: int = 0, *, mode: str | None = None,
-                       has_pending: Callable[[Candidate, ProductPageResult | None], bool] | None = None) -> OriginSelection:
+                       has_pending: Callable[[Candidate, ProductPageResult | None], bool] | None = None,
+                       excluded_asins: Iterable[str] = (), priorities: dict[str, int] | None = None) -> OriginSelection:
         """mode=None: 従来の選択（レポート順位・include_zero_units）。modeを指定すると、候補を`rank_candidates`の順に調べ、
         ①未調査/再調査可能(ELIGIBLE)→取得 ②30日内に調査済み(REUSABLE)→**未処理の続き(has_pending)があれば**保存済み結果で続行、
         無ければ「探索済み」として枠を使わず次へ ③実行中・冷却中・自動停止・該当なし→飛ばして次へ（上位の保留が他の候補を塞がない）。
         配列位置のカーソルは持たず、毎回この履歴（調査行・経路・投入台帳）から決まる。"""
         limits.validate()
         info = validate_origin_imports(self._reports, [origin_import_id])[0]
+        excluded = set(excluded_asins)
         with self._app.get_session(info.marketplace) as conn, conn.begin():
             ranked = fetch_candidates(conn, origin_import_id)
         if mode is not None:
             sel = OriginSelection([], origin_market=info.marketplace, mode=mode)
-            for c in rank_candidates(ranked, mode):
+            candidates = rank_candidates(ranked, mode)
+            if priorities:
+                candidates.sort(key=lambda c: -priorities.get(c.asin, 0))  # 同点は元のレポート順。0実績も残す
+            for c in candidates:
                 if c.rank <= after_rank:
                     continue
                 sel.scanned += 1
+                if c.asin in excluded:
+                    sel.skipped.append((c.asin, "WORKFLOW_PENDING", None))
+                    continue
                 lk = self.guard.lookup(page_market, c.asin)
                 if lk.state == "ELIGIBLE":
                     sel.selected.append(Pick(c.asin, "FETCH", c))
@@ -543,6 +551,9 @@ class DiscoveryService:
                 continue
             if c.units_sum <= 0 and not include_zero_units:
                 continue  # 注文0点の候補は(経路としては残るが)既定では調べない
+            if c.asin in excluded:
+                sel.skipped.append((c.asin, "WORKFLOW_PENDING", None))
+                continue
             pick, skip = self._pick(page_market, c.asin, c)
             if skip:
                 sel.skipped.append(skip)

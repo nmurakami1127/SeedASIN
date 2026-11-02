@@ -84,6 +84,14 @@ def report_with(app_role_factory, tmp_path, market, rows, name="r.csv"):
 
 # ---------------------------------------------------------------- 設定・上限
 
+
+def test_listing_feedback_prioritizes_without_dropping_zero_score_candidates(app_role_factory, tmp_path, svc):
+    rid = report_with(app_role_factory, tmp_path, "US", [(asin(1), 10, 1.0, 9), (asin(2), 10, 1.0, 2), (asin(3), 10, 1.0, 0)])
+    selected = svc.select_origins(rid, "US", DiscoveryLimits(max_origin_asins=3), mode="ordered_then_zero", priorities={asin(2): 20})
+    assert [p.asin for p in selected.selected] == [asin(2), asin(1), asin(3)]
+    selected = svc.select_origins(rid, "US", DiscoveryLimits(max_origin_asins=3), mode="ordered_only", priorities={asin(3): 100}, excluded_asins={asin(2)})
+    assert [p.asin for p in selected.selected] == [asin(1)]
+
 def test_without_own_account_ids_nothing_is_fetched_or_recorded(app_role_factory, tmp_path, svc):
     rid = report_with(app_role_factory, tmp_path, "US", [(asin(1), 10, 1.0, 5)])
     f = FakeFetcher(product_html(buybox="A1SELLER0001"))

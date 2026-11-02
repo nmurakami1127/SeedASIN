@@ -78,8 +78,56 @@ def test_truncated_run_is_marked_partial_and_unusable_runs_are_refused(app_role_
     assert bad.outcome == "PARTIAL"
     with pytest.raises(SubmissionError, match="入力に使えません"):
         build_items(app_role_factory, "JP", claim.run_id, out_dir=tmp_path / "out")
+    ledger = SubmissionLedger(tmp_path / "partial-ledger.jsonl")
+    assert build_items(app_role_factory, "JP", claim.run_id, out_dir=tmp_path / "out",
+                       allow_saved_partial=True, batch_target=5000, ledger=ledger) == ([], [])
+    # 強制flush指定でも、取得失敗を末尾到達として扱わない。
+    assert build_items(app_role_factory, "JP", claim.run_id, out_dir=tmp_path / "out",
+                       allow_saved_partial=True, batch_target=5000, flush_buffer=True, ledger=ledger) == ([], [])
+    with app_role_factory.get_session("JP") as conn:
+        assert tuple(conn.execute(text("SELECT status,outcome FROM collector_run WHERE id=:id"), {"id": claim.run_id}).one()) == ("FAILED", "PARTIAL")
     with pytest.raises(SubmissionError, match="存在しません"):
         build_items(app_role_factory, "US", run_id, out_dir=tmp_path / "out")
+
+
+def test_stalled_small_buffer_is_not_released_after_an_hour(app_role_factory, registry, runs, tmp_path):
+    from workflow.buffer_recovery import stage_stalled_inputs
+    from workflow.config import config_from_dict
+    from workflow.store import WorkflowStore
+    _, run_id, _, _, _ = fetched(app_role_factory, registry, runs, tmp_path, "US",
+        [results([asin(171)], "https://www.amazon.com/s?p=2")],
+        origin_asin=asin(170), units=1, name="stalled.csv", limits=RunLimits(max_pages=1))
+    with app_role_factory.get_session("US") as conn, conn.begin():
+        origin = conn.execute(text("SELECT origin_import_id FROM acquisition_path WHERE source_id=(SELECT source_id FROM collector_run WHERE id=:id)"), {"id": run_id}).scalar_one()
+    cfg = config_from_dict({'lanes': {'US': {'origin_import': origin}},
+        'submission_dir': str(tmp_path/'sub'), 'batch_target_asins': 5000})
+    ledger = SubmissionLedger(tmp_path/'sub/ledger.jsonl')
+    store = WorkflowStore(tmp_path/'wf')
+    assert stage_stalled_inputs(app_role_factory, cfg, store, ledger) == (0, 0)
+    from datetime import datetime, timedelta, timezone
+    later = datetime.now(timezone.utc) + timedelta(hours=2)
+    assert stage_stalled_inputs(app_role_factory, cfg, store, ledger, now=later) == (0, 0)
+    assert stage_stalled_inputs(app_role_factory, cfg, store, ledger, now=later) == (0, 0)
+    assert len(store.list_ids()) == 0
+
+
+def test_failed_run_releases_only_full_batch_and_keeps_remainder(app_role_factory, registry, runs, tmp_path):
+    asins = [f"B1{i:08d}" for i in range(5003)]
+    _, run_id, rep, _, _ = fetched(app_role_factory, registry, runs, tmp_path, "US",
+        [results(asins, "https://www.amazon.com/s?p=2"), PageLoadError("temporary error")],
+        origin_asin=asin(175), units=1, name="full-partial.csv")
+    assert rep.outcome == "PARTIAL"
+    ledger = SubmissionLedger(tmp_path / 'full-partial-ledger.jsonl')
+    args = dict(out_dir=tmp_path/'out', allow_saved_partial=True, batch_target=5000, ledger=ledger)
+    items, files = build_items(app_role_factory, "US", run_id, **args)
+    assert [i.asin_count for i in items] == [5000]
+    assert files[0].decode().splitlines() == asins[:5000]
+    write_plan(items, files, ledger)
+    again, again_files = build_items(app_role_factory, "US", run_id, flush_buffer=True, **args)
+    assert [i.key for i in again] == [i.key for i in items]
+    assert [i.asin_count for i in again] == [5000]
+    write_plan(again, again_files, ledger)
+    assert len(ledger.all_states()) == 1
 
 
 def test_inputs_over_5000_are_split_in_saved_order_with_separate_hashes_and_keys(app_role_factory, registry, runs, tmp_path):

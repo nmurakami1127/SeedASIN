@@ -58,6 +58,7 @@ class Watcher:
         self.now = now or (lambda: datetime.now(timezone.utc))
         self.sleep, self.out, self.min_gap = sleep, out, min_gap_seconds
         self.store = WorkflowStore(cfg.state_dir)
+        self._buffer_recovery_after = self.now() + timedelta(minutes=15)
         self.usage = DailyUsage(Path(cfg.state_dir) / "daily_usage.jsonl", now=self.now)
         self.status_path = Path(cfg.state_dir) / "watch_status.json"
         self.stop_path = Path(cfg.state_dir) / "stop.request"
@@ -65,6 +66,9 @@ class Watcher:
         self.cycles = 0
         self._notified: dict[str, datetime] = {}
         self._last_state = "starting"
+        self._feedback_versions = {}
+        if hasattr(self.ports, "keep_tool_open"):
+            self.ports.keep_tool_open = True  # workflowを跨いでも同じ手動ログインを使う
 
     # ------------------------------------------------------------------ 状態ファイル（status表示用）
     def _write_status(self, state: str, reason: str, res: CycleResult | None = None) -> None:
@@ -112,20 +116,64 @@ class Watcher:
     def _due(self, st: State) -> bool:
         now = _iso(self.now())
         for t in st.tasks.values():
+            if t.kind == "submit" and not self.cfg.submission_enabled:
+                continue
             if t.status in DONE_STATES:
                 continue
             if t.status == "PENDING" or not t.retry_after or t.retry_after <= now or self._daily_room(t.result.get("daily_hold")):
-                if t.status == "PENDING" and t.detail.endswith("のため待機"):
+                if t.status == "PENDING" and t.detail.endswith("のため待機") and any(
+                        st.tasks[d].status not in DONE_STATES and not
+                        (st.tasks[d].kind in ("acquire", "acquire_x") and st.tasks[d].result.get("usable"))
+                        for d in t.deps if d in st.tasks):
                     continue  # 依存の工程が終わっていない（自分では進められない）
                 return True
         return False
 
     def _auto_hold(self, st: State, eng: Engine) -> None:
+        if self.cfg.skip_failures:
+            self._skip_failures(st)
+            return
         for t in st.tasks.values():
             if t.status == "FAILED" and t.attempts >= AUTO_HOLD_AFTER:
                 t.status, t.detail = "HELD", f"連続{t.attempts}回失敗したため自動保留（原因を確認し、手動で `workflow.cli resume` してください）: {t.detail}"
                 t.retry_after = "9999-12-31T00:00:00Z"
         eng.store.save(st)
+
+    def _skip_failures(self, st: State) -> None:
+        from tool_submission.ledger import SubmissionLedger
+
+        if not any(t.status in ("FAILED", "UNKNOWN") or
+                   (t.status == "HELD" and "失敗したため自動保留" in t.detail) or
+                   (t.kind == "submit" and t.status in ("WAITING", "HELD", "PENDING"))
+                   for t in st.tasks.values()):
+            return
+        ledger = SubmissionLedger(Path(self.cfg.submission_dir) / "ledger.jsonl")
+        entries = ledger.all_states()
+        changed = False
+        for task in st.tasks.values():
+            if task.kind == "submit" and not self.cfg.submission_enabled:
+                continue  # 登録プロセスの結果不明・失敗状態には探索から手を加えない
+            failed = task.status == "FAILED" or (task.status == "HELD" and "失敗したため自動保留" in task.detail)
+            entry = entries.get(task.result.get("key", "")) if task.kind == "submit" else None
+            unknown = entry is not None and entry.state in ("UNKNOWN", "AMBIGUOUS")
+            if not failed and task.status != "UNKNOWN" and not unknown:
+                continue
+            if task.kind == "submit":
+                key = task.result.get("key", "")
+                if entry is None:
+                    continue
+                if entry.state in ("SUBMITTING", "RUN_IDENTIFIED", "MEMO_SAVED"):
+                    continue  # 送信中やメモ保存中は完了・失敗を決めつけない
+                if entry.state in ("UNKNOWN", "AMBIGUOUS"):
+                    ledger.abandon_unknown(key, reason="利用者指示: 処理失敗を飛ばして継続。結果不明は再送せず追跡を取り下げる")
+            original = {"status": task.status, "detail": task.detail, "attempts": task.attempts}
+            task.result["skipped_failure"] = original
+            task.status, task.retry_after = "SKIPPED", ""
+            task.detail = "利用者指示で失敗をスキップ（再送しません）: " + original["detail"]
+            self._say(f"{task.lane}: {task.id} の失敗をスキップし続行します")
+            changed = True
+        if changed:
+            self.store.save(st)
 
     def _notify(self, key: str, msg: str, res: CycleResult) -> None:
         res.human.append(msg)
@@ -136,15 +184,50 @@ class Watcher:
 
     def cycle(self) -> CycleResult:
         res = CycleResult(next_check=self.now() + timedelta(minutes=self.cfg.watch.interval_minutes))
+        self._maintain_tool_session()
+        if self.cfg.batch_target_asins and self.now() >= getattr(self, "_buffer_recovery_after", self.now()):
+            self._buffer_recovery_after = self.now() + timedelta(minutes=15)
+            from workflow.buffer_recovery import stage_stalled_inputs
+            try:
+                staged, asins = stage_stalled_inputs(self.factory, self.cfg, self.store,
+                    self._engine(self.cfg).ledger)
+                if staged:
+                    self._say(f"保存済み結果の満杯バッチ・末尾到達済み端数を投入計画へ回します: {staged}件・{asins:,} ASIN")
+            except Exception as exc:
+                self._say(f"保存済み結果の投入計画に失敗: {type(exc).__name__}: {exc}")
+        if self.cfg.listing_feedback:
+            from workflow.feedback import refresh_attribution
+            for lane in self.cfg.lanes:
+                try:
+                    version, added = refresh_attribution(self.factory, lane, self._feedback_versions.get(lane))
+                    self._feedback_versions[lane] = version
+                    if added:
+                        self._say(f"{lane}: 出品成果を取得元へ新たに{added} ASIN紐づけ、探索優先順へ反映しました")
+                except Exception as exc:  # 一方の集計障害で他方を止めない
+                    self._say(f"{lane}: 出品成果の更新に失敗（既存実績で続行）: {type(exc).__name__}")
         blocked_lanes: set[str] = set()
+        deferred_origins: dict[str, set[str]] = {lane: set() for lane in self.cfg.lanes}
         # 1. 続行可能な未完了処理を再開する
-        for wid in self.store.list_ids():
+        ids = self.store.list_ids()
+        if self.cfg.batch_target_asins:
+            # 入力が揃っている投入を先に扱い、過去の保留確認や新規探索で後回しにしない。
+            def priority(wid):
+                try:
+                    st = self.store.load(wid)
+                    return not any(t.kind == "submit" and t.status in ("PENDING", "HELD", "WAITING")
+                                   and "重複候補" not in t.detail for t in st.tasks.values())
+                except Exception:
+                    return True
+            ids.sort(key=priority)
+        for wid in ids:
             if self.stop_requested():
                 break
             try:
                 st = self.store.load(wid)
             except Exception:  # noqa: BLE001
                 continue
+            if self.cfg.skip_failures:
+                self._skip_failures(st)
             if overall_of(st) == "COMPLETED":
                 continue
             lanes = set(st.config.get("lanes", {}).keys())
@@ -158,10 +241,27 @@ class Watcher:
                 self._auto_hold(eng.st, eng)
                 st = eng.st
                 res.worked = True
-            if any(t.status in ("FAILED", "WAITING", "UNKNOWN") or (t.status == "PENDING" and not t.detail.endswith("のため待機"))
+            # 失敗は元のworkflowに残して再試行し、新しいworkflowは別の起点を選ぶ。
+            # 同じ対象を作り直して冷却を迂回しない。
+            if overall_of(st) != "COMPLETED":
+                for lane in lanes & self.cfg.lanes.keys():
+                    saved_lane = st.config["lanes"][lane]
+                    if saved_lane.get("origin_import") != self.cfg.lanes[lane].origin_import:
+                        continue
+                    task = st.tasks.get(f"discover:{lane}")
+                    if task:
+                        picks = task.result.get("selection", {}).get("picked", [])
+                        deferred_origins[lane].update(p["asin"] for p in picks if p.get("asin"))
+                        deferred_origins[lane].update(i["asin"] for i in task.result.get("items", []) if i.get("asin"))
+            # 送信の照合待ちは投入台帳のpending_othersが次の送信を止める。
+            # 独立したAmazon探索は続ける。結果不明の再送はrunnerが禁止する。
+            if any((t.status == "WAITING" and t.kind != "submit")
+                   or (t.status == "PENDING" and t.kind != "submit" and not t.detail.endswith("のため待機"))
                    for t in st.tasks.values()):
                 blocked_lanes |= lanes
             for t in st.tasks.values():
+                if t.kind == "submit" and not self.cfg.submission_enabled:
+                    continue
                 if t.status in ("WAITING", "UNKNOWN"):
                     self._notify(f"{wid}:{t.id}:{t.detail}", f"{t.lane} {t.id}: {t.detail}", res)
                 elif t.status in ("FAILED", "HELD"):
@@ -175,6 +275,7 @@ class Watcher:
                 continue
             lane_cfg = self.cfg.for_lane(lane)
             probe = self._engine(lane_cfg)
+            probe.deferred_origins = deferred_origins[lane]
             try:
                 sel = probe.origin_selection(lane, probe.discover_limits(lane_cfg.totals.max_new_sources, lane_cfg.totals.max_total_pages))
             except Exception as exc:  # noqa: BLE001 - 設定/レポートの問題は市場ごとに表示して他方を進める
@@ -193,12 +294,15 @@ class Watcher:
             self._write_status("running", f"{lane}: 新しい候補を処理")
             self._say(f"{lane}: 次の候補 " + ", ".join(f"{pk.asin}({'取得' if pk.mode == 'FETCH' else '続き'})" for pk in runnable))
             eng = self._engine(lane_cfg)
+            eng.deferred_origins = deferred_origins[lane]
             eng.new_state()
             eng.drive()
             self._auto_hold(eng.st, eng)
             res.worked = True
             res.lanes[lane] = f"{eng.st.workflow_id}: {overall_of(eng.st)}"
             for t in eng.st.tasks.values():
+                if t.kind == "submit" and not self.cfg.submission_enabled:
+                    continue
                 if t.status in ("WAITING", "UNKNOWN"):
                     self._notify(f"{eng.st.workflow_id}:{t.id}:{t.detail}", f"{t.lane} {t.id}: {t.detail}", res)
         res.state = "running" if res.worked else ("waiting_human" if res.human else "idle")
@@ -235,6 +339,8 @@ class Watcher:
             except KeyboardInterrupt:
                 reason_stop = "Ctrl+Cで停止しました"
             finally:
+                if hasattr(self.ports, "close"):
+                    self.ports.close()
                 if self.stop_path.exists():
                     self.stop_path.unlink()
             self._write_status("stopped", reason_stop + "。状態は保存済みです。次回watchで続きから再開します")
@@ -243,7 +349,24 @@ class Watcher:
 
     def _wait(self, until: datetime) -> None:
         while self.now() < until and not self.stop_requested():
+            self._maintain_tool_session()
             self.sleep(min(1.0, max(0.0, (until - self.now()).total_seconds())))
+
+    def _maintain_tool_session(self):
+        if not self.cfg.submission_enabled or not self.cfg.tool_session_monitor:
+            return
+        if not hasattr(self.ports, "keep_tool_session_alive"):
+            return
+        try:
+            result = self.ports.keep_tool_session_alive()
+        except Exception as exc:
+            result = f"ERROR:{type(exc).__name__}"
+        if result and result != getattr(self, "_last_keepalive_result", None):
+            if result == "OK":
+                self._say("統合ツールのセッション維持アクセスを確認しました（10分間隔・同じ認証接続）")
+            else:
+                self._say(f"統合ツールのセッション維持を確認できません: {result}（ブラウザは維持）")
+            self._last_keepalive_result = result
 
 
 def read_status(state_dir: str | Path) -> dict | None:

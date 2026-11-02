@@ -226,6 +226,8 @@ def _memo_phase(ledger, page, item, run_id: str, retries, sleep, wait_seconds: f
 
 def _locked(ledger, page, item, input_path, log_retries, sleep, require_evidence: bool = False) -> SubmitResult:
     st = ledger.state(item.key)
+    if st.state in ("ABANDONED", "WITHDRAWN"):
+        return SubmitResult("REFUSED", detail="人の指示で追跡を取り下げ済みです。再送・メモ保存はしません")
     if st.state == "NONE":
         return SubmitResult("REFUSED", detail="投入計画が台帳にありません（先にplanを実行してください）")
     if st.state in ("MEMO_SAVED", "LINKED"):

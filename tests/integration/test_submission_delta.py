@@ -41,6 +41,32 @@ def ids(items):
     return [(i.repeat_of_earlier_cycle, i.asin_count) for i in items]
 
 
+def test_batch_accumulates_5000_across_runs_and_flushes_final_remainder(app_role_factory, registry, runs, fast_cfg, tmp_path):
+    pages = mk_pages(5, per=1250)
+    src, site = new_site(app_role_factory, registry, pages)
+    ledger = SubmissionLedger(tmp_path / "batch.jsonl")
+    run1, _ = make_run(runs, app_role_factory, site, src.source_id, 2)
+    args = dict(out_dir=tmp_path / "out", direction_override="EXPORT", ledger=ledger, batch_target=5000)
+    old, old_files = build_items(app_role_factory, "US", run1, **{**args, "batch_target": 0})
+    write_plan(old, old_files, ledger)
+    for item in old:
+        ledger.append(item.key, "PLAN_WITHDRAWN", reason="5000件にまとめ直す")
+        assert ledger.state(item.key).state == "WITHDRAWN"
+    assert build_items(app_role_factory, "US", run1, **args) == ([], [])
+    run2, _ = make_run(runs, app_role_factory, site, src.source_id, 2)
+    items, files = build_items(app_role_factory, "US", run2, **args)
+    assert ids(items) == [(False, 5000)]
+    assert items[0].carried_from_runs == [run1]
+    first_asins = set(files[0].decode().splitlines())
+    assert len(first_asins) == 5000
+    write_plan(items, files, ledger)
+    run3, _ = make_run(runs, app_role_factory, site, src.source_id, 4)
+    tail, tail_files = build_items(app_role_factory, "US", run3, **args)
+    assert ids(tail) == [(False, 1250)]
+    assert not first_asins.intersection(tail_files[0].decode().splitlines())
+    assert first_asins.union(tail_files[0].decode().splitlines()) == {a for page in pages for a in page}
+
+
 def test_same_cycle_asins_already_submitted_reserved_or_unknown_are_removed_but_unsent_ones_return(app_role_factory, registry, runs, fast_cfg, tmp_path):
     pages = mk_pages(4)
     src, site = new_site(app_role_factory, registry, pages)

@@ -422,21 +422,55 @@ from contextlib import contextmanager  # noqa: E402
 
 
 @contextmanager
-def _open_tool_page(selectors):
+def _open_tool_page(selectors, *, wait_for_login=True, playwright=None):
     """統合ツール専用のブラウザプロファイルで開き、利用者がログインしてEnterを押すのを待つ（認証情報は保存・入力しない）。"""
     from playwright.sync_api import sync_playwright
 
     from tool_submission.import_tool_page import ImportToolPage
 
-    with sync_playwright() as p:
-        context = p.chromium.launch_persistent_context(str(Path("playwright_profiles") / "import_tool"), headless=False)
-        try:
-            page = context.new_page()
+    if playwright is None:
+        with sync_playwright() as runtime:
+            with _open_tool_page(selectors, wait_for_login=wait_for_login, playwright=runtime) as page:
+                yield page
+        return
+    context = playwright.chromium.launch_persistent_context(str(Path("playwright_profiles") / "import_tool"), headless=False)
+    try:
+        page = context.new_page()
+        page.add_init_script("document.addEventListener('DOMContentLoaded', () => { document.title = '【SeedASIN 自動投入用】' + document.title; });")
+        page.goto(selectors.log_url)
+        page.bring_to_front()
+        if wait_for_login:
+            _wait_for_tool_login(page, selectors)
+        yield ImportToolPage(page, selectors)
+    finally:
+        context.close()
+
+
+def _wait_for_tool_login(page, selectors, *, timeout=300, sleep=None, monotonic=None):
+    """ログイン済みなら入力待ちを挟まない。未ログイン時の認証は人だけが行う。"""
+    import time
+
+    from tool_submission.import_tool_page import LOG_HEADER_MARKERS
+
+    sleep, monotonic = sleep or time.sleep, monotonic or time.monotonic
+    deadline = monotonic() + timeout
+    announced = False
+    while True:
+        header = page.locator("table tr").first
+        if header.count() and all(marker in header.inner_text() for marker in LOG_HEADER_MARKERS):
+            return
+        if "/asin/" in page.url and "login" not in page.url.lower() and page.locator('input[type="password"]').count() == 0 and page.url != selectors.log_url:
             page.goto(selectors.log_url)
-            input("統合ツールにログインし、ログ画面が表示されたら、この画面でEnterを押してください...")
-            yield ImportToolPage(page, selectors)
-        finally:
-            context.close()
+            continue
+        if not announced:
+            print("【手動対応が必要】開いた統合ツールのブラウザでログインしてください。完了後に自動で続行します。", flush=True)
+            announced = True
+        if monotonic() >= deadline:
+            raise EOFError("統合ツールのログイン待ちが時間切れになりました")
+        sleep(3)
+        # ログイン入力中の画面は再読込しない。認証後、メイン画面に移った時だけログへ進む。
+        if "/asin/" in page.url and "login" not in page.url.lower() and page.locator('input[type="password"]').count() == 0:
+            page.goto(selectors.log_url)
 
 
 def _cmd_submit(a: argparse.Namespace) -> int:
@@ -458,6 +492,17 @@ def _cmd_submit(a: argparse.Namespace) -> int:
     return 0 if r.kind in ("MEMO_SAVED", "ALREADY_DONE") else 3
 
 
+def _cmd_abandon(a: argparse.Namespace) -> int:
+    ledger = _ledger(a)
+    try:
+        ledger.abandon_unknown(a.key, reason=a.reason)
+    except ValueError as exc:
+        print(f"[中止] {exc}")
+        return 2
+    print("結果不明の投入の追跡を取り下げました。再送・メモ保存はしません。統合ツール上のジョブは取消していません。")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="python -m tool_submission.cli")
     sub = p.add_subparsers(dest="command", required=True)
@@ -467,6 +512,10 @@ def build_parser() -> argparse.ArgumentParser:
         sp.add_argument("--ledger", default=None)
         sp.set_defaults(func=func)
         return sp
+
+    sp = add("abandon", _cmd_abandon, "結果不明の投入の追跡を取り下げる（外部ジョブの取消ではない）")
+    sp.add_argument("--key", required=True)
+    sp.add_argument("--reason", required=True)
 
     sp = add("plan", _cmd_plan, "取得runから入力ファイルと投入計画を作る（DB読み取りのみ）")
     sp.add_argument("--fetch-market", required=True, choices=["US", "JP"], help="ASINを取得したAmazonの市場（collector_runの市場）")

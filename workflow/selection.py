@@ -24,7 +24,7 @@ from tool_submission.planner import build_items
 from workflow.dedupe import find_duplicates
 
 SUCCESS = tuple(USABLE_FETCH_OUTCOMES)
-ACTIONABLE_STATES = ("NONE", "PLANNED", "NOT_SUBMITTED", "RUN_IDENTIFIED", "MEMO_SAVED")  # UNKNOWN/AMBIGUOUS/SUBMITTINGは人の確認が先
+ACTIONABLE_STATES = ("NONE", "WITHDRAWN", "PLANNED", "NOT_SUBMITTED", "RUN_IDENTIFIED", "MEMO_SAVED")  # UNKNOWN/AMBIGUOUS/SUBMITTINGは人の確認が先
 
 
 def reusable_run(factory, market: str, source_id: int, max_age_days: int) -> dict | None:
@@ -139,7 +139,7 @@ class PendingChecker:
                 continue  # 取得間隔内/除外/保留/実行中など。今は進められないので枠を塞がない（状態が変われば次の選択で再評価される）
             try:
                 items, _ = build_items(self.e.factory, self.pm, run["run_id"], out_dir=Path(cfg.submission_dir), max_per_input=cfg.tool_max_asins,
-                                       ledger=self.e.ledger)
+                                       ledger=self.e.ledger, batch_target=cfg.batch_target_asins)
             except SubmissionError:
                 continue
             for it in items:

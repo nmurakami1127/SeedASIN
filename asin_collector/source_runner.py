@@ -375,7 +375,7 @@ class PlaywrightFetcher:
 
     def fetch(self, url: str) -> FetchedPage:
         try:
-            resp = self._page.goto(url)
+            resp = self._page.goto(url, wait_until="domcontentloaded")
         except Exception as exc:  # noqa: BLE001
             raise PageLoadError(f"{type(exc).__name__}: {exc}") from exc
         return FetchedPage(self._page.content(), self._page.url, resp.status if resp is not None else None)
@@ -400,7 +400,7 @@ class PlaywrightFetcher:
 
     def delivery_warning(self, marketplace: str) -> str | None:
         try:
-            self._page.goto(f"https://{DOMAIN[marketplace]}/")
+            self._page.goto(f"https://{DOMAIN[marketplace]}/", wait_until="domcontentloaded")
             return delivery_region_warning(self._page.content(), marketplace)
         except Exception:  # noqa: BLE001
             return "配送先表示を確認できませんでした（警告のみ）"

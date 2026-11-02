@@ -94,6 +94,7 @@ class Engine:
         self.ledger = SubmissionLedger(Path(cfg.submission_dir) / "ledger.jsonl")
         self.usage = DailyUsage(Path(cfg.state_dir) / "daily_usage.jsonl", now=self.now)  # watch全体で共有する日次使用量（JST）
         self.should_stop: Callable[[], bool] | None = None  # watchの停止要求（工程の間で確認する）
+        self.deferred_origins: set[str] = set()  # watchが別の未完了workflowで管理中の起点
         self.st: State | None = None
         self._stack: ExitStack | None = None
         self._tool_page = None
@@ -221,6 +222,8 @@ class Engine:
             while progressed:
                 progressed = False
                 for t in list(self.st.tasks.values()):
+                    if t.kind == "submit" and not self.cfg.submission_enabled:
+                        continue  # 入力と投入台帳を残し、別プロセスの登録へ渡す
                     if t.status != "PENDING":
                         continue
                     if self.should_stop is not None and self.should_stop():  # 停止要求: 実行中の工程は終わらせ、残りはPENDINGのまま保存して戻る
@@ -262,6 +265,8 @@ class Engine:
                 except Exception as exc:  # noqa: BLE001
                     self._event("resume", f"期限切れ回収に失敗({m}): {type(exc).__name__}")
         for t in self.st.tasks.values():
+            if t.kind == "submit" and not self.cfg.submission_enabled:
+                continue
             if t.kind == "submit" and t.status == "DONE":
                 if self.ledger.state(t.result.get("key", "")).state != "LINKED":
                     t.status, t.detail = "PENDING", "台帳が対応記録済みでないため再確認"
@@ -400,7 +405,12 @@ class Engine:
         """次の起点の選択。planと実行が同じ条件（モード・履歴・未処理の続き）でこれを使う。"""
         ln = self.cfg.lanes[lane]
         chk = PendingChecker(self, lane)
-        sel = self.svc.select_origins(ln.origin_import, self.cfg.page_market(lane), limits, mode=ln.selection_mode, has_pending=chk)
+        priorities = None
+        if self.cfg.listing_feedback:
+            from workflow.feedback import origin_priorities
+            priorities = origin_priorities(self.factory, lane, self.cfg.page_market(lane), ln.origin_import)
+        sel = self.svc.select_origins(ln.origin_import, self.cfg.page_market(lane), limits, mode=ln.selection_mode, has_pending=chk,
+                                      excluded_asins=self.deferred_origins, priorities=priorities)
         sel.reasons = chk.reasons
         return sel
 
@@ -540,20 +550,22 @@ class Engine:
                 recs[str(sid)] = {"mode": "HELD", "reason": why + "（利用できる保存済みの結果もありません）",
                                   "retry_at": (until + timedelta(seconds=60)).astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ") if until else None}
         self._save_task(t)
-        usable = sum(1 for r in recs.values() if r["mode"] in ("FETCHED", "REUSED"))
+        usable = sum(1 for r in recs.values() if r["mode"] in ("FETCHED", "REUSED", "PARTIAL_SAVED"))
         t.result["usable"] = usable
         modes = [r["mode"] for r in recs.values()]
+        failed_count = modes.count("FAILED") + modes.count("PARTIAL_SAVED")
         skipped = modes.count("SKIPPED_POLICY")
         needs_release = sum(1 for r in recs.values() if r["mode"] == "SKIPPED_POLICY" and r.get("needs_release"))
         t.result["branches"] = {"skipped_policy": skipped, "permanent": sum(1 for r in recs.values() if r.get("permanent")),
                                 "needs_release": needs_release, "empty": modes.count("EMPTY"),
-                                "held": modes.count("HELD"), "captcha": modes.count("CAPTCHA"), "failed": modes.count("FAILED")}
+                                "held": modes.count("HELD"), "captcha": modes.count("CAPTCHA"), "failed": failed_count}
         summary = f"使える取得結果{usable}件（取得{modes.count('FETCHED')}・保存済みの再利用{modes.count('REUSED')}）" \
                   + (f"／正常な0件{modes.count('EMPTY')}件（一巡完了）" if modes.count("EMPTY") else "") \
-                  + f"／保留{modes.count('HELD')}・CAPTCHA{modes.count('CAPTCHA')}・失敗{modes.count('FAILED')}" \
+                  + f"／保留{modes.count('HELD')}・CAPTCHA{modes.count('CAPTCHA')}・失敗{failed_count}" \
+                  + (f"（失敗前の保存済み結果{modes.count('PARTIAL_SAVED')}件を利用）" if modes.count("PARTIAL_SAVED") else "") \
                   + (f"／枝のスキップ{skipped}件（除外{t.result['branches']['permanent']}・保留/期間内{skipped - t.result['branches']['permanent']}）" if skipped else "") \
                   + (f"／要解除{needs_release}件（取り直しの上限・保留。原因を確認して acquisition.cli release）" if needs_release else "")
-        pending = modes.count("HELD") + modes.count("CAPTCHA") + modes.count("FAILED")
+        pending = modes.count("HELD") + modes.count("CAPTCHA") + failed_count
         if not sources:
             return self._set(t, "DONE", "取得する出典がありません")
         if pending == 0:
@@ -564,7 +576,7 @@ class Engine:
             return self._set(t, "DONE", summary)
         if modes.count("CAPTCHA"):
             return self._set(t, "WAITING", summary + "。CAPTCHAを解いてから resume してください")
-        if modes.count("FAILED") and not modes.count("HELD"):
+        if failed_count and not modes.count("HELD"):
             return self._set(t, "FAILED", summary)
         daily = any(r.get("daily") for r in recs.values() if r["mode"] == "HELD")
         held = [r for r in recs.values() if r["mode"] == "HELD" and not r.get("daily")]
@@ -597,7 +609,7 @@ class Engine:
         elif rp.outcome == "LEASE_LOST":
             recs[str(sid)] = {"mode": "FAILED", **base, "reason": "leaseを失いました"}
         else:
-            recs[str(sid)] = {"mode": "FAILED", "outcome": rp.outcome, **base, "reason": rp.detail or rp.error_code or rp.outcome,
+            recs[str(sid)] = {"mode": "PARTIAL_SAVED" if self.cfg.skip_failures and rp.outcome == "PARTIAL" and rp.asins > 0 else "FAILED", "outcome": rp.outcome, **base, "reason": rp.detail or rp.error_code or rp.outcome,
                               "error_code": rp.error_code}
 
     def _save_task(self, t: Task) -> None:
@@ -704,11 +716,12 @@ class Engine:
         market = acq.result.get("market")
         made, skipped = [], []
         for sid, rec in acq.result.get("sources", {}).items():
-            if rec["mode"] not in ("FETCHED", "REUSED"):
+            if rec["mode"] not in ("FETCHED", "REUSED", "PARTIAL_SAVED") and not (self.cfg.batch_target_asins and rec["mode"] == "EMPTY"):
                 continue
             try:
                 items, files = build_items(self.factory, market, rec["run_id"], out_dir=Path(self.cfg.submission_dir),
-                                           max_per_input=self.cfg.tool_max_asins, ledger=self.ledger)
+                                           max_per_input=self.cfg.tool_max_asins, ledger=self.ledger, batch_target=self.cfg.batch_target_asins,
+                                           allow_saved_partial=self.cfg.skip_failures)
             except SubmissionError as exc:
                 skipped.append({"run_id": rec["run_id"], "reason": str(exc)[:200]})
                 continue
@@ -731,7 +744,8 @@ class Engine:
                         "partial": i.input_is_partial, "repeat": i.repeat_of_earlier_cycle, "excluded_same_cycle": i.same_cycle_excluded,
                         "also_from": len(i.also_from)})
                 made.append(i.key)
-        self._set(t, "DONE", f"投入計画{len(made)}件" + (f"（見送り{len(skipped)}件）" if skipped else ""), keys=made, skipped=skipped)
+        buffering = f"（同一出典で{self.cfg.batch_target_asins:,} ASIN単位への蓄積を継続）" if self.cfg.batch_target_asins and not made else ""
+        self._set(t, "DONE", f"投入計画{len(made)}件" + buffering + (f"（見送り{len(skipped)}件）" if skipped else ""), keys=made, skipped=skipped)
 
     # ------------------------------------------------------------------ 投入・メモ保存・対応記録
 
@@ -762,6 +776,8 @@ class Engine:
     def _run_submit(self, t: Task) -> None:
         key = t.result["key"]
         st = self.ledger.state(key)
+        if st.state in ("ABANDONED", "WITHDRAWN"):
+            return self._set(t, "SKIPPED", "人の指示で結果不明の投入の追跡を取り下げました。再送しません（外部ジョブは取消していません）")
         if st.state == "LINKED":
             return self._set(t, "DONE", f"既存の対応記録を引き継ぎ（実行ID={st.tool_run_id}）。再送しません", adopted=True,
                              tool_run_id=st.tool_run_id)
@@ -769,7 +785,8 @@ class Engine:
         fresh = st.state in ("PLANNED", "NOT_SUBMITTED")
         if fresh and item.repeat_of_earlier_cycle and key not in self.st.allow_duplicates:
             return self._set(t, "HELD", f"過去の一巡で投入済み（または投入予約済み）のASIN {item.asin_count}件だけの再投入です（重複候補）。"
-                                        f"意図した再投入なら `resume --allow-duplicate {key}`。新しいASINの投入はこれを待たずに進みます", repeat=True)
+                                        f"意図した再投入なら `resume --allow-duplicate {key}`。新しいASINの投入はこれを待たずに進みます",
+                             retry_after="9999-12-31T00:00:00Z", repeat=True)
         if fresh:
             dups = [d for d in find_duplicates(self.ledger, item)]
             if dups and key not in self.st.allow_duplicates:
