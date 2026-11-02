@@ -183,7 +183,8 @@ def _print_batch(items) -> None:
 def _limits(args: argparse.Namespace):
     from asin_collector.source_runner import RunLimits
 
-    return RunLimits(max_pages=args.max_pages, max_asins=args.max_asins)
+    return RunLimits(max_pages=args.max_pages, max_asins=args.max_asins,
+                     close_on_repeated_page=getattr(args, "close_on_repeated_page", False))
 
 
 def _run_in_browser(factory: SessionFactory, marketplace: str, source_ids: list[int], args: argparse.Namespace) -> None:
@@ -363,6 +364,10 @@ def _add_run_options(sp: argparse.ArgumentParser) -> None:
                                                      "前回の最後のページの取り直し(overlap。設定 overlap_pages、既定1)は含まない別枠で、実際のページアクセスは"
                                                      "最大 max-pages + overlap_pages（5xxの再試行・CAPTCHA後の取り直しは別に数える）")
     sp.add_argument("--max-asins", type=int, default=None, help="1出典あたりの最大ASIN数（任意）")
+    sp.add_argument("--close-on-repeated-page", action="store_true",
+                    help="保存済みのページの直後に同じ内容が返ったら、同じURLを1回だけ取り直して確認し、同じなら検索結果の深さの限界として"
+                         "SUCCESS_TRUNCATED(DEPTH_LIMIT)・再開位置なしで閉じる（既定は従来どおり REPEATED_PAGE で一巡を BROKEN にする）。"
+                         "取り直しは日次のページ使用量に1ページとして数える（docs/DEVIATIONS.md #80）")
     sp.add_argument("--require-delivery-match", action="store_true",
                     help="配送先表示が想定の郵便番号と確認できない場合は、claimせずに中止する（既定は警告のみ）")
 

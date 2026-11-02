@@ -11,7 +11,9 @@ heartbeat は別スレッドで続け、CAPTCHAの人の待機中も切らさな
 結果の区別（`collector_run.outcome`）:
 - SUCCESS_NONEMPTY   最後のページまで辿り、ASINがあった（「次へ」が無い）
 - SUCCESS_EMPTY      1ページ目が「検索結果0件」ウィジェット付きの0件で、**その種別で0件判定が検証済み**の場合のみ
-- SUCCESS_TRUNCATED  ページ数/ASIN数の上限で打ち切った（取得間隔に数えるかは設定 `truncated_counts_as_success`）
+- SUCCESS_TRUNCATED  ページ数/ASIN数の上限で打ち切った（取得間隔に数えるかは設定 `truncated_counts_as_success`）。
+                     設定 `close_on_repeated_page`=true のときは、検索結果の深さの限界（DEPTH_LIMIT。同じページの繰り返しを
+                     1回の取り直しで確認）でも、再開位置なし（CLOSED_NO_CURSOR）で閉じる（docs/DEVIATIONS.md #80）
 - PARTIAL            ASINを保存した後に、失敗・想定外のページ・同一URL再訪で止まった（成功に数えない）
 - FAILED             1ページ目から取得できなかった（読み込み失敗・5xx・CAPTCHA未解決）
 - UNVERIFIED_EMPTY   0件に見えるが0件と確認できない（ウィジェット無し、または未検証の種別）。**成功にしない**
@@ -84,6 +86,10 @@ class RunLimits:
     server_error_retries: int = 2
     server_error_wait_seconds: float = 5.0
     max_captcha_rounds: int = 3
+    # 既定false=従来どおり（REPEATED_PAGEで一巡をBROKENにする）。true=保存済みのページがある状態で直前と同じページが返ったら、
+    # 同じURLを1回だけ取り直し、同じなら「検索結果の深さの限界」として SUCCESS_TRUNCATED / DEPTH_LIMIT / 再開位置なしで閉じる。
+    # しきい値（ページ数など）は設けない。価格帯分割はしない（別案件）。
+    close_on_repeated_page: bool = False
 
 
 @dataclass
@@ -97,6 +103,8 @@ class RunReport:
     detail: str | None = None
     auto_held: bool = False
     overlap_pages: int = 0       # 続きの前に取り直したページ数（日次のページ使用量に含める）
+    repeat_check_pages: int = 0  # 繰り返しの確認のために取り直したページ数（close_on_repeated_page。日次のページ使用量に含める。pages・overlap_pagesとは別）
+    truncation_reason: str | None = None  # SUCCESS_TRUNCATEDの理由（PAGE_LIMIT / ASIN_LIMIT / DEPTH_LIMIT）
     drift: bool = False          # 重なり確認で、検索結果の変化を検知した（欠落の可能性）
     plan: str = "FRESH"          # FRESH / CONTINUE / FINALIZE / RETRY_FIRST / RESTART_*
     cycle_id: int | None = None
@@ -181,8 +189,10 @@ class Heartbeat:
 # ---------------------------------------------------------------------- 実行
 
 class _Stop(Exception):
-    def __init__(self, outcome: str, code: str | None = None, detail: str | None = None) -> None:
+    def __init__(self, outcome: str, code: str | None = None, detail: str | None = None, *,
+                 truncation: str | None = None, drop_cursor: bool = False) -> None:
         self.outcome, self.code, self.detail = outcome, code, detail
+        self.truncation, self.drop_cursor = truncation, drop_cursor  # 成功としての打切り(DEPTH_LIMIT)で使う
         super().__init__(outcome)
 
 
@@ -204,11 +214,14 @@ def run_claimed_source(
     report = RunReport(claim.run_id, claim.source_id, "FAILED", plan=claim.plan, cycle_id=claim.cycle_id)
     try:
         with Heartbeat(service, claim, heartbeat_interval) as hb:
+            drop_cursor = False
             try:
                 outcome, trunc = _crawl(service, fetcher, claim, src, source_url(marketplace, src), limits, sleep, hb, report)
             except _Stop as stop:
-                outcome, trunc = stop.outcome, None
-                report.error_code, report.detail = stop.code, stop.detail
+                outcome, trunc, drop_cursor = stop.outcome, stop.truncation, stop.drop_cursor
+                report.error_code = stop.code
+                report.detail = stop.detail
+            report.truncation_reason = trunc
             if hb.lost.is_set():
                 raise LeaseLost("heartbeatでleaseの喪失を検知しました")
             if outcome == "DAILY_LIMIT":  # 失敗ではない: 中断として確定し、一巡はOPENのまま（位置は保存済みの最後のページの次）
@@ -217,7 +230,8 @@ def run_claimed_source(
                 report.outcome = "DAILY_LIMIT"
                 return report
             held = service.finish(claim, outcome, truncation_reason=trunc, error_code=report.error_code,
-                                  error_message=report.detail, pages_fetched=report.pages)
+                                  error_message=None if drop_cursor else report.detail, pages_fetched=report.pages,
+                                  drop_cursor=drop_cursor)
             report.outcome, report.auto_held = outcome, held is not None
     except LeaseLost as exc:
         report.outcome, report.detail = "LEASE_LOST", str(exc)
@@ -276,6 +290,18 @@ def _signature(cards: list[str]) -> str:
     return hashlib.sha256("\n".join(cards).encode()).hexdigest()
 
 
+def _empty_page(src, page: FetchedPage, report: RunReport, continuing: bool) -> tuple[str, str | None]:
+    """カードが1件も無いページの扱い（従来どおり）。0件の確認は1ページ目（保存済みページが無い）だけ。"""
+    if report.pages > 0:
+        raise _Stop("PARTIAL", "EMPTY_PAGE_AFTER_RESULTS", "結果の途中で0件のページになりました（想定外）")
+    if continuing:
+        raise _Stop("PARTIAL", "CURSOR_INVALID", "保存した次ページのURLを開いても結果がありません（次ページ位置が無効）。正常な0件・完了とは扱いません")
+    if html_has_no_results_widget(page.html) and src.source_type in VERIFIED_EMPTY_TYPES:
+        return "SUCCESS_EMPTY", None
+    code = "EMPTY_NOT_VERIFIED_FOR_TYPE" if html_has_no_results_widget(page.html) else "NO_CARDS_NO_WIDGET"
+    raise _Stop("UNVERIFIED_EMPTY", code, "0件に見えるが、0件と確認できません（成功に数えません）")
+
+
 def _crawl(service, fetcher, claim, src, start_url, limits, sleep, hb, report: RunReport) -> tuple[str, str | None]:
     """ページを辿り、1ページごとに ASINの保存と再開位置の更新を同じトランザクションで行う。
     続き(CONTINUE)では、前回の最後に保存したページを `overlap_pages` だけ取り直して（ASINは入れない）ページ送りが有効か確認し、
@@ -317,17 +343,24 @@ def _crawl(service, fetcher, claim, src, start_url, limits, sleep, hb, report: R
         visited.add(page.url)
         cards = extract_search_card_asins(page.html)
         if not cards:
-            if report.pages > 0:
-                raise _Stop("PARTIAL", "EMPTY_PAGE_AFTER_RESULTS", "結果の途中で0件のページになりました（想定外）")
-            if continuing:
-                raise _Stop("PARTIAL", "CURSOR_INVALID", "保存した次ページのURLを開いても結果がありません（次ページ位置が無効）。正常な0件・完了とは扱いません")
-            if html_has_no_results_widget(page.html) and src.source_type in VERIFIED_EMPTY_TYPES:
-                return "SUCCESS_EMPTY", None
-            code = "EMPTY_NOT_VERIFIED_FOR_TYPE" if html_has_no_results_widget(page.html) else "NO_CARDS_NO_WIDGET"
-            raise _Stop("UNVERIFIED_EMPTY", code, "0件に見えるが、0件と確認できません（成功に数えません）")
+            return _empty_page(src, page, report, continuing)
         sig = _signature(cards)
         if sig == prev_sig:
-            raise _Stop("PARTIAL", "REPEATED_PAGE", "直前のページと同じ内容が繰り返されました（ページ送りが進んでいません）")
+            if not limits.close_on_repeated_page:
+                raise _Stop("PARTIAL", "REPEATED_PAGE", "直前のページと同じ内容が繰り返されました（ページ送りが進んでいません）")
+            # 保存済みのページ（この実行、または続きの前回まで）の直後に、同じ内容が返った。一時的な不具合かもしれないので、
+            # 同じURLを**1回だけ**取り直して確認する（_getを通す: CAPTCHA・5xx・日次枠・heartbeatは他のページと同じ。日次枠にも1ページとして数える）。
+            page = _get(service, fetcher, claim, target, limits, sleep, hb, report.pages)
+            report.repeat_check_pages += 1
+            cards = extract_search_card_asins(page.html)
+            if not cards:  # 取り直したら0件のページになった: 限界ではなく想定外（従来の0件ページと同じ扱い）
+                return _empty_page(src, page, report, continuing)
+            sig = _signature(cards)
+            if sig == prev_sig:
+                raise _Stop("SUCCESS_TRUNCATED", None,
+                            f"同じ内容が取り直しても繰り返されたため、検索結果の深さの限界として閉じます（保存{report.pages}ページ・取り直し{report.repeat_check_pages}ページ）",
+                            truncation="DEPTH_LIMIT", drop_cursor=True)
+            # 取り直したら内容が変わっていた（一時的な不具合）: 通常のページとして処理を続ける
         prev_sig = sig
         new = [a for a in cards if a not in seen]
         zero_new = zero_new + 1 if not new else 0

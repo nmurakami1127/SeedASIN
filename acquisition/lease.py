@@ -323,13 +323,21 @@ class AcquisitionRunService:
         error_code: str | None = None,
         error_message: str | None = None,
         pages_fetched: int | None = None,
+        drop_cursor: bool = False,
     ) -> Decision | None:
         """終了確定。leaseが失効していれば拒否（LeaseLost）。失敗系は連続失敗を再判定し、閾値に達したら
-        同じトランザクションで自動保留にする（戻り値は自動保留した場合の判定）。"""
+        同じトランザクションで自動保留にする（戻り値は自動保留した場合の判定）。
+
+        drop_cursor=True（SUCCESS_TRUNCATEDのみ）: 保存済みの再開位置（next_url・next_page_no）を捨て、一巡を CLOSED_NO_CURSOR
+        で閉じる。検索結果の深さの限界に達した出典（`close_on_repeated_page`、truncation_reason='DEPTH_LIMIT'）用。続きは無く、
+        BROKENでもないので先頭からの取り直し(RESTART_BROKEN)にならない。取得間隔は従来の CLOSED_NO_CURSOR と同じく
+        truncated_counts_as_success で判定する。"""
         if outcome not in OUTCOME_STATUS:
             raise ValueError(f"unknown outcome: {outcome!r}")
         if outcome == "SUCCESS_TRUNCATED" and not truncation_reason:
             raise ValueError("SUCCESS_TRUNCATEDにはtruncation_reasonが必要です")
+        if drop_cursor and outcome != "SUCCESS_TRUNCATED":
+            raise ValueError("drop_cursor は SUCCESS_TRUNCATED のときだけ指定できます")
         status = OUTCOME_STATUS[outcome]
         held: Decision | None = None
         with self._app.get_session(claim.marketplace) as conn, conn.begin():
@@ -358,15 +366,15 @@ class AcquisitionRunService:
                     "pages_fetched = coalesce(:pf, pages_fetched), completed_at = clock_timestamp(), "
                     "heartbeat_at = clock_timestamp(), "
                     "cycle_state = CASE WHEN cycle_seq IS NULL THEN NULL WHEN :cs = 'TRUNCATED' THEN "
-                    "(CASE WHEN next_url IS NULL THEN 'CLOSED_NO_CURSOR' ELSE 'OPEN' END) ELSE CAST(:cs AS varchar(16)) END, "
+                    "(CASE WHEN next_url IS NULL OR CAST(:dc AS boolean) THEN 'CLOSED_NO_CURSOR' ELSE 'OPEN' END) ELSE CAST(:cs AS varchar(16)) END, "
                     "cursor_error = CASE WHEN cycle_seq IS NULL THEN NULL ELSE CAST(:ce AS varchar(40)) END, "
-                    "next_url = CASE WHEN CAST(:cmp AS boolean) THEN NULL ELSE next_url END, "
-                    "next_page_no = CASE WHEN CAST(:cmp AS boolean) THEN NULL ELSE next_page_no END "
+                    "next_url = CASE WHEN CAST(:cmp AS boolean) OR CAST(:dc AS boolean) THEN NULL ELSE next_url END, "
+                    "next_page_no = CASE WHEN CAST(:cmp AS boolean) OR CAST(:dc AS boolean) THEN NULL ELSE next_page_no END "
                     "WHERE id = :id"
                 ),
                 {"status": status, "outcome": outcome, "comp": DEFAULT_COMPLETENESS[outcome], "tr": truncation_reason,
                  "ec": error_code, "em": error_message, "pf": pages_fetched, "id": claim.run_id, "cs": cycle_state,
-                 "ce": error_code if cycle_state == "BROKEN" else None, "cmp": cycle_state == "COMPLETE"},
+                 "ce": error_code if cycle_state == "BROKEN" else None, "cmp": cycle_state == "COMPLETE", "dc": drop_cursor},
             )
             if status == "FAILED":
                 facts = load_facts(conn, claim.marketplace, [claim.source_id])[0]

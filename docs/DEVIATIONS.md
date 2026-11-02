@@ -1385,3 +1385,26 @@ Amazonのナビゲーションはdomcontentloadedで待機し、第三者リソ�
 - `source-yield`の実行時間: 合成データ（collector_asin 30万行・インデックスは既存のまま）で、24時間 約0.7秒・168時間 約2.3秒（Worker環境のPostgreSQL 16.15）。実DBでの時間は未計測。遅い場合のインデックス案（**作成していない・案のみ**）: `collector_asin (collector_run_id)`、`collector_asin (marketplace, asin)`、`collector_run (marketplace, started_at)`。
 
 テスト: `tests/unit/test_stall_and_yield.py`（しきい値の境界・7日分不足・設定の範囲・通知の間引き・CSVのUTF-8 BOM・稼働の集計）、`tests/integration/test_source_yield_and_stall.py`（実PostgreSQL。初見／既知の判定と境界、市場の分離とRLS、要解除・SERVER_ERROR連続・初見ASIN急減の検出、市場ごとの失敗の隔離、CLI）。
+
+## 80. 繰り返しページを検索結果の深さの限界として閉じる設定 `close_on_repeated_page`（2026-11-03）
+
+背景（実測と設計報告）: 出典取得は、直前のページとASIN列が同じだと REPEATED_PAGE で止まり、一巡が BROKEN になる。大きいセラーでは検索結果の深さに限界があり（約2,700件・約170ページ付近と推定。**実ページでは未確認**）、その先は同じページが返ると考えられる。BROKEN になると RESTART_BROKEN で1ページ目から取り直し、同じASINを最大3周（`max_cycle_restarts=2`）保存していた。24時間で保存行の55%が重複。利用者の方針は「取れるだけ取ればよい。しきい値は設けない」。価格帯分割は別案件（この変更に含まない）。
+
+**スキーマ変更なし**（alembicは追加していない。`truncation_reason`はVARCHAR(40)の自由文字列、`CLOSED_NO_CURSOR`は0017の制約`ck_collector_run_cycle_state`（status=COMPLETED・outcome=SUCCESS_TRUNCATED・next_url NULL）が既に許している。実PostgreSQL 16で遷移を確認）。追記専用テーブル・US/JP分離・RLSは変更なし。
+
+動作（設定が true のときだけ。`asin_collector/source_runner.py`の`_crawl`）:
+- 保存済みのページ（この実行で保存したページ、または続き(CONTINUE)で前回までに保存した最後のページ）の直後に、**直前と同じASIN列**のページが返ったら、すぐ止まらず、**同じURLを1回だけ**取り直す（`_get`を通す。CAPTCHA・5xx・日次ページ枠(`AccessBudgetExhausted`)・heartbeatは他のページと同じ。取り直しも日次枠の1ページとして数える）。
+  - 取り直しも同じ内容 → 限界として **SUCCESS_TRUNCATED / `truncation_reason='DEPTH_LIMIT'` / 再開位置なし（`CLOSED_NO_CURSOR`）** で閉じる。ここまでに保存したASINはそのまま残り、繰り返しのページは保存しない。BROKENではないので、次の判定は RESTART_BROKEN にならず（取得間隔は`truncated_counts_as_success`の従来どおり）、同じASINを取り直さない。
+  - 内容が変わっていた（一時的な不具合）→ 通常のページとして処理を続ける（保存・次ページ判定）。取り直したページが0件なら、従来の0件ページと同じ扱い（EMPTY_PAGE_AFTER_RESULTS / CURSOR_INVALID）。
+  - 取り直しで日次枠が尽きた → DAILY_LIMIT（INTERRUPTED。失敗に数えず、一巡はOPENで保存済みの位置から翌日に続ける。翌日の続きの冒頭で改めて確認する）。取り直しで5xx・CAPTCHA未解決 → 従来の一時的な失敗（一巡はOPEN）。
+- 変えないもの: 設定が false の間の全動作（REPEATED_PAGEでBROKEN）、続きの冒頭の重なり確認(OVERLAP_MISMATCH)、他のBROKEN理由（CURSOR_INVALID, REVISITED_URL, EMPTY_PAGE_AFTER_RESULTS, CURSOR_LOOP, NO_NEW_ASINS_LOOP）。判定のしきい値（累積ページ数など）は設けない。Amazonへの追加アクセスは、繰り返しを検知したときの取り直し1ページだけ。
+- `acquisition/lease.py`の`finish`に`drop_cursor`（SUCCESS_TRUNCATEDのみ可）を追加。真のとき`next_url`・`next_page_no`をNULLにして`cycle_state='CLOSED_NO_CURSOR'`にする（従来は`next_url`が元々NULLのときしか CLOSED_NO_CURSOR にならなかった）。成功行なので`error_code`/`error_message`は書かない。
+- `RunReport`に`repeat_check_pages`（確認のために取り直したページ数。`pages`・`overlap_pages`とは別）と`truncation_reason`を追加。日次枠に数えるアクセス数 = `pages + overlap_pages + repeat_check_pages + 繰り返しを検知した1ページ`（すべてfetcherを通る）。`collect-source`/`collect-next`の画面には打切りの説明（detail）が出る。
+
+設定:
+- `config/workflow.json` のトップレベルに `"close_on_repeated_page": true`（bool、既定 false。bool以外は拒否）。`WorkflowConfig`→`RunLimits`は`workflow/engine.py`の2か所（`fetch_source`と`_acquire_sources`）で渡す。`asin_collector.cli`の`collect-source`/`collect-next`は `--close-on-repeated-page`。`config/workflow.json`はこの変更では書き換えていない（利用者がパソコンで設定する）。
+- `WorkflowConfig.to_dict()`に項目が増えるため、新しく作るworkflowの`config_sha256`は変わる。#79の`stall`と同じく、`config_sha256`は表示用で比較・拒否には使っておらず、項目が無い保存済み状態・設定は読み込み時に既定falseで読める（`tests/unit/test_close_on_repeated_page_config.py`で確認）。再開は上限などに現在の設定を使うため、resume時に現在の設定を渡せば反映される。
+
+判断してほしい点（未対応・範囲外）:
+- **`batch_target_asins>0`（5,000件蓄積）との組み合わせ**: `tool_submission/planner.py`は`cycle_state != "COMPLETE"`の一巡では満杯の`batch_target`単位だけを返し端数を持ち越す（#78）。DEPTH_LIMITで閉じた一巡は`CLOSED_NO_CURSOR`でありCOMPLETEではないため、**端数（5,000未満の残り）は投入されないまま残る**。この案件では範囲外のため変更していない。
+- `DEPTH_LIMIT`の判定は「同じページが返った」ことの確認にとどまり、検索結果の深さの限界が実際に約170ページで起きるかは実ページで未確認。

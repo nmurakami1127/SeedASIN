@@ -105,6 +105,8 @@ class WorkflowConfig:
     batch_target_asins: int = 0  # 0=従来方式。続き取得を同一出典・方向でこの件数まで蓄積し、一巡完了時に端数を送る
     submission_enabled: bool = True  # False=探索と投入計画の保存のみ。登録は独立した手動実行
     tool_session_monitor: bool = False  # ログインの定期監視・維持アクセスは明示的に有効化した場合だけ
+    close_on_repeated_page: bool = False  # true=保存済みのページの直後に同じ内容が返ったら、1回取り直して確認し、同じなら検索結果の深さの限界として
+    #                                      SUCCESS_TRUNCATED(DEPTH_LIMIT)・再開位置なしで閉じる。false=従来どおり（REPEATED_PAGEで一巡をBROKENにする）。docs/DEVIATIONS.md #80
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -124,7 +126,7 @@ class WorkflowConfig:
         return self.lanes[lane].page_market or lane
 
     def validate(self) -> "WorkflowConfig":
-        for name in ("submission_enabled", "tool_session_monitor"):
+        for name in ("submission_enabled", "tool_session_monitor", "close_on_repeated_page"):
             if not isinstance(getattr(self, name), bool):
                 raise ConfigError(f"{name} はtrue/falseで指定してください")
         if not self.lanes:
@@ -189,7 +191,7 @@ def config_from_dict(d: dict) -> WorkflowConfig:
             daily=Daily(**d.get("daily", {})), watch=Watch(**d.get("watch", {})), stall=Stall(**d.get("stall", {})),
             **{k: d[k] for k in ("brand_enabled", "tool_max_asins", "result_max_age_days", "state_dir", "submission_dir",
                                  "page_revisit_days", "profile", "listing_feedback", "skip_failures", "batch_target_asins",
-                                 "submission_enabled", "tool_session_monitor") if k in d},
+                                 "submission_enabled", "tool_session_monitor", "close_on_repeated_page") if k in d},
         )
     except TypeError as exc:
         raise ConfigError(f"設定に未知の項目があります: {exc}") from exc

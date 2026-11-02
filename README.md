@@ -357,6 +357,8 @@ python -m seller_performance.cli watch-activity --days 7
 - **マイグレーション0017・0018の適用は実DBでは未実施。** 適用前のDBに新しいコードを向けるとCLIが案内して終了する。適用手順は docs/DEVIATIONS.md #63 の6（`alembic upgrade head`で0017・0018をまとめて適用）と #64 の6。
 
 **取得ページ数の数え方（`--max-pages`・日次上限）**: `--max-pages`（`asin_collector.cli collect-source` / `workflow.cli fetch-source`）は**新しく保存して進むページ数**です。続き取得での前回の最後のページの取り直し（overlap。`overlap_pages`、初期1）は含まない別枠で、実際のページアクセスは最大 `max-pages + overlap_pages` です（5xxの再試行・CAPTCHA後の取り直しも実アクセスとして数えます）。workflow経由の取得は、overlapと再試行を含む実アクセス数を日次（JST）の上限に対して確保してから行い、枠を使い切ったら、それ以上は取得しません（失敗には数えず、翌JST日付に保存済みの位置から続けます）（`fetch-source --total-cap N` で、overlapを含む総アクセス数の上限も指定できます）。冷却中の出典は30分ごとに再試行せず、冷却が明ける時刻まで飛ばします。
+**検索結果の深さの限界で閉じる設定（`close_on_repeated_page`、既定 false）**: 大きいセラーでは、あるページ数から先は同じページが返ると考えられます（約2,700件・約170ページ付近と推定。実ページでは未確認）。既定（false）では、保存済みのページの直後に同じ内容が返ると `REPEATED_PAGE` で一巡が BROKEN になり、先頭から同じASINを取り直します。`true` にすると、同じURLを**1回だけ**取り直して確認し、同じなら「限界」として、そこまでを保存して `SUCCESS_TRUNCATED`（`truncation_reason=DEPTH_LIMIT`、再開位置なし）で閉じます（取り直しで内容が変わっていれば、そのまま続けます）。しきい値（ページ数など）はありません。取り直しは日次のページ使用量に1ページとして数え、CAPTCHA・5xx・間隔の仕組みは他のページと同じです。設定は `config/workflow.json` のトップレベルに `"close_on_repeated_page": true`、`asin_collector.cli` の `collect-source` / `collect-next` では `--close-on-repeated-page`。詳細と制約は docs/DEVIATIONS.md #80。
+
 # 探索と統合ツール登録の分離（2026-10-28）
 
 5,000件蓄積モードでは、同じ取得先市場・出典・業務方向・一巡の保存済みASINを
