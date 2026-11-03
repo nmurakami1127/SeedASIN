@@ -47,7 +47,7 @@ def test_skip_failures_keeps_evidence_and_does_not_skip_human_waits(tmp_path):
     ledger.append("k", "SUBMIT_STARTED", before_run_ids=[1])
     ledger.append("k", "OUTCOME_UNKNOWN", candidate=2)
     watcher = Watcher.__new__(Watcher)
-    watcher.store, watcher.cfg = store, SimpleNamespace(submission_dir=ledger.path.parent)
+    watcher.store, watcher.cfg = store, SimpleNamespace(submission_dir=ledger.path.parent, submission_enabled=True)
     watcher._say = lambda _: None
     watcher._skip_failures(st)
     assert store.load(st.workflow_id).tasks["failed"].status == "SKIPPED"

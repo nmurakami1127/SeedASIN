@@ -1529,3 +1529,12 @@ Amazonのナビゲーションはdomcontentloadedで待機し、第三者リソ�
 
 ### テスト
 `tests/unit/test_hold_recovery.py`（自動／意図的の分類・バーストの境界・設定・上限の境界・各条件の候補判定・表示）、`tests/integration/test_hold_recovery.py`（実PostgreSQL。意図的な保留が要解除から除外／バーストの警告／OPEN・lease・MANUAL・セラー側・US価格帯・冷却・バースト・要人手確認・上限・`--limit`／ドライランの前後で全表のハッシュと行数が同じ／読み取り専用接続が書き込みを拒否／市場ごとの失敗の隔離／CLI）、`tests/integration/test_workflow_watch.py`（表示する解除コマンドが実在のサブコマンドとして解釈できる）。**未検証**: 実DB・実運用データでの判定結果。
+
+## 85. 既知のテスト失敗2件の原因整理と、独立worktreeからのドライラン手順（2026-11-03）
+
+### 既知のテスト失敗2件（どちらもmaster 2f71280・#84のブランチ b3e5dd0 の両方で同じ。#84の変更による退行ではない）
+1. `tests/unit/test_workflow.py::test_skip_failures_keeps_evidence_and_does_not_skip_human_waits`: **テスト側の古いスタブ**。`Watcher._skip_failures` は `submission_enabled`（`workflow/config.py`）を参照するようになった（f739a33 で導入）が、テストの `SimpleNamespace(submission_dir=…)` が追従していなかった。実装の退行ではない。`submission_enabled=True` をスタブに足した（テストの意図「submitの待機は飛ばす」は既定のTrueの挙動）。実装は変更なし。
+2. `tests/unit/test_shared_browser_runtime.py`: **環境依存（コードの問題ではない）**。`asin_collector`・`tool_submission`は設計どおり `headless=False`（CLAUDE.md 7節、人が手元で起動する対話式）で起動する。X server（`$DISPLAY`）が無い環境では「Missing X server」でChromiumが即終了する。Chromium自体（`/opt/pw-browsers`）は正常で、**`xvfb-run -a pytest tests/unit/test_shared_browser_runtime.py` で通る**。テストもコードも変更していない（headlessに変えるとテストの目的＝headed実運用の確認が変わるため）。X serverの無い環境では `xvfb-run -a` を付けて実行する。Windows PCでは通常どおり通る想定（PCでは未確認）。
+
+### 独立worktreeからのドライラン
+`scripts/run_recovery_plan_isolated.ps1`・`docs/hold_recovery_dryrun.md`を追加。稼働中のwatchが読む `C:\Projects\SeedASIN` は切り替えず、別ディレクトリのgit worktree（分離HEAD）＋元の`.venv`＋本番設定の絶対パス（読むだけ）で`recovery-plan`を実行する。コード・DB・設定・watchの状態を書き換えるコマンドは含まない。PowerShellはこの環境で実行できないため未確認（PCで確認）。
