@@ -365,7 +365,10 @@ python -m seller_performance.cli source-yield --marketplace=JP --hours 72  # 直
 python -m seller_performance.cli efficiency-report                       # JP・US両方、直近24時間
 python -m seller_performance.cli efficiency-report --market JP --hours 48 --out-dir exports
 python -m seller_performance.cli efficiency-report --no-export           # 画面表示のみ
+python -m seller_performance.cli efficiency-report --hours 1 --timeout-seconds 60 --no-recovery --no-band-breakdown --no-daily   # 段階的な確認用（重い節を外す）
 ```
+
+SQL1本ごとに `statement_timeout`（既定120秒・`--timeout-seconds`）とロック待ち3秒の上限が付く。上限を超えた節は途中の結果を残して「打ち切り」と表示し、終了コード1で終わる（市場ごとに独立）。`--no-recovery` / `--no-band-breakdown` / `--no-daily` で重い節だけを外せる。本番DBでの再検証は、タイムアウト付き・段階的な手順 `docs/efficiency_report_perf_verification.md`（docs/DEVIATIONS.md #94）に従う。
 
 取得ページ数・ASIN純増数（期間内に**初めて**その市場で見たASIN。重複・既知は数えない）・純増ASIN/ページ（ページ0は空欄）、価格帯分割の内訳（帯あり／帯なしのページ・純増ASIN、帯の数の状態別、帯ごとのページ・新規保存ASIN）、自動復旧・手動解除・再保留・復旧成功率（成功 = 解除後にその出典のrunが失敗せず初見ASINを得た。判断できないものは「未確定」として別計上）、保留件数（自動保留＝要解除／意図的）、初見ASINの直近7日の日次を表示する。出力は画面（日本語）と、市場ごとのCSV（UTF-8 BOM付き）・全市場まとめたJSON（既定 `exports/efficiency_report/`、`--out-dir` で変更）。各指標の定義は `seller_performance/efficiency_report.py` のモジュール説明と docs/DEVIATIONS.md #89 を参照。`AUTO_RELEASE` が無いDB（P3の未マイグレーション）や `acquisition_band` が無いDB（0019未適用）でも動く（該当は0件／帯なし扱い）。
 

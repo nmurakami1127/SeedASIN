@@ -1644,3 +1644,66 @@ Amazonのナビゲーションはdomcontentloadedで待機し、第三者リソ�
 ### 未確認・判断してほしい点
 - **実DB・実運用データでの数値は未確認**（実際のJP/USのデータで、集計時間と、帯なし/帯ありの分け方が期待どおりかをパソコンで確認してほしい）。
 - P3が自動解除のイベント種別・actorを別の値にした場合、`AUTO_RECOVERY_ACTOR`／`is_auto_release`を合わせる必要がある（現状は`AUTO_RELEASE`型、または`RELEASE`+`system:auto-recovery`）。
+
+
+## 94. 取得効率レポート（`efficiency-report`）の性能改善と安全装置（P4の本番受入前の修正。2026-11-04）
+
+### 事象
+2026-11-03 22:22に実DBで `efficiency-report --hours 24` を実行したところ1時間以上終わらず、PostgreSQLで `WITH win_runs AS (...)` から始まり `collector_run` を参照するSQLが走り続け、並列ワーカー2件が `MessageQueueSend` で待っていた（ロック待ち無し）。実DBへの負荷を懸念して中断した。P4（#89）の本番受入は、この性能改善が終わるまで保留。
+
+### 原因（合成データで再現・実測。実行計画のファイルは作業用で、リポジトリには入れていない）
+再現用データ: 使い捨てPostgreSQL 16（UTF8、shared_buffers 512MB、**work_mem 既定4MB・並列既定**、2コア）に、JP: `collector_run` 40,000行・`collector_asin` 4,000,000行（異なりASIN約81万）、US: 30,000行・3,000,000行（`tests/integration/perf_dataset.py`。ASINは時間とともに母集団が増え、1ASINが平均5回前後出る。24時間窓のrunは全体の約3.3%、窓内の初見ASINはJP 18,322件・US 13,678件）。実運用と同じく `collector_asin` の索引は主キー(id)だけ。`app_role`（RLS有効）で測定。
+
+1. **実行計画の見積もりが約200分の1に外れる（根本原因）**: RLSの条件 `(marketplace)::text = current_setting('app.current_marketplace')` は、`marketplace`（char(2)）を`text`へ変換するため列の統計が使えず、選択率が既定値（0.5%）になる。その結果、`collector_asin` 400万行を推定約2万行、窓内の`collector_run` 1,334行を推定4行、`first_win`（実際は約12万件）を**推定2行**と見積もる。
+2. 推定2行の`first_win`（CTE）に対し、PostgreSQLは `collector_asin` 全行（400万行）を外側に、`CTE Scan on first_win` を内側にした **Nested Loop Semi Join** を選ぶ。外側1行ごとにCTE（実際は約12万行、索引なし）を走査するので、約 4,000,000 × 120,000 ≒ 10^11 回の比較になり、終わらない。Gather（並列）はその上にあるだけで、ワーカーは親（leader）の結果待ち（`MessageQueueSend`）になる。事象の症状と一致する。
+3. **仮説の検証結果**: (a) 索引が無く全走査: 事実だが線形（1回5秒前後）で、これ単独では遅さの原因ではない。(b) `NOT IN` がwork_memを超えてhashedにならず二次になる: **違う**（計画は`hashed SubPlan`）。(c) 同じ集計を複数のSQLで繰り返す: 事実（純増・帯別・出典別・日次・復旧成功で各1回以上）だが、1回が数秒なら合計も数十秒。(d) `DISTINCT ON`/`count(DISTINCT)`の大きなソート: 数秒（今回の新実装でも支配的な部分）。
+   - 決め手: **同じ旧SQLを `SET enable_nestloop = off` で流すと、JP 5.0秒・US 3.5秒（帯別の純増）、JP 5.2秒・US 4.1秒（`source-yield`の合計）で終わる**。つまり旧SQLの遅さは計画の誤り（入れ子ループ）が原因。
+4. **別の独立した問題**: 復旧成功の `_RECOVERY_RUNS_SQL`（runごとの相関 `EXISTS (… NOT EXISTS (… b.asin = a.asin …))`）は、`enable_nestloop = off` でも **JP 259秒**かかる（自動復旧30出典の窓内runの、ASINごとに、索引の無い`collector_asin`を探しに行くため）。こちらは計画の誤りではなく方式の問題で、書き換えが必要。
+
+測定表（`EXPLAIN (ANALYZE, BUFFERS)`。「打ち切り」は`statement_timeout`まで走って未完了。バッファ＝共有バッファのhit+read、一時＝一時ファイルのブロック(8KB) read/written。旧SQLは`tests/integration/legacy_efficiency_sql.py`に保存）:
+
+| 対象 | JP 旧(既定) | US 旧(既定) | JP 旧(nestloop off) | US 旧(nestloop off) | JP 新 | US 新 |
+|---|---|---|---|---|---|---|
+| 帯別の純増(`_split_new_asins`) | 打ち切り(600秒超) | 打ち切り(600秒超) | 5.0秒 / 120k buf / 一時 2.4k/2.4k | 3.5秒 / 120k buf / 一時 1.8k/1.8k | （下の新集計に統合） | （同左） |
+| `source-yield` 合計(`_TOTAL_SQL`) | 打ち切り(120秒超) | 打ち切り(120秒超) | 5.2秒 / 120k buf / 一時 2.7k/2.4k | 4.1秒 / 120k buf / 一時 1.9k/1.8k | （新集計に統合） | （同左） |
+| `source-yield` 出典別(`_BY_SOURCE_SQL`) | 打ち切り(120秒超) | 打ち切り(120秒超) | 未測定 | 未測定 | 9.8秒（出典別+合計の相当） | 7.0秒 |
+| 復旧成功(`_RECOVERY_RUNS_SQL`) | 打ち切り(120秒超) | 打ち切り(120秒超) | **259秒** | 未測定 | （新集計に統合） | （同左） |
+| 日次の初見(`first_seen_daily_counts`) | 5.4秒 / 60k buf / 一時 33k/33k | 3.5秒 | — | — | （新集計に統合） | （同左） |
+| **新: 初見ASINの集計1本**（純増・帯別・日次・復旧成功の判定を全部） | — | — | — | — | **9.2秒** / 60k buf(hit 48.7k+read 11.4k) / 一時 49k/42k | **6.5秒** / 60k buf / 一時 36k/32k |
+| **レポート全体**(`efficiency-report`、両市場・24時間窓・全部の節) | **1時間以上(中断)** | 同左 | — | — | **約8〜9秒**（節ごと: 初見ASINの集計 約7〜8秒、保留 約1秒、他は0.1秒未満） | **約6〜7秒** |
+
+新実装のレポート全体は、1時間窓 JP 9.1秒/US 5.8秒、168時間窓 JP 9.0秒/US 6.9秒（窓の長さにほぼ依存しない。`collector_asin`を1回走査するため）。性能テスト（`SEEDASIN_PERF_TEST=1`）の実測: JP 7.7秒・US 7.3秒。目標（各市場で数十秒以内）を達成。
+
+### 変更内容
+- `seller_performance/source_yield.py`: 初見ASINの集計を作り直した（`compute_window_facts`）。`collector_run`（市場の全run、数万行）に `(started_at, id)` の順位`rk`を付け、`collector_asin`を**1回だけ**走査してASINごとの最小`rk`（最初に現れたrun）を求める。`rk`は`(started_at, id)`の全順序なので、「期間の開始より前のrunの数 `n_old` より大きい」⇔「期間より前に無い（初見）」。この1回の結果から、①合計（保存行・重複なし・初見）②帯あり/なし別の初見③日次(7窓)④復旧成功の判定(期間内の各runが初見ASINを得たか)を全部出す。`NOT IN (SELECT …)`・`old`の全探索・相関EXISTSはやめた。`compute_source_yield`（出典別+合計）と `first_seen_daily_counts`（watchの停止検知も使う）も同じ集計に切り替え、**出力は同一**（テストで旧SQLと比較）。
+- `plan_guard`: 集計のトランザクション内だけ（`SET LOCAL`）`enable_nestloop = off`・`jit = off`。RLSで見積もりが外れても二次の計算量の計画にならないようにする安全装置（JITは数秒の集計では約0.7秒の損）。**work_mem・並列度は変えない**: work_memを16/64/256MBにしても（ハッシュ集計に切り替えて試験）4.6〜5.4秒で既定（約5.9秒）とほぼ同じ、`max_parallel_workers_per_gather = 0` にしても JP 9.3秒/US 7.5秒（既定: 8.3/6.3秒）で、並列は害になっていない。
+- `seller_performance/efficiency_report.py`: ①レポートは`compute_source_yield`を呼ばず上の集計を1回だけ使う（出典別の集計は不要だった）②復旧成功の相関EXISTSを集合演算（上の`got_new`）に③節（取得ページ数・ASIN純増の集計・価格帯分割・自動復旧・保留）ごとにSAVEPOINTで囲み、**タイムアウトした節は`incomplete`に入れて他の節の数字を残す**④`readonly_session`が、`SET LOCAL`で`statement_timeout`（既定120秒）・`lock_timeout`（3秒）・`application_name = seedasin_efficiency_report`・`plan_guard`を設定する⑤`ReportOptions`（`--timeout-seconds`・`--no-recovery`・`--no-band-breakdown`・`--no-daily`）。
+- `seller_performance/cli.py`: `efficiency-report` に上のオプションを追加。実行開始時に「読み取り専用・SQLごとのタイムアウトN秒…」を表示。打ち切り・失敗があれば**終了コード1**（途中の結果は表示・CSV/JSONに書き出した後）。従来は`--no-export`のとき失敗しても終了コード0だったのを、1に揃えた。
+- 出力形式の互換: 打ち切り・省略が無いとき、画面は従来の行に「（節ごと: …）」の1行が増えるだけ。CSVは従来と同じ行（打ち切り・省略のときだけ「打ち切り」「省略」行が増え、不完全な数字は空欄）。JSONは`incomplete`/`skipped`/`section_seconds`/`timeout_seconds`が増えるだけ（既存のキーは同じ）。
+
+### 純増の同値性の根拠
+- 定義: 純増 = 期間内（商品ページ調査を除くrun）に現れたASINのうち、**その市場で期間の開始より前に始まったrun（種類を問わない）に1行も無いもの**。旧SQLの `old` と同じ。新実装は、ASINごとの最初のrunの順位 `first_all`（全種類のrun）を求め、`first_all > n_old`（期間の開始より前に始まったrunの数）で判定する。順位は`(started_at, id)`の全順序なので、期間の開始より前のrunは順位が先頭の`n_old`個ちょうど。⇔が成り立つ。
+- 帯別: 旧は「期間内で最初のrun（`started_at`,`id`の最小。商品ページ調査を除く）」の側。新は `first_win`（窓内の最小順位）のrunの`banded`。
+- 日次: 旧は `min(started_at)`（全種類のrun）の日数バケット。新は `first_all` のrunの`started_at`から同じ式。窓外に1行でもあれば最古は窓の外になるので、窓内のrunだけに絞って集計しても同じ（`HAVING bool_or(in_recent)`）。
+- 復旧成功の判定材料: 旧は「runの各ASINについて、`(started_at, id)`がそのrun未満のrunにそのASINが無いものが1つでもある」。新は「`first_all` がそのrunの順位と等しいASINが1つでもある」（そのASINを含む最も古いrunがそのrun自身）。同じ。
+- **テストでの確認**（実PostgreSQL。`tests/integration/test_efficiency_report_perf.py`）: 乱数データ3シード×JP/US×4つの窓（6/24/30.5/72時間）＋「期間の端がちょうどrunの開始時刻」の窓で、旧SQL（`legacy_efficiency_sql.py`に原文のまま保存）と新実装が、出典別の全行・合計（run数・ページ数・保存行・重複なし・初見）・帯別の初見・日次(7窓)・復旧成功の判定材料(got_newが真と偽の両方を含む)を**完全に一致**させる。runの開始時刻は30分刻みに丸めて同時刻のrunを多数作り、JPとUSに同じASINの文字列がある。手で作った境界テスト（期間の開始/終了ちょうど・1秒前・同時刻の別run・商品ページ調査runが期間前/期間内にある・他市場に同ASIN）も旧SQLと一致。確認のため`first_all > n_old`を`>=`に壊すとこの比較が1件の差で失敗することを確かめた（変更後に戻した）。
+
+### 索引案（今回は不要。作成していない。必要になったときの参考）
+目標は索引なしで達成したので、索引は提案のみ（作成にはユーザー承認が要る）。実データが合成データより大幅に大きく、`『ASIN純増の集計』`が120秒を超える場合に検討する。
+- `CREATE INDEX CONCURRENTLY ix_collector_asin_run ON collector_asin (collector_run_id)`: 合成データ(700万行)で**47MB・作成2.6秒**（メモリ内。本番は数十秒〜数分の見込み）。外部キーの検査・`run → ASIN`の引き当てが速くなる。ただし今回の集計は窓のASINの**全行**を読む必要があり、この索引を足しても集計時間は変わらなかった（実測 JP 8.5秒/US 6.5秒 vs 索引なし 8.3/6.3秒）。
+- `CREATE INDEX CONCURRENTLY ix_collector_asin_asin ON collector_asin (marketplace, asin)`: **90MB・作成9.4秒**。ASINでの引き当てが可能になるが、使うにはSQLの書き換え（窓のASINごとに索引で最古のrunを引く）が要る。窓のASINが12万件ある今回は、全走査＋集計より速くなるとは限らない（未検証）。
+- ロック影響: `CONCURRENTLY`は書き込み（取得中の追記）を止めない（`SHARE UPDATE EXCLUSIVE`）が、表を2回走査する。追記専用テーブルなので更新の競合は無い。alembicのマイグレーションで使うときは`autocommit_block`が必要（トランザクション内では`CONCURRENTLY`は使えない）。失敗すると`INVALID`の索引が残るので `DROP INDEX CONCURRENTLY` で消してやり直す。ロールバック＝`DROP INDEX CONCURRENTLY <名前>`（データは変わらない）。
+- 索引を足すと追記（INSERT）が少し遅くなる（1行あたり索引1本ぶん）。
+
+### 安全装置の使い方と本番での再検証
+- `docs/efficiency_report_perf_verification.md`（PowerShell）: 先に `--hours 1 --timeout-seconds 60 …` → `--timeout-seconds 60` → 24時間と、`--no-recovery` 等で節を外しながら段階的に進める。実行中の重いクエリを探す`pg_stat_activity`の読み取りクエリ（`application_name = 'seedasin_efficiency_report'`）と、止め方（`pg_cancel_backend(pid)`。`pg_terminate_backend`は最後の手段）。
+- **実DB・実データでの数値は未確認**（合成データは索引なし・既定のwork_mem/並列で測ったが、実データのASINの分布・表のキャッシュ状態・サーバーの性能は未確認）。本番での所要時間は、表の大きさにほぼ比例する（1回の全走査＋ソート）と見て、合成データ(JP 400万行)で約8〜9秒なら、同規模なら同程度、10倍の規模なら1分前後を見込む。
+
+### 影響範囲・注意
+- `first_seen_daily_counts` は `workflow.stall.check_market`（watchの停止検知）も使う。**戻り値は同一**で、SQLだけが変わる（`workflow/`のコードは変更していない）。このブランチをwatchが読むコードに入れると、停止検知のSQLも新しい集計になり、そのトランザクションの最後（他のSQLの後）で`SET LOCAL enable_nestloop = off`・`jit = off`が効く。
+- `collector_asin`の削除（テストの掃除など）は、`collector_run_id`に索引が無いので、`collector_run`を消すたびに外部キーの検査で`collector_asin`を全走査する。大規模データのテストの掃除は`TRUNCATE`を使う（`test_efficiency_report_perf.py`はそうしている）。
+- 保留の節（`_load_holds` → `acquisition.eligibility.load_facts`）は、市場の全`collector_run`（`last_page_asins`の配列を含む）をPythonへ読み込むため、合成データでJP約0.7〜1.0秒かかる。今回の対象ではないので変更していない（`acquisition/`は変更範囲外）。実データでrunが桁違いに増えると効いてくる可能性がある。
+
+### テスト
+- 自動テスト: `tests/integration/test_efficiency_report_perf.py`（上の同値性＋境界＋タイムアウト/ロック待ち/市場独立/終了コード/節の省略/設定がトランザクション内だけ、性能テスト＝`SEEDASIN_PERF_TEST=1`のときだけ）、`tests/unit/test_efficiency_report.py`（打ち切り・省略の表示とCSV）。既存の `test_efficiency_report.py`・`test_source_yield_and_stall.py` はそのまま全て合格。
+- 既知の失敗2件（`tests/integration/test_seller_performance.py::TestSellerRecommenderService`の`last_requested_date`系。時刻帯・タイムゾーン依存で、変更前のe3c65f7のコピーでも同じく失敗することを確認）は今回の対象外。

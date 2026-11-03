@@ -67,3 +67,36 @@ def test_empty_report_formats_and_exports_without_errors():
     rep = MarketReport("JP", 24, T0 - timedelta(hours=24), T0)
     assert any("純増ASIN/ページ: -" in line for line in format_report(rep))
     assert all(len(r) == 4 for r in csv_rows(rep))
+
+
+def test_options_are_described_and_cut_or_skipped_sections_are_shown_without_inventing_numbers():
+    from seller_performance.efficiency_report import ReportOptions, SEC_NEW_ASINS, SEC_RECOVERY, _stop_reason
+
+    assert ReportOptions().describe() == "読み取り専用・SQLごとのタイムアウト120秒・ロック待ち3秒まで"
+    assert "省略する節: 自動復旧・再保留、初見ASINの日次" in ReportOptions(timeout_seconds=60, recovery=False, daily=False).describe()
+    assert ReportOptions(timeout_seconds=60).describe().startswith("読み取り専用・SQLごとのタイムアウト60秒")
+
+    rep = MarketReport("JP", 24, T0 - timedelta(hours=24), T0, pages=7, runs=2, new_asins=0, timeout_seconds=30)
+    rep.incomplete[SEC_NEW_ASINS] = "タイムアウト"
+    rep.skipped.append(SEC_RECOVERY)
+    out = "\n".join(format_report(rep))
+    assert "【打ち切り】SQL1本あたり30秒" in out and "ASIN純増数（期間内に初めて見たASIN。重複・既知は数えない）: -（打ち切り）" in out
+    assert "取得ページ数: 7（run 2件）" in out and "純増ASIN/ページ: -" in out and "省略しました（--no-recovery）" in out
+    rows = csv_rows(rep)
+    assert [r for r in rows if r[1] == "ASIN純増数"][0][2] == "" and [r for r in rows if r[1] == "保存行"][0][2] == ""
+    assert ["打ち切り", SEC_NEW_ASINS, "タイムアウト", "SQL1本あたり30秒の上限など。この節の数字は不完全"] in rows
+    assert ["省略", SEC_RECOVERY, "", "オプションで省略"] in rows
+    # 打ち切りも省略も無ければ、CSVに余計な行は増えない（従来の出力と同じ）
+    plain = csv_rows(MarketReport("JP", 24, T0 - timedelta(hours=24), T0))
+    assert not [r for r in plain if r[0] in ("打ち切り", "省略")]
+
+    class _Orig:
+        def __init__(self, sqlstate):
+            self.sqlstate = sqlstate
+
+    class _Exc:
+        def __init__(self, sqlstate):
+            self.orig = _Orig(sqlstate)
+
+    assert _stop_reason(_Exc("57014")) == "タイムアウト" and _stop_reason(_Exc("55P03")) == "ロック待ち超過"
+    assert _stop_reason(_Exc("42P01")) is None and _stop_reason(_Exc(None)) is None

@@ -11,6 +11,7 @@
     python -m seller_performance.cli source-yield --marketplace=US --hours 24
     python -m seller_performance.cli efficiency-report --hours 24
     python -m seller_performance.cli efficiency-report --market JP --out-dir exports
+    python -m seller_performance.cli efficiency-report --hours 1 --timeout-seconds 60 --no-recovery --no-band-breakdown
     python -m seller_performance.cli watch-activity --days 7
 
 recommendは、前回の取得（tool_execution_link.requested_atの最新値と、
@@ -94,6 +95,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import sys
 from datetime import datetime
 from pathlib import Path
 
@@ -241,21 +243,30 @@ def _cmd_source_yield(args: argparse.Namespace) -> None:
 
 
 def _cmd_efficiency_report(args: argparse.Namespace) -> None:
-    from seller_performance.efficiency_report import EXPORT_DIR, MARKETS, build_reports, format_report, write_csv, write_json
+    from seller_performance.efficiency_report import (
+        EXPORT_DIR, MARKETS, ReportOptions, build_reports, format_report, write_csv, write_json,
+    )
 
+    if not args.timeout_seconds > 0:
+        raise SystemExit("--timeout-secondsは正の数にしてください")
+    options = ReportOptions(timeout_seconds=args.timeout_seconds, recovery=not args.no_recovery,
+                            band_breakdown=not args.no_band_breakdown, daily=not args.no_daily)
     markets = (args.market,) if args.market else MARKETS
-    # 読み取りのみ（市場ごとに別の接続・READ ONLYトランザクション）。一方の市場の失敗は他方を止めない
-    reports = build_reports(SessionFactory.for_app_role(), markets, args.hours)
+    print(f"取得効率レポート: {options.describe()}（DBは更新しません・Amazonにはアクセスしません）", flush=True)
+    # 読み取りのみ（市場ごとに別の接続・READ ONLYトランザクション）。一方の市場の失敗・打ち切りは他方を止めない
+    reports = build_reports(SessionFactory.for_app_role(), markets, args.hours, options=options)
     for rep in reports.values():
         print("\n".join(format_report(rep)))
         print()
-    if args.no_export:
-        return
-    out_dir = Path(args.out_dir) if args.out_dir else EXPORT_DIR
-    for rep in reports.values():
-        print(f"CSVを{write_csv(rep, out_dir)}に書き出しました")
-    print(f"JSONを{write_json(reports, out_dir)}に書き出しました")
-    if any(r.error for r in reports.values()):
+    if not args.no_export:
+        out_dir = Path(args.out_dir) if args.out_dir else EXPORT_DIR
+        for rep in reports.values():
+            print(f"CSVを{write_csv(rep, out_dir)}に書き出しました")
+        print(f"JSONを{write_json(reports, out_dir)}に書き出しました")
+    # 失敗・打ち切り（不完全な数字）があれば終了コード1（途中までの結果は上で表示・書き出し済み）
+    bad = [f"{m}: {r.error}" if r.error else f"{m}: 打ち切り（{'、'.join(r.incomplete)}）" for m, r in reports.items() if r.error or r.incomplete]
+    if bad:
+        print("終了コード1: " + " / ".join(bad), file=sys.stderr)
         raise SystemExit(1)
 
 
@@ -326,6 +337,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_eff.add_argument("--hours", type=float, default=24, help="対象期間（直近N時間。既定24）")
     p_eff.add_argument("--out-dir", default=None, help="CSV/JSONの出力先。省略時はexports/efficiency_report/")
     p_eff.add_argument("--no-export", action="store_true", help="画面表示のみ（ファイルを書かない）")
+    p_eff.add_argument("--timeout-seconds", type=float, default=120.0,
+                       help="SQL1本あたりの上限秒数（既定120）。超えた節は途中の結果を残して『打ち切り』と表示し、終了コード1で終わる")
+    p_eff.add_argument("--no-recovery", action="store_true", help="自動復旧・再保留の節を省略する（重い集計を外したいとき）")
+    p_eff.add_argument("--no-band-breakdown", action="store_true", help="価格帯分割の内訳の節（帯別の純増・帯の台帳）を省略する")
+    p_eff.add_argument("--no-daily", action="store_true", help="初見ASINの日次の節を省略する")
     p_eff.set_defaults(func=_cmd_efficiency_report)
 
     p_act = subparsers.add_parser(

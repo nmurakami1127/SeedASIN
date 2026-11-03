@@ -15,6 +15,15 @@
 読み取りのみ（SELECTだけ。追記専用テーブル・既存のデータは変更しない）。US/JPは`SessionFactory.get_session(marketplace)`のRLSの範囲で別々に実行する。
 スキーマ変更・インデックス作成は行わない。
 
+## 集計方式（docs/DEVIATIONS.md #94）
+「初見」の判定は、ASINごとに**最初に現れたrun**を1回だけ求めて使い回す（`_FACTS_CTE`）。以前は期間より前のASIN全体を`old`として引き、
+`NOT IN (SELECT ...)`で突き合わせていたが、RLSの条件（`marketplace::text = current_setting(...)`）でPostgreSQLの行数見積もりが約200分の1になり、
+`collector_asin`（索引は主キーのみ・数百万行）を入れ子ループで行ごとに何万回も走査する計画が選ばれて、1時間以上終わらなかった。
+今は`collector_run`（数万行）に`(started_at, id)`の順位`rk`を付け、`collector_asin`を1回だけ走査してASINごとの最小`rk`を求める
+（`rk`は`(started_at, id)`の全順序なので、期間の開始より前のrunの数`n_old`より大きければ「期間より前に無い」と同値）。
+また、見積もりが外れても二次の計算量にならないよう、この集計のトランザクション内では`SET LOCAL enable_nestloop = off`にする（`plan_guard`）。
+結果（初見の定義・数）は従来と同一（tests/integration/test_efficiency_report_perf.pyの同値性テストで旧SQLと比較する）。
+
 また、`first_seen_daily_counts()`は`workflow.stall`（停止の検知）が使う「市場ごとの日次の初見ASIN数」を返す（同じ初見の定義）。
 """
 from __future__ import annotations
@@ -32,9 +41,95 @@ EXPORT_DIR = Path("exports") / "source_yield"
 CSV_HEADER = ["出典ID", "種別", "出典", "run数", "ページ数", "保存行数", "重複なしASIN数", "初見ASIN数", "既知ASIN数",
               "初見ASIN/ページ", "重複なしの割合(%)", "初見の割合(%)"]
 
-# 対象期間のrun・ASIN・期間より前に見たASINを求める共通部分（:m=市場, :s=期間の開始, :e=期間の終了）
-_CTE = """
-WITH win_runs AS (
+# ---- 初見ASINの集計（:m=市場, :s=期間の開始, :e=期間の終了, :days=日次の窓の日数(0なら不要)）
+
+_FACTS_RUNS_CTE = """
+runs AS MATERIALIZED (
+    SELECT id, started_at, run_type, cycle_id,
+           row_number() OVER (ORDER BY started_at, id) AS rk,
+           (started_at >= :s AND run_type <> 'ASIN_PAGE') AS in_win,
+           (started_at >= LEAST(CAST(:s AS timestamptz), CAST(:e AS timestamptz) - make_interval(days => :days))) AS in_recent,
+           {banded} AS banded
+    FROM collector_run
+    WHERE marketplace = :m AND started_at < :e
+)"""
+
+_BANDED_EXPR = "coalesce(cycle_id IN (SELECT cycle_id FROM acquisition_band WHERE marketplace = :m), false)"
+
+# ASINごとの「最初に現れたrunの順位」(first_all。全種類のrunが対象)と「期間内で最初のrunの順位」(first_win。商品ページ調査は除く)、期間内の行数。
+# 期間の開始以降のrunにしか現れないASIN(=期間より前に無い)は first_all > n_old。collector_asinを走査するのはここだけ。
+_FACTS_CTE = """
+f AS MATERIALIZED (
+    SELECT a.asin, min(r.rk) AS first_all, min(r.rk) FILTER (WHERE r.in_win) AS first_win,
+           count(*) FILTER (WHERE r.in_win) AS rows_win
+    FROM collector_asin a JOIN runs r ON r.id = a.collector_run_id
+    WHERE a.marketplace = :m
+    GROUP BY a.asin
+    HAVING bool_or(r.in_recent)
+), n AS (
+    SELECT count(*) AS n_old FROM runs WHERE started_at < :s
+)"""
+
+
+def plan_guard(conn: Connection) -> None:
+    """集計のトランザクション内だけ、入れ子ループ結合とJITを使わせない（`SET LOCAL`。トランザクションが終われば元に戻る）。
+    RLSの条件で行数の見積もりが大きく外れても、索引の無い`collector_asin`を行ごとに走査する計画にならないようにする安全装置。
+    work_mem・並列度は変えない（本番の設定のまま。測定では大きくしても速くならなかった）。"""
+    conn.execute(text("SET LOCAL enable_nestloop = off"))
+    conn.execute(text("SET LOCAL jit = off"))     # 数秒の集計では、JITのコンパイル（約0.7秒）のほうが高くつく
+
+
+def _facts_with(has_band: bool) -> str:
+    return "WITH " + _FACTS_RUNS_CTE.format(banded=_BANDED_EXPR if has_band else "false") + ", " + _FACTS_CTE
+
+
+@dataclass
+class WindowFacts:
+    """`compute_window_facts`の結果。"""
+    unique_asins: int = 0                                   # 期間内(商品ページ調査を除く)に現れたASINの数
+    rows: int = 0                                           # 期間内の保存行数
+    new_asins: int = 0                                      # うち初見(期間より前のrunに無い)
+    new_by_side: dict[bool, int] = field(default_factory=dict)      # 初見ASINを、期間内で最初に含むrunが帯あり(True)か(False)で分けた数
+    daily: dict[int, int] = field(default_factory=dict)             # k=0が直近24時間…の初見ASIN数(first_seen_daily_countsと同じ定義)
+    got_new_run_ids: set[int] = field(default_factory=set)          # 「そのrun自身が、それより前に無いASINを1件以上得た」期間内のrunのid
+
+
+def compute_window_facts(conn: Connection, marketplace: str, start: datetime, end: datetime, *, days: int = 0,
+                         has_band: bool = False, side: bool = False, got_new: bool = False) -> WindowFacts:
+    """期間[start,end)の初見ASINに関する数を、`collector_asin`を1回だけ走査して求める（SELECTのみ）。
+    days>0なら日次(first_seen_daily_counts)も、side=Trueなら帯あり/なしの内訳、got_new=Trueなら期間内の各runが初見を得たかも返す。
+    呼び出し側は`plan_guard`済みのトランザクション内で呼ぶこと。"""
+    parts = ["SELECT 'total' AS kind, 0::bigint AS a, count(*) FILTER (WHERE first_win IS NOT NULL) AS b, "
+             "coalesce(sum(rows_win), 0)::bigint AS c, count(*) FILTER (WHERE first_win IS NOT NULL AND first_all > n_old) AS d FROM f, n"]
+    if side:
+        parts.append("SELECT 'side', rb.banded::int::bigint, count(*), 0::bigint, 0::bigint FROM f JOIN runs rb ON rb.rk = f.first_win, n "
+                     "WHERE f.first_all > n.n_old GROUP BY rb.banded")
+    if days > 0:
+        parts.append("SELECT 'daily', t.k::bigint, count(*), 0::bigint, 0::bigint FROM ("
+                     "SELECT (ceil(extract(epoch FROM (CAST(:e AS timestamptz) - rd.started_at)) / 86400) - 1)::int AS k "
+                     "FROM f JOIN runs rd ON rd.rk = f.first_all "
+                     "WHERE rd.started_at >= CAST(:e AS timestamptz) - make_interval(days => :days)) t GROUP BY t.k")
+    if got_new:
+        parts.append("SELECT 'gotnew', rg.id, 0::bigint, 0::bigint, 0::bigint FROM runs rg WHERE rg.in_win AND rg.rk IN (SELECT first_all FROM f)")
+    sql = text(_facts_with(has_band) + "\n" + "\nUNION ALL\n".join(parts))
+    out = WindowFacts()
+    for r in conn.execute(sql, {"m": marketplace, "s": start, "e": end, "days": days}):
+        if r.kind == "total":
+            out.unique_asins, out.rows, out.new_asins = int(r.b), int(r.c), int(r.d)
+        elif r.kind == "side":
+            out.new_by_side[bool(r.a)] = int(r.b)
+        elif r.kind == "daily":
+            out.daily[int(r.a)] = int(r.b)
+        else:
+            out.got_new_run_ids.add(int(r.a))
+    return out
+
+
+# 出典ごと（:m,:s,:e。日次は不要なので:daysは0）。win=期間内の(出典, run_type, ASIN)。freshは初見ASINの集合（asinは一意）
+_BY_SOURCE_BODY = """
+, fresh AS (
+    SELECT asin FROM f, n WHERE first_win IS NOT NULL AND first_all > n_old
+), win_runs AS (
     SELECT id, source_id, run_type, COALESCE(pages_fetched, 0) AS pages
     FROM collector_run
     WHERE marketplace = :m AND started_at >= :s AND started_at < :e AND run_type <> 'ASIN_PAGE'
@@ -42,22 +137,12 @@ WITH win_runs AS (
     SELECT r.source_id, r.run_type, a.asin
     FROM collector_asin a JOIN win_runs r ON r.id = a.collector_run_id
     WHERE a.marketplace = :m
-), win_asins AS (
-    SELECT DISTINCT asin FROM win
-), old AS (
-    SELECT DISTINCT a.asin
-    FROM collector_asin a JOIN collector_run r ON r.id = a.collector_run_id
-    WHERE a.marketplace = :m AND r.started_at < :s AND a.asin IN (SELECT asin FROM win_asins)
-)
-"""
-
-_BY_SOURCE_SQL = text(_CTE + """
-, runs_g AS (
+), runs_g AS (
     SELECT source_id, run_type, count(*) AS runs, COALESCE(sum(pages), 0) AS pages FROM win_runs GROUP BY source_id, run_type
 ), asin_g AS (
-    SELECT source_id, run_type, count(*) AS rows_, count(DISTINCT asin) AS uniq,
-           count(DISTINCT asin) FILTER (WHERE asin NOT IN (SELECT asin FROM old)) AS new_
-    FROM win GROUP BY source_id, run_type
+    SELECT w.source_id, w.run_type, count(*) AS rows_, count(DISTINCT w.asin) AS uniq,
+           count(DISTINCT w.asin) FILTER (WHERE fr.asin IS NOT NULL) AS new_
+    FROM win w LEFT JOIN fresh fr ON fr.asin = w.asin GROUP BY w.source_id, w.run_type
 )
 SELECT g.source_id, g.run_type, s.source_type, s.display_primary, s.display_qualifier,
        g.runs, g.pages, COALESCE(a.rows_, 0) AS rows_, COALESCE(a.uniq, 0) AS uniq, COALESCE(a.new_, 0) AS new_
@@ -65,14 +150,13 @@ FROM runs_g g
 LEFT JOIN asin_g a ON a.source_id IS NOT DISTINCT FROM g.source_id AND a.run_type = g.run_type
 LEFT JOIN acquisition_source s ON s.source_id = g.source_id AND s.marketplace = :m
 ORDER BY g.pages DESC, g.runs DESC, g.source_id NULLS LAST
-""")
+"""
 
-_TOTAL_SQL = text(_CTE + """
-SELECT (SELECT count(*) FROM win_runs) AS runs,
-       (SELECT COALESCE(sum(pages), 0) FROM win_runs) AS pages,
-       (SELECT count(*) FROM win) AS rows_,
-       (SELECT count(*) FROM win_asins) AS uniq,
-       (SELECT count(*) FROM win_asins WHERE asin NOT IN (SELECT asin FROM old)) AS new_
+_BY_SOURCE_SQL = text(_facts_with(False) + _BY_SOURCE_BODY)
+
+_TOTAL_RUNS_SQL = text("""
+SELECT count(*) AS runs, COALESCE(sum(COALESCE(pages_fetched, 0)), 0) AS pages FROM collector_run
+WHERE marketplace = :m AND started_at >= :s AND started_at < :e AND run_type <> 'ASIN_PAGE'
 """)
 
 _ASIN_PAGE_SQL = text(
@@ -136,11 +220,13 @@ def compute_source_yield(conn: Connection, marketplace: str, hours: float = 24, 
     params = {"m": marketplace, "s": start, "e": end}
     t0 = time.monotonic()
     rep = YieldReport(marketplace, hours, start, end)
-    for r in conn.execute(_BY_SOURCE_SQL, params):
+    plan_guard(conn)
+    for r in conn.execute(_BY_SOURCE_SQL, {**params, "days": 0}):
         name, kind = _label(r.source_id, r.run_type, r.source_type, r.display_primary, r.display_qualifier)
         rep.items.append(YieldRow(name, r.source_id, kind, r.runs, int(r.pages), r.rows_, r.uniq, r.new_))
-    t = conn.execute(_TOTAL_SQL, params).one()
-    rep.total = YieldRow("合計", None, "", t.runs, int(t.pages), t.rows_, t.uniq, t.new_)
+    t = conn.execute(_TOTAL_RUNS_SQL, params).one()
+    wf = compute_window_facts(conn, marketplace, start, end)
+    rep.total = YieldRow("合計", None, "", t.runs, int(t.pages), wf.rows, wf.unique_asins, wf.new_asins)
     rep.asin_page_runs = conn.execute(_ASIN_PAGE_SQL, params).scalar_one()
     rep.elapsed_seconds = time.monotonic() - t0
     return rep
@@ -202,18 +288,6 @@ def write_csv(rep: YieldReport, export_dir: Path = EXPORT_DIR, now: datetime | N
 
 # ---------------------------------------------------------------------- 日次の初見ASIN（停止の検知用）
 
-_FIRST_SEEN_SQL = text("""
-SELECT (ceil(extract(epoch FROM (CAST(:now AS timestamptz) - first_seen)) / 86400) - 1)::int AS k, count(*) AS n
-FROM (
-    SELECT a.asin, min(r.started_at) AS first_seen
-    FROM collector_asin a JOIN collector_run r ON r.id = a.collector_run_id
-    WHERE a.marketplace = :m
-    GROUP BY a.asin
-) t
-WHERE first_seen < :now AND first_seen >= CAST(:now AS timestamptz) - make_interval(days => :days)
-GROUP BY k
-""")
-
 _EARLIEST_SQL = text(
     "SELECT min(started_at) FROM collector_run WHERE marketplace = :m AND run_type <> 'ASIN_PAGE'"
 )
@@ -224,6 +298,7 @@ def first_seen_daily_counts(conn: Connection, marketplace: str, as_of: datetime,
     各窓は`[as_of-24h×(k+1), as_of-24h×k)`で、`source-yield`の対象期間と同じ「開始を含み終了を含まない」）。
     初見の日時 = そのASINを含む最も古いrunの`started_at`（対象期間より前に行が無い、と同じ定義）。
     もう一つ返すのは、この市場の最も古い取得runの開始時刻（データが何日分あるかの判定用。runが無ければNone）。"""
-    counts = {int(r.k): int(r.n) for r in conn.execute(_FIRST_SEEN_SQL, {"m": marketplace, "now": as_of, "days": days})}
+    plan_guard(conn)
+    counts = compute_window_facts(conn, marketplace, as_of - timedelta(seconds=1), as_of, days=days).daily if days > 0 else {}
     earliest = conn.execute(_EARLIEST_SQL, {"m": marketplace}).scalar_one()
     return counts, earliest
