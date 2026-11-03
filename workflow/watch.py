@@ -27,6 +27,7 @@ from workflow.engine import Engine
 from workflow.stall import check_all
 from workflow.store import DONE_STATES, State, WorkflowStore, pid_alive
 from workflow.watch_events import append_event
+from workflow.watch_recovery import WatchRecovery
 
 AUTO_HOLD_AFTER = 3
 STALL_CHECK_MIN_MINUTES = 10  # 止まりの検知のDB確認の最短間隔（続きの候補を5秒ごとに確認する間も、毎回は調べない）
@@ -76,6 +77,7 @@ class Watcher:
         self._stall_checked_at: datetime | None = None
         self._stall_snapshot: dict | None = None   # watch_status.jsonの"stall"
         self._stall_warnings: dict[str, list] = {}  # 市場 → [(種類のキー, 表示文)]（通知の間引き用。状態ファイルには出さない）
+        self._recovery = WatchRecovery(cfg, factory, self.now, say=self._say)  # 自動復旧（既定は無効=何もしない）。docs/DEVIATIONS.md #92
         self._last_state = "starting"
         self._feedback_versions = {}
         if hasattr(self.ports, "keep_tool_open"):
@@ -92,6 +94,9 @@ class Watcher:
              "caps": {"pages": self.cfg.daily.max_pages, "submit_per_direction": self.cfg.daily.max_new_submissions_per_direction,
                       "asins": self.cfg.daily.max_submit_asins},
              "interval_minutes": self.cfg.watch.interval_minutes, "stall": self._stall_snapshot}
+        rec = self._recovery.snapshot()
+        if rec is not None:   # 無効（既定）のときは項目を出さない＝従来の状態ファイルと同一
+            d["recovery"] = rec
         self.status_path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.status_path.with_suffix(".tmp")
         tmp.write_text(json.dumps(d, ensure_ascii=False, indent=1), encoding="utf-8")
@@ -234,6 +239,15 @@ class Watcher:
             self._say("[停止の兆候] " + msg)
             append_event(self.cfg.state_dir, self.now(), "stall_warning", market, detail=msg[:200])
 
+    def _run_recovery(self) -> None:
+        """自動復旧（既定は無効）。取得の工程の切れ目で、停止要求がなければ、間隔が来たときだけ。失敗しても取得は止めない（例外はWatchRecovery内で隔離）。"""
+        if not self._recovery.active or self.stop_requested():
+            return
+        try:
+            self._recovery.maybe_run()
+        except Exception as exc:  # noqa: BLE001 - 念のための二重の隔離
+            self._say(f"[自動復旧] 失敗（取得は続行）: {type(exc).__name__}: {exc}")
+
     def cycle(self) -> CycleResult:
         res = CycleResult(next_check=self.now() + timedelta(minutes=self.cfg.watch.interval_minutes))
         self._maintain_tool_session()
@@ -357,6 +371,7 @@ class Watcher:
                     continue
                 if t.status in ("WAITING", "UNKNOWN"):
                     self._notify(f"{eng.st.workflow_id}:{t.id}:{t.detail}", f"{t.lane} {t.id}: {t.detail}", res, t.lane)
+        self._run_recovery()
         self._check_stalls(res)
         res.state = "running" if res.worked else ("waiting_human" if res.human else "idle")
         if res.worked:

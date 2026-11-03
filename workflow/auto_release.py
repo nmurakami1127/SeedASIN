@@ -4,7 +4,7 @@
   1. コマンドに `--apply` を付けた
   2. 設定 `recovery.auto_release.enabled` が true（既定 false）
 どちらかが欠ければ、ドライラン（`recovery-plan`と同じ判定・同じ表示。読み取り専用の接続）で、DBを更新しない。
-watchの自動実行ループ（workflow/watch.py）には**組み込まれていない**。人が実行したときだけ動く。Amazonにはアクセスしない。
+このコマンドは人が実行したときだけ動く。watchからの定期実行は別の鍵 recovery.watch.enabled（既定false。workflow/watch_recovery.py、#92）で、同じ判定・解除（run_market）を呼ぶ。Amazonにはアクセスしない。
 
 解除の実体は`acquisition.registry.SourceRegistry.release`と同じ効果（status→ACTIVE、hold_reason/hold_detail/held_atをクリア、failure_streak_reset_atを現在時刻に）。
 ただしregistryの関数は自前のトランザクションを開くため、「解除」と「AUTO_RELEASEの記録」を**同一トランザクション**にできない。そのため同等のSQLをここに持つ
@@ -203,7 +203,7 @@ def format_runs(runs: dict[str, MarketRun], *, limit: int | None = None) -> list
     modes = {r.mode for r in runs.values()}
     mode = APPLY if APPLY in modes else (APPLY_DISABLED if APPLY_DISABLED in modes else DRYRUN)
     lines = ["自動保留の自動解除（recovery-run）。" + MODE_NOTES[mode],
-             "Amazonへのアクセスはありません。watchの自動実行には組み込まれていません（人が実行したときだけ動きます）。"]
+             "Amazonへのアクセスはありません。このコマンドは人が実行したときだけ動きます（watchからの自動実行は別の設定 recovery.watch.enabled。既定false）。"]
     for m, r in runs.items():
         lines.append("")
         if r.error:

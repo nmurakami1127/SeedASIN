@@ -1603,3 +1603,52 @@ Amazonのナビゲーションはdomcontentloadedで待機し、第三者リソ�
 - `engine.py` の `needs_release`（意図的な保留も含めて要解除と表示）は変えていない（#84から継続）。
 - 連続失敗が環境障害の間にも数えられて3回で自動保留になる根本対策（バーストの間は失敗を数えない）は `acquisition/` の変更なので未実施。この変更は『保留になったあと安全に戻す』ことだけを扱う。
 - 実運用で自動解除した後、同じ原因で再び保留になる頻度は未確認。
+
+## 92. watchの周期処理からの自動復旧（`recovery.watch`。既定は無効）（2026-11-03）
+
+ユーザー承認済みの方針に基づく実装。**本番には反映していない**。#88の「watchへの組み込み設計案」を、承認された範囲（観測のみ／二重の鍵）で実装したもの。P3（#86・#87・#88）の判定・解除は変更していない（`workflow/auto_release.py`は表示文1行のみ）。
+
+### 構成（`workflow/watch_recovery.py` 新設、`workflow/watch.py` は最小限、`workflow/config.py` に `recovery.watch`）
+- `Watcher.cycle()` の、取得の工程（未完了の再開・次の候補）が終わった後・停止の兆候の確認の前で `_run_recovery()` を呼ぶ。停止要求（stop）が出ていれば呼ばない。取得の途中には割り込まない。`origin_selection`等の選定・順序には触れない。
+- 実体は `auto_release.run_market`（P3）を呼ぶだけ。解除は出典ごとの短いトランザクション（識別ロック→FOR UPDATE→ロックの下で再判定→UPDATE＋AUTO_RELEASE）なので、leaseのある出典は触らず、手動の`recovery-run`と同時に動いても二重解除しない（テストで確認: watchの1周期と手動2本を並行させ、全出典のAUTO_RELEASEが1回だけ）。
+- 設定: `recovery.watch.enabled`（既定false）・`observe_only`（既定false）・`interval_minutes`（既定60。1〜10080）・`max_per_cycle`（既定1。1〜100。**全市場の合計**。実際の上限は `recovery.auto_release.max_per_run` との小さい方）・`markets`（既定`["JP"]`）。厳密に型を検証し、未知の項目は拒否する。
+- 間隔は起動後の最初の1間隔を待ってから数える（再起動の連続で即座に解除しない）。試行はwatchの確認周期の境界でしか起きない（待機中は30分周期なので、`interval_minutes`が周期より短くても実際の間隔は周期になる）。試行が失敗しても次の間隔まで再試行しない。
+
+### 3つの状態の選択（「何もしない」か「ドライラン判定のみ」か）
+- `enabled=false`（既定）: **完全に何もしない**。DB読み取り・イベント書き込み・状態ファイルの`recovery`項目とも無し（テスト: `get_session`の呼び出し回数が、復旧の呼び出し自体が無い場合と同一／`run_market`・`readonly_session`を呼べば失敗するよう差し替えても通る）。
+- `enabled=true` かつ（`observe_only=true` または `auto_release.enabled=false`）: **観測のみ**。読み取り専用の接続（`SET TRANSACTION READ ONLY`）で判定し、`recovery_check`と状態ファイルに残す。DBは更新しない（全表のハッシュ不変をテスト）。
+  - 二重の鍵の片方（`auto_release.enabled`）が欠けているときに「何もしない」ではなく観測のみにした理由: `watch.enabled=true`は利用者が明示した操作で、その状態で鍵が足りないと分かる（どの出典が候補か・何件か）ほうが、無言で止まるより安全に確認できる。読み取りは間隔ごとに1回だけで、書き込みは無い。ただし**`watch.enabled=false` のときは `auto_release.enabled=true` でも一切動かない**（逆の欠け方は完全に無動作）。
+- `enabled=true` かつ `observe_only=false` かつ `auto_release.enabled=true`: **解除**。
+
+### 観測性
+- `watch_status.json` に `recovery`（有効のときだけ。mode・理由・市場・間隔・`last_run_at`・`next_run_at`・今回までの解除件数・直近の試行の結果＝市場ごとの候補数/解除/見送り/失敗/**見送り理由の件数（`excluded_by_reason`）**/バースト中の原因コード・成果確認の件数）。既存の`stall`とは独立した項目で、watchの`state`（running/idle/waiting_human）も変えない。
+- `watch_events.jsonl` に `recovery_check`（試行ごと・市場ごと）・`recovery_release`・`recovery_outcome`（#93）・`recovery_error`を追記する。既存の種別（watch_start/human_wait/stop_request/stall_warning）と形式は変えていない。
+
+### 検証したこと（実PostgreSQL 16の使い捨てDB。tests/integration/test_watch_recovery.py）
+既定で従来と同一／二重の鍵の全組み合わせ／間隔未満で実行しない・1周期1件／US REPEATED_PAGE・意図的保留・COMPETITOR_SAME_SERVICE・RETRY_LATER・PERMANENTLY_EXCLUDED・再開位置なし/放置期限切れ/冷却中のOPEN一巡は解除しない（全表不変）／RESUME_OPENは条件を満たすときだけ（一巡・再開位置・ASIN不変）／30日2回・同一原因の再発・バースト・lease／復旧の例外でwatchが止まらない／停止要求が復旧より先に効く／手動`recovery-run`との同時実行。
+
+### 本番へ有効化する手順（案。未実施。利用者の承認と実行が必要）
+1. #86の手順（バックアップ→`alembic upgrade head`で0020→`recovery-plan`/`recovery-run`のドライラン）が済んでいること。watchを止める（Ctrl+Cまたは`workflow.cli stop`）。
+2. `git pull`。設定に `"recovery": {"watch": {"enabled": true, "observe_only": true}}` を足してwatchを再開（**観測のみ**。数日、`watch_status.json`の`recovery`と`recovery_check`の候補件数・見送り理由が`recovery-plan`と一致することを確認）。
+3. 問題なければ `"recovery": {"auto_release": {"enabled": true}, "watch": {"enabled": true, "observe_only": false, "max_per_cycle": 1}}` にしてwatchを再開（最初は`interval_minutes`を長め、`max_per_cycle`は1）。`AUTO_RELEASE`の`detail`と`recovery_outcome`を確認する。
+
+### ロールバック（無効化）手順
+- 設定の `recovery.watch.enabled` を false（または`recovery.watch`を削除）にしてwatchを再開 → 以後、DBも読まない。即時に止めたいときは`recovery.auto_release.enabled`をfalseにしても解除は止まる（観測のみになる）。再開はwatchの再起動が必要（設定はwatch起動時に読む）。
+- 解除済みの出典を戻す: `python -m acquisition.cli hold-source --market <US|JP> --source-id <ID> --reason ...`（#86と同じ。監査記録は残る）。コードを戻す場合は本ブランチのコミットを戻す（スキーマ変更なし。0020はP3側）。
+
+### 未確認・限界
+- 実DB・実運用データ・実Amazon・実際のwatchの長時間稼働は未確認。解除後に実際に取得が成功するかは、`recovery_outcome`の蓄積で観測する。
+- `watch_events.jsonl`は追記専用のファイルで、ローテーションはしない（既存と同じ）。`recovery_check`は試行ごと・市場ごとに1行（既定で1日24行程度）。
+- 停止要求は試行の開始前にだけ確認する（試行は短いトランザクションの連続で、取得のように長くない）。試行の途中で出たstopは、その試行の終了後に効く。
+- `markets`にUSを入れると、USのPAGE_LOAD_FAILED（RETRY_PAGE_LOAD/RESUME_OPEN）は対象になる（P3の判定どおり）。USのREPEATED_PAGEは対象外のまま。既定はJPのみ。
+
+## 93. 復旧後の取得成果の記録（`recovery_outcome`）（2026-11-03）
+
+要件: 解除した出典の、次に取得されたrunの結果（成功/失敗・純増ASIN数）を観測できるようにする（新しいDBテーブルは作らない）。
+
+- P4の`efficiency-report`（別ブランチ`worker/efficiency-report-p4`のコードを読んで確認。このブランチには含まれず、変更もしていない）は、期間ごとの集計として`AUTO_RELEASE`の復旧成功（解除後に開始・`COMPLETED`で初見ASINを1件以上得たrunがある）・再保留・未確定（NO_RUN_YET/RUN_FAILED_NOT_HELD/NO_NEW_ASIN等）をDBの事実から出す。**集計としては足りている**。足りないのは、(1) 解除ごとに「いつ・どのrunが・どう終わったか」を時系列で個別に追える記録、(2) 失敗したrunの`error_code`と、再保留される前の段階での結果（レポートでは`RUN_FAILED_NOT_HELD`の件数のみ）、(3) 統合前（P4未統合）でも使えること。そのため、watchのログに解除ごとの結果を追記する（レポートとは独立。数え方は同じ定義に合わせた）。
+- 記録: 解除時に`recovery_release`（source_id・候補区分・原因・AUTO_RELEASEの`event_id`）。次の試行以降、その出典の「`AUTO_RELEASE`の`occurred_at`以後に開始し、完了したrunのうち最初のもの」が見つかったら`recovery_outcome`を1回だけ追記する: `run_id`・`status`・`outcome`・`error_code`・`pages_fetched`・`run_asins`（そのrunの重複なしASIN数）・**`new_asins`（純増ASIN）**・`held_again`（解除後にAUTO_HOLD/HOLD/EXCLUDEが記録されたか）・`run_completed_at`・`candidate_class`・`release_event_id`。
+- 純増ASINの数え方は効率レポートの「初見ASIN」と同じ（そのrunが保存したASINのうち、同じ市場の、開始時刻・idがそのrunより前のrunに無いもの）。読み取り専用の接続で数える。
+- 確認待ちの解除は、watchの再起動後も`watch_events.jsonl`の`recovery_release`と`recovery_outcome`の差から復元する（記録済みは重複して追記しない。テストで再起動を2回挟んで確認）。解除から長く走らない出典は確認待ちのまま残る（`outcomes_pending`として状態ファイルに出る。覚える上限500件）。
+- `enabled=false`（OFF）の間は成果の確認もしない（DBに触れない）。観測のみ（OBSERVE）へ切り替えた後は、以前に解除した出典の成果を記録し続ける。
+- 申し送り: 効率レポートは`recovery_outcome`を読まない（DBの事実だけから集計する設計を保つ）。両者の数え方（初見ASIN）は同じ定義だが、レポートは期間・as_ofで区切るのに対し`recovery_outcome`は解除ごとの1回限りの記録なので、件数は一致しない場合がある（例: watchが止まっている間に完了したrunは、次の試行まで記録されない）。統合後に突き合わせ表示が要るかは未決。

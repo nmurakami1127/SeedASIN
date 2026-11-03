@@ -87,9 +87,21 @@ class Stall:
 @dataclass
 class AutoRelease:
     """自動解除の実行（`workflow.cli recovery-run --apply`。docs/DEVIATIONS.md #86）。**既定は無効**。enabled=true かつ --apply のときだけ解除する。
-    watchの自動実行ループには組み込まれていない（設定を有効にしても、人が recovery-run を実行しない限り何も解除しない）。"""
+    watchの自動実行ループへの組み込みは別の鍵 recovery.watch.enabled（既定false。#92）。この鍵だけでは、人が recovery-run --apply を実行しない限り何も解除しない。"""
     enabled: bool = False
     max_per_run: int = 3               # 1回の recovery-run で解除する最大件数（--limit との小さい方）
+
+
+@dataclass
+class RecoveryWatch:
+    """watchの周期処理からの自動復旧（workflow/watch_recovery.py、docs/DEVIATIONS.md #92）。**既定は無効**で、無効の間はwatchの動作・DBアクセスとも従来と同一。
+    3つの状態: enabled=false → 何もしない（DBも読まない）／enabled=true かつ（observe_only=true または recovery.auto_release.enabled=false）→ 判定だけ（読み取り専用）
+    して結果を記録する／enabled=true かつ observe_only=false かつ recovery.auto_release.enabled=true（二重の鍵）→ 再判定に通った出典だけを解除する。"""
+    enabled: bool = False
+    observe_only: bool = False
+    interval_minutes: int = 60         # 復旧の判定・解除を試みる間隔（watchの周期より短くならない。起動後は最初の1間隔を待つ）
+    max_per_cycle: int = 1             # 1回の試行で解除する最大件数（全市場の合計。recovery.auto_release.max_per_run との小さい方）
+    markets: list[str] = field(default_factory=lambda: ["JP"])   # 対象の取得先市場。USを入れてもUSのREPEATED_PAGE（価格帯分割未検証）は対象外のまま
 
 
 @dataclass
@@ -99,6 +111,7 @@ class Recovery:
     max_auto_releases: int = 2         # 同じ出典の過去の自動復旧がこの回数に達していたら候補にしない（window_days日以内）
     window_days: int = 30
     auto_release: AutoRelease = field(default_factory=AutoRelease)
+    watch: RecoveryWatch = field(default_factory=RecoveryWatch)
 
 
 @dataclass
@@ -245,6 +258,16 @@ class WorkflowConfig:
             raise ConfigError(f"recovery.auto_release.enabled はtrue/falseで指定してください（指定: {ar.enabled!r}）")
         if isinstance(ar.max_per_run, bool) or not isinstance(ar.max_per_run, int) or not 0 <= ar.max_per_run <= 100:
             raise ConfigError(f"recovery.auto_release.max_per_run は0〜100の整数で指定してください（指定: {ar.max_per_run!r}）")
+        rw = self.recovery.watch
+        for name in ("enabled", "observe_only"):
+            if not isinstance(getattr(rw, name), bool):
+                raise ConfigError(f"recovery.watch.{name} はtrue/falseで指定してください（指定: {getattr(rw, name)!r}）")
+        for name, lo, hi in (("interval_minutes", 1, 7 * 24 * 60), ("max_per_cycle", 1, 100)):
+            v = getattr(rw, name)
+            if isinstance(v, bool) or not isinstance(v, int) or not lo <= v <= hi:
+                raise ConfigError(f"recovery.watch.{name} は{lo}〜{hi}の整数で指定してください（指定: {v!r}）")
+        if not isinstance(rw.markets, list) or any(m not in MARKETS for m in rw.markets) or len(set(rw.markets)) != len(rw.markets):
+            raise ConfigError(f"recovery.watch.markets は {MARKETS} の重複しないリストで指定してください（指定: {rw.markets!r}）")
         if not isinstance(self.page_revisit_days, int) or not 1 <= self.page_revisit_days <= 365:
             raise ConfigError("page_revisit_days は1〜365")
         mn = self.totals.max_new_submissions_per_direction
@@ -285,6 +308,16 @@ def _recovery_from_dict(raw) -> Recovery:
     if not isinstance(raw, dict):
         raise ConfigError("recovery はオブジェクトで指定してください")
     raw = {k: v for k, v in raw.items() if not k.startswith("_")}
+    rwatch = raw.pop("watch", None)
+    if rwatch is None:
+        watch = RecoveryWatch()
+    elif isinstance(rwatch, dict):
+        try:
+            watch = RecoveryWatch(**{k: v for k, v in rwatch.items() if not k.startswith("_")})
+        except TypeError as exc:
+            raise ConfigError(f"recovery.watch に未知の項目があります: {exc}") from exc
+    else:
+        raise ConfigError("recovery.watch はオブジェクトで指定してください")
     ar = raw.pop("auto_release", None)
     if ar is None:
         auto = AutoRelease()
@@ -295,7 +328,7 @@ def _recovery_from_dict(raw) -> Recovery:
             raise ConfigError(f"recovery.auto_release に未知の項目があります: {exc}") from exc
     else:
         raise ConfigError("recovery.auto_release はオブジェクトで指定してください")
-    return Recovery(auto_release=auto, **raw)
+    return Recovery(auto_release=auto, watch=watch, **raw)
 
 
 def config_from_dict(d: dict) -> WorkflowConfig:

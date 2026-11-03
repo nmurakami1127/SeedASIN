@@ -350,6 +350,13 @@ python -m workflow.cli recovery-run --config config/workflow.json --market JP|US
 - 解除されない: 意図的な保留・除外・セラー側の記録（`COMPETITOR_SAME_SERVICE`／`RETRY_LATER`／`PERMANENTLY_EXCLUDED`）、実行中のlease、バースト中の `PAGE_LOAD_FAILED`、30日で2回に達した出典、前回の自動解除の後に同じ原因で再発した出典（以後は要人手確認）、USの `REPEATED_PAGE`、再開できないOPEN一巡。OPEN一巡の再開（`RESUME_OPEN`）でも `collector_run`／`collector_asin` には一切書き込まない。
 - 設定例: `"recovery": {"auto_release": {"enabled": true, "max_per_run": 3}}`
 
+**watchからの自動復旧（既定は無効。docs/DEVIATIONS.md #92・#93）**: 上の `recovery-run` と同じ判定・解除を、watchの周期処理から一定の間隔で呼べる。**二重の鍵**（`recovery.watch.enabled` と `recovery.auto_release.enabled` の両方がtrue）と `observe_only=false` がそろったときだけ解除する。
+- 3つの状態: (1) `recovery.watch.enabled=false`（**既定**）→ **何もしない**（DBも読まない。状態ファイルにも項目を出さない）／(2) `enabled=true` で `observe_only=true`、または `recovery.auto_release.enabled=false` → **観測のみ**（読み取り専用で判定し、`watch_events.jsonl` の `recovery_check` と `watch_status.json` の `recovery` に結果を残す。解除しない）／(3) 二重の鍵＋`observe_only=false` → **解除**（1回の試行で `max_per_cycle` 件まで）。
+- 設定（`recovery.watch`）: `enabled`（既定false）・`observe_only`（既定false）・`interval_minutes`（既定60。起動後の最初の1間隔を待つ。実際の試行はwatchの確認周期の境界）・`max_per_cycle`（既定1。全市場の合計。`recovery.auto_release.max_per_run` との小さい方）・`markets`（既定 `["JP"]`。USを入れても、USのREPEATED_PAGE（価格帯分割未検証）は対象外のまま）。
+- 解除回数（30日2回）・冷却期間・同一原因の再発停止・バースト中の抑制・OPEN一巡/意図的保留/セラー側の記録の保護・lease中の除外は `recovery-run` と同じ（P3の判定をそのまま呼ぶ）。取得の工程の切れ目（停止要求の確認と同じ位置）で実行し、停止要求があれば実行しない。失敗してもwatchの取得は止まらない。
+- 復旧後の成果: 解除したとき `recovery_release`、その出典の解除後に最初に完了したrunが見つかったとき `recovery_outcome`（status・error_code・ページ数・取得ASIN数・純増ASIN数・再保留の有無）を `watch_events.jsonl` に追記する。
+- 設定例（観測のみで試す）: `"recovery": {"watch": {"enabled": true, "observe_only": true}}`／（解除する）: `"recovery": {"auto_release": {"enabled": true}, "watch": {"enabled": true, "max_per_cycle": 1}}`
+
 **出典ごとの新規ASIN率**（読み取り専用。USとJPは別々に実行）:
 
 ```
