@@ -3,6 +3,7 @@
     python -m workflow.cli init-config [--out config/workflow.json]      # 例（config/workflow.example.json）をコピー。import_idを書き換える
     python -m workflow.cli plan   --config config/workflow.json           # 外部アクセス・DB更新なし。対象・予定・上限を表示
     python -m workflow.cli run    --config config/workflow.json           # 計画に従って実行（人の操作が必要な所で待機/保留）
+    python -m workflow.cli recovery-plan --config config/workflow.json [--market JP|US] [--limit N] [--out plan.json]   # 自動保留の復旧候補（ドライラン・読み取り専用）
     python -m workflow.cli status [--id wf-…]                             # 工程別の完了・待機・保留・失敗・結果不明
     python -m workflow.cli resume [--id wf-…] [--allow-duplicate <投入キー>]   # 保存済み状態から再開（完了工程は繰り返さない）
     python -m workflow.cli backup  --out backups/wf.zip                    # workflow状態・投入台帳・マニフェストをまとめて保存
@@ -20,7 +21,7 @@ import sys
 from pathlib import Path
 
 from workflow.backup import BackupError, create_backup, restore_backup
-from workflow.config import ConfigError, config_from_dict, load_config
+from workflow.config import MARKETS, ConfigError, config_from_dict, load_config
 from workflow.engine import KIND_LABEL, Engine
 from workflow.store import DONE_STATES, State, StateCorrupt, WorkflowBusy, WorkflowStore, usage
 
@@ -157,13 +158,17 @@ def stall_status_lines(st: dict | None, jst=lambda x: x or "-") -> list[str]:
         else:
             new = (f"初見ASIN 直近24時間{na.get('last24')}件／直近7日の日次中央値{na.get('median7d'):g}件"
                    f"（{na.get('percent_of_median'):.0f}%・{na.get('threshold_percent')}%未満で警告）")
-        lines.append(f"    [{m}] 要解除{mk.get('needs_release_count', 0)}件 ・ 商品ページSERVER_ERROR連続{mk.get('server_error_streak', 0)}回 ・ {new}")
+        ih = mk.get("intentional_hold_count", 0)
+        lines.append(f"    [{m}] 要解除{mk.get('needs_release_count', 0)}件{f'（意図的な保留{ih}件を除く）' if ih else ''} ・ 商品ページSERVER_ERROR連続{mk.get('server_error_streak', 0)}回 ・ {new}")
         for it in (mk.get("needs_release") or [])[:10]:
             lines.append(f"        要解除 #{it['source_id']} {it['source_type']} {it['name']}（{'/'.join(it['codes'])}"
                          f"{'・' + it['hold_reason'] if it.get('hold_reason') else ''}）")
         extra = mk.get("needs_release_count", 0) - min(10, len(mk.get("needs_release") or []))
         if extra > 0:
             lines.append(f"        ほか{extra}件（python -m acquisition.cli で確認）")
+        bc = (mk.get("burst") or {}).get("codes") or {}
+        if bc:
+            lines.append("        環境障害の疑い: " + "・".join(f"{c}({n}出典)" for c, n in bc.items()))
         for w in mk.get("warnings") or []:
             lines.append(f"    ! {w}")
     return lines
@@ -295,6 +300,22 @@ def _cmd_yield(a, factory=None, **_) -> int:
     return 0
 
 
+def _cmd_recovery_plan(a, factory=None, **_) -> int:
+    """自動保留の復旧候補のドライラン（読み取り専用。DBの更新・Amazonアクセス・解除はしない。workflow/hold_recovery.py）。"""
+    from workflow.hold_recovery import build_plans, dump_json, format_plans
+
+    cfg = load_config(a.config)
+    if a.limit is not None and a.limit < 1:
+        print("[中止] --limit は1以上を指定してください")
+        return 2
+    plans = build_plans(factory or _factory(), [a.market] if a.market else list(MARKETS), cfg, a.limit)
+    print("\n".join(format_plans(plans, a.limit)))
+    if a.out:
+        dump_json(plans, a.out)
+        print(f"\nJSONを書きました: {a.out}")
+    return 2 if any(p.error for p in plans.values()) else 0
+
+
 def _cmd_status(a, **_) -> int:
     from workflow.daily_usage import DailyUsage
     from workflow.planning import usage_lines
@@ -360,6 +381,11 @@ def build_parser() -> argparse.ArgumentParser:
     sp = add("yield", _cmd_yield, "取得・投入の成果（新規ASIN・投入数・既存の出品成果）を表示（読み取りのみ）")
     sp.add_argument("--config", default="config/workflow.json")
     sp.add_argument("--submission-dir", default="exports/tool_submission")
+    sp = add("recovery-plan", _cmd_recovery_plan, "自動保留の復旧候補のドライラン（読み取り専用。実行・解除はしない）")
+    sp.add_argument("--config", default="config/workflow.json")
+    sp.add_argument("--market", choices=list(MARKETS), default=None, help="省略すると両市場")
+    sp.add_argument("--limit", type=int, default=None, help="候補として表示する最大件数（市場ごと）")
+    sp.add_argument("--out", default=None, help="結果をJSONでも書き出す先")
     sp = add("status", _cmd_status, "工程別の状態")
     sp.add_argument("--id", default=None)
     sp.add_argument("--state-dir", default="exports/workflow")

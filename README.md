@@ -325,10 +325,20 @@ python -m workflow.cli backup  --out backups/wf.zip   /   restore --zip backups/
 Amazonへのアクセスは増えません。DBの読み取りと、`exports/workflow` のログの表示だけです。マイグレーション（スキーマ変更）はありません。
 
 **止まりの検知（watchの状態表示とターミナルの警告）**: watch が市場ごとに（US/JPは別々のDB接続。一方の失敗は他方を止めない）、最短10分おきに次を調べ、`python -m workflow.cli status`（`exports/workflow/watch_status.json` の `stall`）に出し、警告はターミナルに `[停止の兆候]` として表示する。同じ警告は `watch.notify_minutes`（既定360分）以内には繰り返さない。人手待ち（`human`）とは別で、watchの状態（稼働中／待機／人手対応待ち）は変えない。
-- 要解除の出典（取り直しの上限 `CYCLE_RESTART_LIMIT`／保留 `ON_HOLD`）の件数と一覧。解除は `python -m acquisition.cli release --market <US|JP> --source-id <ID> --reason ...`。
+- 要解除の出典（取り直しの上限 `CYCLE_RESTART_LIMIT`／保留 `ON_HOLD`）の件数と一覧。**自動保留**（`AUTO_FAILURES`／`AUTO_CYCLE_RESTARTS`／ACTIVEのまま上限）だけを数える。人が意図した保留（`hold_reason=MANUAL`・除外、セラー側の `COMPETITOR_SAME_SERVICE`／`RETRY_LATER`／`PERMANENTLY_EXCLUDED`）は数えず、`status` に「意図的な保留N件を除く」と別に出す（docs/DEVIATIONS.md #84）。解除は `python -m acquisition.cli release-hold --market <US|JP> --source-id <ID> --reason ...`。
+- 環境障害の疑い（バースト）: 直近 `stall.burst_window_hours`（既定3）時間に、異なる `stall.burst_min_sources`（既定5）出典以上で同じ `error_code`（特に `PAGE_LOAD_FAILED`）の失敗が出たら警告。出典を個別に解除する前に、ネットワーク・Amazon側の状態を確認する合図。連続失敗のカウントや自動保留の挙動は変えない。
 - 商品ページ取得（discover）が `SERVER_ERROR` で何回連続したか。`stall.server_error_streak`（既定5）回以上で警告。途中の中断（日次枠の不足）は数えず、成功や別のエラーで連続は途切れる。
 - 直近24時間の初見ASIN数が、その前の7日間の日次（24時間ごと）の中央値の `stall.new_asin_min_percent`%（既定30）**未満**なら警告。7日分のデータが足りない市場（最も古い取得runが8日前より新しい）は警告せず「判定不能」と表示。中央値が0のときも警告しない。
 - 設定は `config/workflow.json` の `stall` 項目（例: `"stall": {"server_error_streak": 5, "new_asin_min_percent": 30}`）。範囲は `server_error_streak` 1〜1000、`new_asin_min_percent` 1〜100の整数。省略すれば既定値（既存の設定ファイルはそのまま使える）。
+
+**自動保留の復旧候補のドライラン（読み取り専用。docs/DEVIATIONS.md #84）**: 自動保留された出典のうち、安全に復旧できそうなものを判定して表示するだけのコマンド。**何も解除せず**、DBを更新せず（読み取り専用トランザクション）、Amazonにもアクセスしない。
+```
+python -m workflow.cli recovery-plan --config config/workflow.json [--market JP|US] [--limit N] [--out exports/recovery_plan.json]
+```
+- 候補にする条件（全部満たす場合だけ）: 自動保留／OPENな一巡が無い（BROKENまたは一巡なし）／実行中のleaseが無い／過去30日の自動復旧が2回未満（`recovery.max_auto_releases`・`recovery.window_days`）。
+- 原因別: `REPEATED_PAGE` はJPのSELLERで `partition.price_band` が有効なときだけ候補（USは未検証のため常に対象外 `US_PRICE_BAND_UNVERIFIED`）。`PAGE_LOAD_FAILED` はバースト中でなく、最後の失敗から `recovery.cooldown_hours`（既定24）時間が過ぎていれば候補。`OVERLAP_MISMATCH` などその他のコード・原因不明は「要人手確認」で対象外。
+- 出力: 市場ごとの対象件数・候補・対象外の理由別の内訳と、出典ごとの直近run・一巡の状態・保留理由・error_code・取得済みASIN数・解除回数。`--limit` は候補として表示する最大件数（市場ごと。総数は残る）。
+- 設定は `config/workflow.json` の `recovery`（`cooldown_hours`・`max_auto_releases`・`window_days`）と `stall`（`burst_window_hours`・`burst_min_sources`）。省略すれば既定値。
 
 **出典ごとの新規ASIN率**（読み取り専用。USとJPは別々に実行）:
 

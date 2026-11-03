@@ -80,6 +80,16 @@ class Stall:
     """止まりの検知（watch_status.jsonとターミナルの警告。workflow/stall.py、docs/DEVIATIONS.md #79）。表示が増えるだけで、探索・登録の動作は変えない。"""
     server_error_streak: int = 5       # 商品ページの取得がSERVER_ERRORで何回連続したら警告にするか
     new_asin_min_percent: int = 30     # 直近24時間の初見ASINが、直近7日の日次の中央値のこの%未満なら警告
+    burst_window_hours: int = 3        # 環境障害の疑い（バースト）: この時間の窓の中で（docs/DEVIATIONS.md #84）
+    burst_min_sources: int = 5         # 異なる出典のこの数以上で、同じerror_code（特にPAGE_LOAD_FAILED）の失敗が出たら「環境障害の疑い」
+
+
+@dataclass
+class Recovery:
+    """自動保留の復旧候補の判定（読み取り専用のドライラン。workflow/hold_recovery.py、docs/DEVIATIONS.md #84）。今は何も解除しない。"""
+    cooldown_hours: int = 24           # PAGE_LOAD_FAILEDで止まった出典を、最後の失敗からこの時間は候補にしない
+    max_auto_releases: int = 2         # 同じ出典の過去の自動復旧がこの回数に達していたら候補にしない（window_days日以内）
+    window_days: int = 30
 
 
 @dataclass
@@ -111,6 +121,7 @@ class WorkflowConfig:
     totals: Totals = field(default_factory=Totals)
     cross: Cross = field(default_factory=Cross)
     stall: Stall = field(default_factory=Stall)
+    recovery: Recovery = field(default_factory=Recovery)
     brand_enabled: bool = False     # 未検証のブランド取得（初期OFF。SELLERから開始）
     tool_max_asins: int = 5000      # 統合ツールの1回の入力（画面の案内は5,000件まで）
     result_max_age_days: int = 30   # 保存済みの取得結果を投入に使ってよい鮮度
@@ -211,10 +222,15 @@ class WorkflowConfig:
             v = getattr(self.watch, name)
             if not isinstance(v, int) or not 1 <= v <= 7 * 24 * 60:
                 raise ConfigError(f"watch.{name} は1〜10080（分）")
-        for name, lo, hi in (("server_error_streak", 1, 1000), ("new_asin_min_percent", 1, 100)):
+        for name, lo, hi in (("server_error_streak", 1, 1000), ("new_asin_min_percent", 1, 100),
+                             ("burst_window_hours", 1, 168), ("burst_min_sources", 2, 1000)):
             v = getattr(self.stall, name)
             if isinstance(v, bool) or not isinstance(v, int) or not lo <= v <= hi:
                 raise ConfigError(f"stall.{name} は{lo}〜{hi}の整数で指定してください（指定: {v!r}）")
+        for name, lo, hi in (("cooldown_hours", 0, 24 * 90), ("max_auto_releases", 0, 100), ("window_days", 1, 365)):
+            v = getattr(self.recovery, name)
+            if isinstance(v, bool) or not isinstance(v, int) or not lo <= v <= hi:
+                raise ConfigError(f"recovery.{name} は{lo}〜{hi}の整数で指定してください（指定: {v!r}）")
         if not isinstance(self.page_revisit_days, int) or not 1 <= self.page_revisit_days <= 365:
             raise ConfigError("page_revisit_days は1〜365")
         mn = self.totals.max_new_submissions_per_direction
@@ -257,6 +273,7 @@ def config_from_dict(d: dict) -> WorkflowConfig:
             lanes=lanes, limits=Limits(**d.get("limits", {})), totals=Totals(**d.get("totals", {})), cross=Cross(**d.get("cross", {})),
             partition=_partition_from_dict(d.get("partition")),
             daily=Daily(**d.get("daily", {})), watch=Watch(**d.get("watch", {})), stall=Stall(**d.get("stall", {})),
+            recovery=Recovery(**d.get("recovery", {})),
             **{k: d[k] for k in ("brand_enabled", "tool_max_asins", "result_max_age_days", "state_dir", "submission_dir",
                                  "page_revisit_days", "profile", "listing_feedback", "skip_failures", "batch_target_asins",
                                  "submission_enabled", "tool_session_monitor", "close_on_repeated_page") if k in d},

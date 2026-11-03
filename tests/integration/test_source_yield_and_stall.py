@@ -202,11 +202,16 @@ def test_server_error_streaks_are_counted_per_market(app_role_factory):
 def test_on_hold_and_cycle_restart_limit_sources_are_listed_and_released_ones_are_not(app_role_factory, registry, runs, fast_cfg):  # noqa: F811
     f = app_role_factory
     held = new_source(registry, "JP")
-    registry.set_status("JP", held.source_id, "ON_HOLD", "手動の保留")
+    with f.get_session("JP") as conn, conn.begin():     # 自動保留（AUTO_FAILURES）。人が意図した保留（MANUAL）は要解除に数えない（docs/DEVIATIONS.md #84）
+        conn.execute(text("UPDATE acquisition_source SET status = 'ON_HOLD', hold_reason = 'AUTO_FAILURES', hold_detail = 't', held_at = clock_timestamp() "
+                          "WHERE source_id = :id"), {"id": held.source_id})
+    manual = new_source(registry, "JP")
+    registry.set_status("JP", manual.source_id, "ON_HOLD", "手動の保留")
     healthy = new_source(registry, "JP")
     res = check_market(f, "JP", LIMITS, AS_OF)
     ids = {i["source_id"]: i for i in res.needs_release}
     assert held.source_id in ids and healthy.source_id not in ids and ids[held.source_id]["codes"] == ["ON_HOLD"]
+    assert manual.source_id not in ids and res.intentional_hold_count >= 1
     assert res.needs_release_count == len(res.needs_release) >= 1 and any(k.startswith("needs_release:") for k, _ in res.warnings)
     # 取り直しの上限（CYCLE_RESTART_LIMIT）で止まったACTIVEな出典（USだけ）
     src = new_source(registry, "US")

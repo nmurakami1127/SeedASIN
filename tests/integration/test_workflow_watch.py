@@ -581,6 +581,25 @@ def test_excluded_branches_are_skipped_without_retry_and_the_search_moves_on_to_
     assert env.engine().usage.used().get("pages", 0) == 4 + 1  # 商品ページ4 + 注文0点の出品者の取得1ページ（除外の枝は0）
 
 
+def test_a_held_branch_shows_the_real_release_hold_command(app_role_factory, tmp_path, own, ranked_rows):
+    """表示する解除コマンドは、実在するサブコマンド `acquisition.cli release-hold`（存在しない `release` ではない。docs/DEVIATIONS.md #84）。"""
+    from acquisition.cli import build_parser
+    from acquisition.registry import SourceRegistry
+
+    r = ranked_rows
+    reg = SourceRegistry(app_role_factory, actor="tester")
+    env = Env(app_role_factory, tmp_path, r["rows"][:1])
+    rp = reg.register_path("US", "SELLER", env.seller[r["o1"]], "", origin_import_id=env.import_id, origin_asin=r["o1"])
+    reg.set_status("US", rp.source.source_id, "ON_HOLD", "テスト: 保留")
+    rec = list(env.run().st.tasks["acquire:US"].result["sources"].values())[0]
+    assert rec["mode"] == "SKIPPED_POLICY" and rec["needs_release"]
+    cmd = rec["release_cmd"]
+    assert cmd.startswith("python -m acquisition.cli release-hold --market US --source-id ") and "acquisition.cli release " not in cmd
+    argv = cmd.split()[3:]                                     # "python -m acquisition.cli" の後ろ。<理由>の「...」を実際の文字列に置き換えて構文を確かめる
+    args = build_parser().parse_args([*argv[:-1], "確認した"])
+    assert args.command == "release-hold" and args.market == "US" and args.source_id == rp.source.source_id
+
+
 def test_released_exclusion_is_reevaluated_from_state_and_the_branch_resumes_without_refetching_the_product_page(app_role_factory, tmp_path, own, ranked_rows):
     from acquisition.registry import SourceRegistry
 

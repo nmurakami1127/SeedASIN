@@ -545,7 +545,7 @@ class Engine:
                 needs_release = "CYCLE_RESTART_LIMIT" in codes or "ON_HOLD" in codes
                 recs[str(sid)] = {"mode": "SKIPPED_POLICY", "codes": codes, "permanent": "EXCLUDED" in codes,
                                   "needs_release": needs_release,
-                                  "release_cmd": f"python -m acquisition.cli release --market {market} --source-id {sid} --reason ..." if needs_release else None,
+                                  "release_cmd": f"python -m acquisition.cli release-hold --market {market} --source-id {sid} --reason ..." if needs_release else None,
                                   "reeval_at": until.strftime("%Y-%m-%dT%H:%M:%SZ") if until and "EXCLUDED" not in codes and not needs_release else None,
                                   "reason": "; ".join(f"{b.code}({b.detail})" for b in d.blockers)[:300]}
             else:
@@ -568,7 +568,7 @@ class Engine:
                   + f"／保留{modes.count('HELD')}・CAPTCHA{modes.count('CAPTCHA')}・失敗{failed_count}" \
                   + (f"（失敗前の保存済み結果{modes.count('PARTIAL_SAVED')}件を利用）" if modes.count("PARTIAL_SAVED") else "") \
                   + (f"／枝のスキップ{skipped}件（除外{t.result['branches']['permanent']}・保留/期間内{skipped - t.result['branches']['permanent']}）" if skipped else "") \
-                  + (f"／要解除{needs_release}件（取り直しの上限・保留。原因を確認して acquisition.cli release）" if needs_release else "")
+                  + (f"／要解除{needs_release}件（取り直しの上限・保留。原因を確認して acquisition.cli release-hold）" if needs_release else "")
         pending = modes.count("HELD") + modes.count("CAPTCHA") + failed_count
         if not sources:
             return self._set(t, "DONE", "取得する出典がありません")

@@ -1239,7 +1239,7 @@ PERMANENTLY_EXCLUDEDは引き続き完全除外のまま変更しない。
 **2. 取り直しの上限と解除（採用した規則）**
 - **取り直しの連続回数（`restart_streak`）は、取得の異常終了（BROKEN: 位置の無効・ループ・繰り返し・重なり不足など）からの取り直し（`RESTART_BROKEN`）だけで1増やす。** 放置による期限切れ（`RESTART_EXPIRED`）は取得の失敗ではないので増やさない（前の値のまま。0にも戻さない）。一巡が最後まで到達（COMPLETE）すれば、次の新しい一巡は0から。
 - 上限（`CYCLE_RESTART_LIMIT`）は`RESTART_BROKEN`にだけ適用する。上限に達するのはBROKENのrunの終了確定（finish）のときなので、その同じトランザクションで自動保留（`ON_HOLD`/`AUTO_CYCLE_RESTARTS`）にする（従来どおり）。判定関数`decide()`・planは読み取り専用で、DBを更新しない。
-- 自動保留を経ずに上限の判定だけが出る場合（`max_cycle_restarts`を下げた、0018より前の記録など）も、表示の案内どおり`acquisition.cli release`で解除できる（ACTIVEの出典でも`CYCLE_RESTART_LIMIT`がある時だけ受け付け、`failure_streak_reset_at`を記録し、`RELEASE`イベントを残す。保留でも上限でもない出典のreleaseは従来どおり拒否）。
+- 自動保留を経ずに上限の判定だけが出る場合（`max_cycle_restarts`を下げた、0018より前の記録など）も、表示の案内どおり`acquisition.cli release-hold`で解除できる（ACTIVEの出典でも`CYCLE_RESTART_LIMIT`がある時だけ受け付け、`failure_streak_reset_at`を記録し、`RELEASE`イベントを残す。保留でも上限でもない出典のreleaseは従来どおり拒否）。
 - 解除後は、解除時刻が一巡の終了以後になるため、同じ履歴では上限に止められない。次の取り直しの連続回数は0から（もう一度BROKENになっても、すぐには止まらない）。
 - workflowの表示: 枝のスキップ（`SKIPPED_POLICY`）のうち、取り直しの上限・保留は「要解除(release)」として、解除コマンドの例と件数を表示する（時間では解けないので再評価時刻は付けない）。
 
@@ -1501,3 +1501,31 @@ Amazonのナビゲーションはdomcontentloadedで待機し、第三者リソ�
 - ページ数/ASIN数の上限（`max_pages`）はこれまで通り1回の実行あたり。帯が多いセラーは複数回の実行（日をまたぐ）で完走する。
 - 実PostgreSQLの結合テストは使い捨てDB（リポジトリ外）で実行した。
 
+## 84. 自動保留の復旧（P1: 既存の修正・安全対策 / P2: 復旧候補のドライラン）（2026-11-03）
+
+背景: 自動保留（`AUTO_FAILURES`／`AUTO_CYCLE_RESTARTS`／ACTIVEのままCYCLE_RESTART_LIMIT）された出典は、人が`release-hold`で解除するまで止まる。これを安全に復旧する仕組みの第一段。**今回は判定とドライランまで。自動解除の実行（P3）・DBスキーマ変更・マイグレーション・US価格帯分割はしていない。** `acquisition/`・`asin_collector/`・`alembic/`・`db/`は変更していない。
+
+### P1
+1. **存在しない解除コマンドの案内を修正**: `python -m acquisition.cli release ...` は実在しない（実際のサブコマンドは `release-hold --market <US|JP> --source-id <ID> --reason <理由>`。`acquisition/cli.py`の定義で確認）。`workflow/stall.py`の警告文、`workflow/engine.py`の`release_cmd`と要約文、READMEを修正。#64の記述（旧`acquisition.cli release`）も`release-hold`に直した。
+2. **「要解除」から意図的な保留を除外**（`workflow/stall.py`の`classify_hold`。純粋関数）: `hold_reason=MANUAL`、`status=EXCLUDED`、セラー側の`COMPETITOR_SAME_SERVICE`／`RETRY_LATER`／`PERMANENTLY_EXCLUDED`、**知らない`hold_reason`**（安全側で意図的として扱う）は数えない。自動保留（`AUTO_FAILURES`／`AUTO_CYCLE_RESTARTS`／ACTIVEでCYCLE_RESTART_LIMIT）だけを`needs_release`に入れる。人の記録（セラー側）は自動保留より優先して意図的とする。除外した件数は`MarketStall.intentional_hold_count`（`watch_status.json`の`stall.markets.<M>.intentional_hold_count`）に別カウントとして持ち、警告文に「うち意図的な保留N件は除く」、`status`表示に「意図的な保留N件を除く」と出す。**既存テスト1件を更新**: `test_on_hold_and_cycle_restart_limit_sources_are_listed_and_released_ones_are_not` は手動保留（MANUAL）が要解除に出ることを期待していたため、自動保留（AUTO_FAILURES）を要解除に、手動保留を除外に変えた。
+3. **バースト検知（環境障害の疑い）**: 純粋関数`detect_error_bursts(events, as_of, window_hours, min_sources)`。窓は`as_of - window <= 完了時刻 <= as_of`（ちょうど窓の開始は内側、1秒前は外側、未来は数えない）。**異なる出典**が`min_sources`以上（ちょうどその数で成立）で同じ`error_code`の失敗（`collector_run.status='FAILED'`・`source_id`あり）を出していれば、そのコードをバーストとする（同じ出典の繰り返しは1出典、`error_code`がNULLは無視）。設定は`stall.burst_window_hours`（既定3、1〜168）・`stall.burst_min_sources`（既定5、2〜1000）。使い道は(a) stall警告に「環境障害の疑い」（警告キー`burst:<コード>`。通知の間引きは既存と同じ）、(b) 下記ドライランでPAGE_LOAD_FAILED系を「バースト中のため見送り」にする。**既存の連続失敗カウント・自動保留（`acquisition/eligibility.py`・`lease.py`）の挙動は変えていない。**
+
+### P2: ドライラン（`workflow/hold_recovery.py`、`python -m workflow.cli recovery-plan`）
+- 読み取り専用: `SET TRANSACTION READ ONLY`の接続で、US/JPを別々のDB接続で判定する（一方の失敗は他方を止めず、その市場のerrorに入れる）。DBの更新・Amazonへのアクセス・解除はしない。出力に「実行はしません。ドライラン」と明記。`--market`・`--limit N`（候補の表示上限。総数は残す）・`--out`（JSON）。
+- 判定は純粋関数`judge()`。候補は全部満たす場合だけ: 自動保留／lease中でない／OPENな一巡（OPEN・末尾到達・放置期限切れ）が無い（OPENを閉じる・強制終了する提案は出さない）／過去の自動復旧が上限未満／原因別の条件。原因は「最後に失敗したrunの`error_code`」。
+  - `REPEATED_PAGE`: JP・SELLER・`partition.price_band`が有効のときだけ候補。USは価格帯分割が未検証なので常に対象外（`US_PRICE_BAND_UNVERIFIED`）。
+  - `PAGE_LOAD_FAILED`: バースト中でなく、最後の失敗から`recovery.cooldown_hours`（既定24。ちょうどで候補）経過で候補。
+  - `OVERLAP_MISMATCH`・その他のコード: `NEEDS_MANUAL_REVIEW`（対象外）。失敗runが無い: `UNKNOWN_CAUSE`（対象外）。
+- 過去の自動復旧の上限（`recovery.max_auto_releases`=2 / `recovery.window_days`=30）: `count_recent_auto_releases`＋`auto_release_limit_reached`（純粋関数）。**P3で差し替える前提**: 今は`acquisition_source_event.event_type`の制約に`AUTO_RELEASE`が無いため、`RELEASE`かつ`actor='system'`を数える（現状そのイベントは作られないので常に0）。
+- 設定: `recovery`（`cooldown_hours`・`max_auto_releases`・`window_days`）を`workflow/config.py`に追加（既定値あり・JSONで上書き可・範囲検証）。`config/workflow.json`は変更していない。
+
+### P3に渡す前提・懸念
+- **PAGE_LOAD_FAILEDの自動保留は、OPENな一巡の途中で起きることが多い**（`PAGE_LOAD_FAILED`は`BROKEN_CODES`ではなく、一巡はOPENのまま残る。`acquisition/lease.py`）。仕様どおりOPENがあれば対象外にしたため、このコードの候補は「一巡がまだ無い／BROKENになった後」に限られる。OPENのまま解除して続き（CONTINUE）から再開するのは安全に見えるが、別承認が必要。
+- **`engine.py`の`needs_release`は意図的な保留も含む**（`SKIPPED_POLICY`の`ON_HOLD`を全て要解除と表示し、`release_cmd`を付ける）。コマンド名の修正のみ行い、意図的な保留の除外は`stall.py`側だけ。engine側は判定の入力にfactsが無いため、変えるなら別途。
+- **`AUTO_FAILURES`の連続失敗は、環境障害の間にも数えられ、3回で自動保留になる**（`COUNTED_FAILURE_OUTCOMES`）。バーストの間は失敗として数えない／保留にしない、が根本対策だが、`acquisition/`の変更なので今回はしていない（必要性の報告のみ）。
+- 自動解除のイベント種別（`AUTO_RELEASE`）には`acquisition_source_event.ck_ase_type`の変更（マイグレーション）が要る。P3の前に方針提示と承認が必要。
+- 判定は`release-hold`の事前条件（`failure_streak_reset_at`の更新で連続失敗が0に戻る）と整合する。解除後に同じ原因で再び自動保留されても、上限（30日で2回）で止まる設計にする。
+- USのREPEATED_PAGEは当面ずっと対象外（人が原因を確認して`release-hold`）。
+
+### テスト
+`tests/unit/test_hold_recovery.py`（自動／意図的の分類・バーストの境界・設定・上限の境界・各条件の候補判定・表示）、`tests/integration/test_hold_recovery.py`（実PostgreSQL。意図的な保留が要解除から除外／バーストの警告／OPEN・lease・MANUAL・セラー側・US価格帯・冷却・バースト・要人手確認・上限・`--limit`／ドライランの前後で全表のハッシュと行数が同じ／読み取り専用接続が書き込みを拒否／市場ごとの失敗の隔離／CLI）、`tests/integration/test_workflow_watch.py`（表示する解除コマンドが実在のサブコマンドとして解釈できる）。**未検証**: 実DB・実運用データでの判定結果。
