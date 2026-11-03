@@ -30,6 +30,8 @@ from tool_submission.model import (
 USABLE_OUTCOMES = ("SUCCESS_NONEMPTY", "SUCCESS_TRUNCATED")
 PARTIAL_REASON = {"SUCCESS_TRUNCATED": "上限打切りの取得（一部のASINのみ。ページ数・ASIN数の上限で止めた）",
                   "PARTIAL": "取得失敗前に保存済みのASINのみ。取得は未完了で、失敗履歴・再開位置を保持"}
+# collector_run.completeness（0016）で見る「一部のみ」。outcomeがSUCCESS_NONEMPTYでもcompletenessがTRUNCATED/PARTIALなら注記する
+PARTIAL_COMPLETENESS_REASON = {"TRUNCATED": PARTIAL_REASON["SUCCESS_TRUNCATED"], "PARTIAL": PARTIAL_REASON["PARTIAL"]}
 
 
 def _path_dict(p) -> dict:
@@ -91,7 +93,7 @@ def build_items(app: SessionFactory, fetch_market: str, run_id: int, *, out_dir:
         raise SubmissionError("batch_target は0〜max_per_inputで指定してください")
     with app.get_session(fetch_market) as conn, conn.begin():
         run = conn.execute(
-            text("SELECT id, marketplace, source_id, status, outcome, truncation_reason, pages_fetched, completed_at, cycle_id, cycle_seq, cycle_state "
+            text("SELECT id, marketplace, source_id, status, outcome, truncation_reason, completeness, pages_fetched, completed_at, cycle_id, cycle_seq, cycle_state "
                  "FROM collector_run WHERE id = :id AND source_id IS NOT NULL"), {"id": run_id}).one_or_none()
         if run is None:
             raise SubmissionError(f"run={run_id} は市場{fetch_market}の出典取得として存在しません")
@@ -127,7 +129,11 @@ def build_items(app: SessionFactory, fetch_market: str, run_id: int, *, out_dir:
     if not directions:
         raise SubmissionError(f"出典{src.source_id}の経路に業務方向がありません（手動登録・起点なし）。--direction で明示してください")
     key_name = src.key_primary if src.source_type == "SELLER" else src.display_primary
-    partial = run.outcome in ("SUCCESS_TRUNCATED", "PARTIAL")
+    partial = run.outcome in ("SUCCESS_TRUNCATED", "PARTIAL") or run.completeness in PARTIAL_COMPLETENESS_REASON
+    partial_reason = PARTIAL_REASON.get(run.outcome) or PARTIAL_COMPLETENESS_REASON.get(run.completeness)
+    # 検索結果の深さの限界(DEPTH_LIMIT。#80)は続きの無い確定の終了状態なので、COMPLETEと同じく端数も放出する（#81。#78の一部撤回）。
+    # OPEN・BROKEN・その他のCLOSED_NO_CURSOR（再開位置の消失など）は末尾到達ではないので従来どおり保留。
+    reached_end = run.cycle_state == "COMPLETE" or (run.cycle_state == "CLOSED_NO_CURSOR" and run.truncation_reason == "DEPTH_LIMIT")
     ckey = _cycle_key(run.cycle_id, run_id)
     states = ledger.all_states() if ledger is not None else {}  # 台帳は計画作成ごとに読み直す（方向ごとに読み直さない）
     file_cache: dict = {}
@@ -155,15 +161,15 @@ def build_items(app: SessionFactory, fetch_market: str, run_id: int, *, out_dir:
         for is_repeat, part in ((False, new_part), (True, repeat_part)):
             if not part:
                 continue
-            if batch_target and run.cycle_state != "COMPLETE":
-                # 失敗・停滞・再開位置の消失は末尾到達ではない。
+            if batch_target and not reached_end:
+                # 失敗・停滞・再開位置の消失は末尾到達ではない（DEPTH_LIMITで閉じた一巡は末尾到達として扱う。reached_end）。
                 # flush_bufferは旧呼び出しとの互換用に受け取るだけで、端数を放出しない。
                 # 同じ出典・方向・一巡で満杯になるまで残りを持ち越す。
                 part = part[:len(part) // batch_target * batch_target]
                 if not part:
                     continue
             chunks_d = split_asins(part, max_per_input)
-            items_d, files_d = _items_for(d, part, chunks_d, is_repeat, run_id, fetch_market, src, key_name, run, partial, asins, raw, paths,
+            items_d, files_d = _items_for(d, part, chunks_d, is_repeat, run_id, fetch_market, src, key_name, run, partial, partial_reason, asins, raw, paths,
                                           dpaths, best, directions, prior, out_dir, ckey, len(asins) - len(remaining), fetched_from, also_from,
                                           carried_runs)
             items += items_d
@@ -171,7 +177,7 @@ def build_items(app: SessionFactory, fetch_market: str, run_id: int, *, out_dir:
     return items, files
 
 
-def _items_for(d, part, chunks, is_repeat, run_id, fetch_market, src, key_name, run, partial, asins, raw, paths, dpaths, best, directions,
+def _items_for(d, part, chunks, is_repeat, run_id, fetch_market, src, key_name, run, partial, partial_reason, asins, raw, paths, dpaths, best, directions,
                prior, out_dir, ckey, excluded, fetched_from, also_from, carried_runs):
     items, files = [], []
     for idx, chunk in enumerate(chunks, start=1):
@@ -182,7 +188,7 @@ def _items_for(d, part, chunks, is_repeat, run_id, fetch_market, src, key_name, 
         items.append(SubmissionItem(
             key=key, collector_run_id=run_id, fetch_market=fetch_market, source_id=src.source_id, source_type=src.source_type,
             source_key=key_name, direction=d, business_market=BUSINESS_MARKET[d], memo=build_memo(d, key_name),
-            run_outcome=run.outcome, input_is_partial=partial, partial_reason=PARTIAL_REASON.get(run.outcome),
+            run_outcome=run.outcome, input_is_partial=partial, partial_reason=partial_reason,
             run_completed_at=run.completed_at.strftime("%Y-%m-%d %H:%M:%S UTC"), run_pages=run.pages_fetched,
             asin_count=len(chunk), total_rows=len(raw), duplicate_rows_removed=len(raw) - len(asins),
             input_file=str(Path(out_dir) / f"run{run_id}_{d}{suffix}_{key}.csv"), input_sha256=sha,

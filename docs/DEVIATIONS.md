@@ -1408,3 +1408,16 @@ Amazonのナビゲーションはdomcontentloadedで待機し、第三者リソ�
 判断してほしい点（未対応・範囲外）:
 - **`batch_target_asins>0`（5,000件蓄積）との組み合わせ**: `tool_submission/planner.py`は`cycle_state != "COMPLETE"`の一巡では満杯の`batch_target`単位だけを返し端数を持ち越す（#78）。DEPTH_LIMITで閉じた一巡は`CLOSED_NO_CURSOR`でありCOMPLETEではないため、**端数（5,000未満の残り）は投入されないまま残る**。この案件では範囲外のため変更していない。
 - `DEPTH_LIMIT`の判定は「同じページが返った」ことの確認にとどまり、検索結果の深さの限界が実際に約170ページで起きるかは実ページで未確認。
+
+## 81. 5,000件蓄積で、検索結果の深さの限界(DEPTH_LIMIT)で閉じた一巡の端数を放出（#78の一部撤回）（2026-11-03）
+
+利用者承認済み（2026-11-03）。#78「CLOSED_NO_CURSORでも端数を放出しない」のうち、**`cycle_state='CLOSED_NO_CURSOR'` かつ `truncation_reason='DEPTH_LIMIT'` の一巡だけ**を撤回する。理由: DEPTH_LIMITは#80で入った、同じページの繰り返しを取り直して確認した**確定の終了状態**で、続き（再開位置）が無く、BROKENでもないので取り直しもされない。端数を保留し続けると、5,000件に満たない残りが永久に投入されない（#80の「判断してほしい点」で指摘した状態）。
+
+動作（`tool_submission/planner.py`の`build_items`、`batch_target>0`のとき）:
+- 端数（5,000件未満）も放出するのは、`cycle_state='COMPLETE'`、または`cycle_state='CLOSED_NO_CURSOR'`かつ`truncation_reason='DEPTH_LIMIT'`の一巡。
+- **従来どおり保留（#78のまま）**: OPEN、BROKEN、DEPTH_LIMIT以外のCLOSED_NO_CURSOR（再開位置の消失など。PAGE_LIMIT/ASIN_LIMIT等）、完了状態不明の旧取得、PARTIALの保存済み結果（5,000件以上の部分だけ利用）。`flush_buffer`引数は互換性のため受け取るだけで、この条件を迂回できない。
+- 同じ取得先市場・出典・方向・一巡での蓄積、重複・送信済み・結果不明の占有、同じ入力から同じ投入キー（再作成しても重複しない）は変更なし。`batch_target=0`の動作も変更なし。
+- 「一部のみ」の判定（`input_is_partial`・`partial_reason`）は、outcome（SUCCESS_TRUNCATED/PARTIAL）に加えて`collector_run.completeness`（`TRUNCATED`/`PARTIAL`。0016で追加済みの列）も見る。`outcome=SUCCESS_NONEMPTY`でも`completeness='TRUNCATED'`なら「上限打切りの取得」と注記する。outcomeによる従来の判定・文言・`run_outcome`の表示は変えない。通常の取得では`completeness`は`outcome`から決まる（`DEFAULT_COMPLETENESS`）ため、この拡張が効くのは両者が食い違う行（旧データ・手修正）のみ。
+- DEPTH_LIMITの端数の放出は「検索結果の深さの限界が実際に約170ページ付近で起きる」ことを前提にしているが、実ページでは未確認（#80のまま）。
+
+スキーマ変更なし（alembic追加なし）。追記専用・RLS・US/JP分離は変更なし。テスト: `tests/integration/test_planner_depth_limit_flush.py`（実PostgreSQL）。

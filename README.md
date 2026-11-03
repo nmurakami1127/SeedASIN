@@ -364,6 +364,8 @@ python -m seller_performance.cli watch-activity --days 7
 5,000件蓄積モードでは、同じ取得先市場・出典・業務方向・一巡の保存済みASINを
 重複除外して蓄積する。取得失敗・1時間の停滞・再開位置の消失では端数を計画化しない。
 5,000件単位の入力を作り、一巡の末尾到達が確定した場合だけ残りの端数も対象にする。
+末尾到達とは、一巡が最後のページまで到達した場合(COMPLETE)と、検索結果の深さの限界(`DEPTH_LIMIT`)で
+再開位置なしに閉じた場合。その他の打切り・BROKENでは端数を保留する（docs/DEVIATIONS.md #81）。
 
 運用設定 `config/workflow.json` の `submission_enabled=false` では、
 `exports/run_bulk_watch.py` は探索・取得・投入計画の保存までを行う。
