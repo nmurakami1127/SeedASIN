@@ -349,6 +349,16 @@ python -m seller_performance.cli source-yield --marketplace=JP --hours 72  # 直
 
 出典ごとに、run数・ページ数・保存行数・重複なしASIN数・初見ASIN数・既知ASIN数・初見ASIN/ページを表示し、末尾に合計と「保存行のうち重複なしの割合」「重複なしASINのうち初見の割合」を出す。CSVは `exports/source_yield/source_yield_<市場>_<時間>h_<日時>.csv`（UTF-8 BOM付き。`--output-dir` で出力先を変更）。**初見ASIN** = 対象期間より前のrunに、その市場のDB全体で一度も無いASIN。出典ごとの数は出典内の重複を除いたもので、複数の出典が同じASINを取得していれば各出典に数えるため、合計行（市場全体で数え直し）より出典の合計が大きくなることがある。商品ページ調査（`ASIN_PAGE`）は出典ではないので表から除き、件数だけ参考に表示する。実行時間も表示する。
 
+**日次の取得効率レポート**（読み取り専用。全接続が `SET TRANSACTION READ ONLY`。JPとUSは別々の接続で集計し、一方の失敗は他方を止めない）:
+
+```
+python -m seller_performance.cli efficiency-report                       # JP・US両方、直近24時間
+python -m seller_performance.cli efficiency-report --market JP --hours 48 --out-dir exports
+python -m seller_performance.cli efficiency-report --no-export           # 画面表示のみ
+```
+
+取得ページ数・ASIN純増数（期間内に**初めて**その市場で見たASIN。重複・既知は数えない）・純増ASIN/ページ（ページ0は空欄）、価格帯分割の内訳（帯あり／帯なしのページ・純増ASIN、帯の数の状態別、帯ごとのページ・新規保存ASIN）、自動復旧・手動解除・再保留・復旧成功率（成功 = 解除後にその出典のrunが失敗せず初見ASINを得た。判断できないものは「未確定」として別計上）、保留件数（自動保留＝要解除／意図的）、初見ASINの直近7日の日次を表示する。出力は画面（日本語）と、市場ごとのCSV（UTF-8 BOM付き）・全市場まとめたJSON（既定 `exports/efficiency_report/`、`--out-dir` で変更）。各指標の定義は `seller_performance/efficiency_report.py` のモジュール説明と docs/DEVIATIONS.md #89 を参照。`AUTO_RELEASE` が無いDB（P3の未マイグレーション）や `acquisition_band` が無いDB（0019未適用）でも動く（該当は0件／帯なし扱い）。
+
 **稼働の可視化**（DBには接続しない）:
 
 ```

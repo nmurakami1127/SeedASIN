@@ -1538,3 +1538,35 @@ Amazonのナビゲーションはdomcontentloadedで待機し、第三者リソ�
 
 ### 独立worktreeからのドライラン
 `scripts/run_recovery_plan_isolated.ps1`・`docs/hold_recovery_dryrun.md`を追加。稼働中のwatchが読む `C:\Projects\SeedASIN` は切り替えず、別ディレクトリのgit worktree（分離HEAD）＋元の`.venv`＋本番設定の絶対パス（読むだけ）で`recovery-plan`を実行する。コード・DB・設定・watchの状態を書き換えるコマンドは含まない。PowerShellはこの環境で実行できないため未確認（PCで確認）。
+
+## 89. 日次の取得効率レポート `efficiency-report`（P4。読み取り専用）（2026-11-03）
+
+背景: 価格帯分割（#83）と自動復旧（#84、P3は別実装中）が入ると、「ページを使った分だけASINが本当に増えているか」「復旧は効いているか」を毎日JP/US別に確認したい。既存の`source-yield`（#79）を再利用して、1つの画面で見られる読み取り専用レポートを足した。**DBスキーマ変更・マイグレーション・書き込みは無い。** `workflow/`（`hold_recovery.py`・`cli.py`・`config.py`・`stall.py`）、`acquisition/`、`asin_collector/`、`alembic/`、`db/`は変更していない（`workflow.stall._find_needs_release`をimportして読むだけ）。
+
+### コマンド
+`python -m seller_performance.cli efficiency-report [--market JP|US] [--hours 24] [--out-dir DIR] [--no-export]`（`seller_performance/cli.py`のサブコマンド。`workflow/cli.py`には足していない）。市場を省略すればJP・US両方。出力は画面（日本語）、市場ごとのCSV（UTF-8 BOM・縦長`セクション,項目,値,補足`）、全市場まとめたJSON。既定の出力先は`exports/efficiency_report/`。いずれかの市場の集計が失敗したら（他方は出力した上で）終了コード1。
+
+### 安全
+- 市場ごとに別の接続で`SET TRANSACTION READ ONLY`（`readonly_session`。`hold_recovery.readonly_session`と同じ方式だが、P3の変更と衝突しないよう自モジュール内に持つ）。SELECTのみ。RLSの範囲だけを見る。インデックス作成なし。
+- 一方の市場の例外はその市場の`error`に入れ、他方は続ける。
+- 重い集計は`source_yield`と同じ集計SQLの流儀（期間内のASINに絞った`IN`）に合わせた。自動復旧の判定は、期間内に自動復旧があった出典のrun・イベントだけを読む（自動復旧が0件なら読まない）。
+
+### 指標の定義（詳細は`seller_performance/efficiency_report.py`のモジュール説明）
+1. **取得ページ数・ASIN純増数・純増/ページ**: `source_yield.compute_source_yield`の合計行をそのまま使う（再実装しない）。純増 = 期間内に初めてその市場で見たASIN（そのASINを含む最も古いrunの`started_at`が期間内）。同じrun・複数run・複数出典での重複取得、期間より前に取得済みのASINは数えない。ページ0なら純増/ページは空欄。
+2. **価格帯分割の内訳**: 期間内のrunを、`acquisition_band`に帯を持つ一巡（`collector_run.cycle_id`が帯の`cycle_id`にある）に属する「帯あり」と、それ以外の「帯なし（従来方式）」に分ける。一巡の方式は開始時に決まる（#83）ので、一巡のrunは同じ側になる。純増ASINは「その初見ASINを期間内で最初に含むrun」がどちら側かで分ける。**帯あり + 帯なし = 全体**で、食い違いがあれば「区別できない」の行に分けて出し合算しない（通常0）。帯の数（PENDING/ACTIVE/DONE/SPLIT/TRUNCATED_MIN別）・帯ごとのページ/`asins_new`は`acquisition_band`の値。**これは「期間内にrunがあった帯あり一巡」の帯の累計（期間より前の分を含み得る）で、`asins_new`は一巡の中での新規保存数であり、DB全体の初見（純増ASIN）とは別の数**。帯ごとの数と純増ASINの対応は区別できない（ASINはrun単位でしか保存されない）ので、対応づけずに別々に表示する。`acquisition_band`が無いDB（0019未適用）では全て帯なしとして扱い、その旨を表示する。
+3. **自動復旧・再保留・復旧成功率**（`acquisition_source_event`を、`event_type`と`actor`をデータとして読むだけ。`AUTO_RELEASE`が`ck_ase_type`に無いDBでも動き、その場合は0件）:
+   - 自動復旧 = `event_type='AUTO_RELEASE'` または `event_type='RELEASE'` かつ `actor='system:auto-recovery'`。手動解除 = それ以外の`RELEASE`（`actor='system'`のRELEASEも自動とは見なさず手動側に入れる。#84のP2は`system`を数えていたが、`system`は`AUTO_HOLD`のactorであり、P3の解除のactor・種別が確定していないための保守的な扱い。**P3が別のactorを使うなら`AUTO_RECOVERY_ACTOR`を合わせる必要がある**）。自動保留 = `AUTO_HOLD`。いずれも対象期間内に発生したもの。
+   - 各自動復旧Rの結果（as_ofまでの記録で判定。Rの後の、同じ出典の最初の保留・解除系イベント＝`AUTO_HOLD/HOLD/EXCLUDE/RELEASE/AUTO_RELEASE`までを区間とする）:
+     - **再保留** = 区間を終わらせたのが`AUTO_HOLD`。その前に成功があっても再保留に数える（保守的）。
+     - **復旧成功** = 再保留でなく、区間内に開始された run が`status='COMPLETED'`かつ`outcome`が`SUCCESS_NONEMPTY`/`SUCCESS_TRUNCATED`で、**そのrun自身が初見ASIN（その市場で、そのrunより前の(started_at, id)のrunに無いASIN）を1件以上得た**。
+     - **未確定**（別計上。成功にも再保留にも入れない）: `NO_RUN_YET`／`RUN_IN_PROGRESS`／`RUN_FAILED_NOT_HELD`（失敗したが再保留にはまだなっていない）／`NO_NEW_ASIN`（失敗はしていないが初見ASINなし・中断）／`MANUAL_STOP`（人が保留・除外した）／`RELEASED_AGAIN`。
+   - 復旧成功率 = 復旧成功 ÷ 自動復旧（未確定を分母に含める保守的な値）。参考に確定分のみの成功率 = 成功 ÷ (成功+再保留)、再保留率 = 再保留 ÷ 自動復旧。自動復旧0件なら全て空欄。
+4. **保留件数**: `workflow.stall._find_needs_release`（`classify_hold`で自動／意図的を分ける、watchの要解除と同じ関数）の結果を再利用する。自動保留（要解除）の件数と意図的な保留の件数、`acquisition_source`のstatus別の件数を出す。分類ロジックは再実装していない。**`_find_needs_release`は`stall.py`の非公開関数のため、P3側で名前・戻り値が変わるとこのレポートが壊れる**（結合テスト`test_intentional_and_auto_holds_are_counted_separately`が検知する）。
+5. **日次の初見ASIN**: `source_yield.first_seen_daily_counts`を直近7日分（as_ofから24時間ごと）。データが無い窓は「-」、最も古い取得runが窓の途中にある窓は「一部」。注: この日次は`ASIN_PAGE`のrunも含めて初見を数える（停止検知#79と同じ）が、純増ASINは`ASIN_PAGE`を除く（`source_yield`と同じ）。両者は`ASIN_PAGE`がASINを保存しない限り一致する。
+
+### テスト
+`tests/unit/test_efficiency_report.py`（復旧結果の判定・自動解除の判別・率のゼロ除算）、`tests/integration/test_efficiency_report.py`（実PostgreSQL。重複・既知を純増に数えない／期間の境界／ページ0／JP・US分離とRLS／日次の窓／帯あり・帯なしの分離と帯の状態別／分割された帯／帯の台帳なしでも動く／AUTO_HOLD→自動解除→再AUTO_HOLDの再保留と成功・未確定／手動解除と自動解除の分離／AUTO_RELEASEが無いCHECKでも動き0件・あるCHECK（P3後を模擬）でも数える／期間外のイベント／意図的と自動の保留の件数分離／実行前後で全表のハッシュが同じ／読み取り専用接続が書き込みを拒否／一方の市場の失敗の隔離／CSV(BOM)・JSON・CLI）。
+
+### 未確認・判断してほしい点
+- **実DB・実運用データでの数値は未確認**（実際のJP/USのデータで、集計時間と、帯なし/帯ありの分け方が期待どおりかをパソコンで確認してほしい）。
+- P3が自動解除のイベント種別・actorを別の値にした場合、`AUTO_RECOVERY_ACTOR`／`is_auto_release`を合わせる必要がある（現状は`AUTO_RELEASE`型、または`RELEASE`+`system:auto-recovery`）。
