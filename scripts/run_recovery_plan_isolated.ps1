@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
   稼働中のwatchに影響しない独立worktreeから、自動保留の復旧ドライラン
   (python -m workflow.cli recovery-plan) を読み取り専用で実行する。
@@ -19,9 +19,9 @@
 
 .EXAMPLE
   $env:SEEDASIN_APP_DATABASE_URL = '...'   # watchと同じ接続文字列
-  .\scripts\run_recovery_plan_isolated.ps1 -Branch worker/hold-recovery-p1p2
-  .\scripts\run_recovery_plan_isolated.ps1 -Branch worker/hold-recovery-p1p2 -Market JP -Limit 20
-  .\scripts\run_recovery_plan_isolated.ps1 -Branch worker/hold-recovery-p1p2 -Cleanup   # 片付け
+  .\scripts\run_recovery_plan_isolated.ps1 -Branch worker/integration-p1-p4
+  .\scripts\run_recovery_plan_isolated.ps1 -Branch worker/integration-p1-p4 -Market JP -Limit 20
+  .\scripts\run_recovery_plan_isolated.ps1 -Branch worker/integration-p1-p4 -Cleanup   # 片付け
 #>
 [CmdletBinding()]
 param(
