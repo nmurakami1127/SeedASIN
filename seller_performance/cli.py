@@ -9,6 +9,8 @@
     python -m seller_performance.cli export-all
     python -m seller_performance.cli export-all --output-dir=C:\tmp\analysis
     python -m seller_performance.cli source-yield --marketplace=US --hours 24
+    python -m seller_performance.cli efficiency-report --hours 24
+    python -m seller_performance.cli efficiency-report --market JP --out-dir exports
     python -m seller_performance.cli watch-activity --days 7
 
 recommendは、前回の取得（tool_execution_link.requested_atの最新値と、
@@ -83,7 +85,9 @@ seller_performance/export_all.pyのモジュールdocstring参照。
 
 source-yieldは、出典（acquisition_source）ごとの新規ASIN率を、対象期間（既定は直近24時間）について市場別に集計する読み取り専用コマンド
 （docs/DEVIATIONS.md #79）。出力は画面とCSV（exports/source_yield/、UTF-8 BOM付き）。定義は
-seller_performance/source_yield.pyのモジュールdocstring参照。watch-activityは、exports/workflowのログから日ごとの稼働時間・停止要求・
+seller_performance/source_yield.pyのモジュールdocstring参照。efficiency-reportは、取得ページ数・ASIN純増数（初見）・純増ASIN/ページ・
+価格帯分割の内訳・自動復旧/再保留・保留件数・初見ASINの日次をJP/US別に出す読み取り専用コマンド（docs/DEVIATIONS.md #89。全接続が
+SET TRANSACTION READ ONLY。画面とCSV/JSON exports/efficiency_report/。定義はseller_performance/efficiency_report.pyのモジュールdocstring参照）。watch-activityは、exports/workflowのログから日ごとの稼働時間・停止要求・
 人手待ちの回数を表示する（DBには接続しない。seller_performance/watch_activity.py参照）。
 """
 from __future__ import annotations
@@ -236,6 +240,25 @@ def _cmd_source_yield(args: argparse.Namespace) -> None:
     print(f"CSVを{path}に書き出しました")
 
 
+def _cmd_efficiency_report(args: argparse.Namespace) -> None:
+    from seller_performance.efficiency_report import EXPORT_DIR, MARKETS, build_reports, format_report, write_csv, write_json
+
+    markets = (args.market,) if args.market else MARKETS
+    # 読み取りのみ（市場ごとに別の接続・READ ONLYトランザクション）。一方の市場の失敗は他方を止めない
+    reports = build_reports(SessionFactory.for_app_role(), markets, args.hours)
+    for rep in reports.values():
+        print("\n".join(format_report(rep)))
+        print()
+    if args.no_export:
+        return
+    out_dir = Path(args.out_dir) if args.out_dir else EXPORT_DIR
+    for rep in reports.values():
+        print(f"CSVを{write_csv(rep, out_dir)}に書き出しました")
+    print(f"JSONを{write_json(reports, out_dir)}に書き出しました")
+    if any(r.error for r in reports.values()):
+        raise SystemExit(1)
+
+
 def _cmd_watch_activity(args: argparse.Namespace) -> None:
     from seller_performance.watch_activity import build_activity, format_activity
 
@@ -293,6 +316,17 @@ def build_parser() -> argparse.ArgumentParser:
     p_yield.add_argument("--hours", type=float, default=24, help="対象期間（直近N時間。既定24）")
     p_yield.add_argument("--output-dir", default=None, help="CSVの出力先。省略時はexports/source_yield/")
     p_yield.set_defaults(func=_cmd_source_yield)
+
+    p_eff = subparsers.add_parser(
+        "efficiency-report",
+        help="日次の取得効率（ページ数・ASIN純増数・純増/ページ・価格帯分割の内訳・自動復旧/再保留・保留件数・初見ASINの日次）をJP/US別に表示する"
+        "（読み取り専用。画面とCSV/JSON exports/efficiency_report/）",
+    )
+    p_eff.add_argument("--market", type=str.upper, choices=["US", "JP"], default=None, help="省略時はJPとUSの両方")
+    p_eff.add_argument("--hours", type=float, default=24, help="対象期間（直近N時間。既定24）")
+    p_eff.add_argument("--out-dir", default=None, help="CSV/JSONの出力先。省略時はexports/efficiency_report/")
+    p_eff.add_argument("--no-export", action="store_true", help="画面表示のみ（ファイルを書かない）")
+    p_eff.set_defaults(func=_cmd_efficiency_report)
 
     p_act = subparsers.add_parser(
         "watch-activity",
