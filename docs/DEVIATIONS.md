@@ -1462,3 +1462,42 @@ Amazonのナビゲーションはdomcontentloadedで待機し、第三者リソ�
 1. 取得系のプロセス（`workflow`・`asin_collector`）を停止。2. `pg_dump`。3. `alembic upgrade head`（0019のみ。既存データには触れない）。4. `\d acquisition_band`でRLS・トリガー・権限を確認。動作は変わらない（帯を使う経路はまだ無い）。
 
 テスト: `tests/integration/test_acquisition_band.py`（実PostgreSQL。マイグレーションの冪等・downgradeの中止と成功、保護トリガー、同時ACTIVEの拒否、3ロールのRLS・権限、leaseのメソッド）、`tests/unit/test_schema_guard.py`。
+
+## 83. 価格帯分割のJP/SELLER探索への組み込み（既定OFF、段階D）（2026-11-03）
+
+利用者承認済みの設計（2026-11-03）。#80（`close_on_repeated_page`）・#82（`acquisition_band`、alembic 0019）・`acquisition/partition.py`の部品を、出典取得に接続する。**スキーマ変更なし**（0019のまま）。設定が無効（既定）の間の動作は従来と完全に同じで、既存テストは無変更で通る。
+
+### 動作（`asin_collector/source_runner.py` の `_crawl_banded`。帯なしの一巡は従来の`_crawl`のまま、別経路）
+- **一巡＝セラー1件の全帯の走査。帯は一巡の内側。** 開始時に初期帯を`init_bands`（冪等）で作り、lo昇順に1つずつ`ACTIVE`にして、帯の1ページ目から走査する。開始URL（`start_url`）は最初の帯の1ページ目。
+- **遅延二分割**: 保存済みのページの直後に同じ内容が返り、同じURLの取り直しでも同じなら（#80のDEPTH_LIMIT確認）、**その帯だけ**を`advance_band(SPLIT)`で二分割する（親`SPLIT`・子2つ・左が`ACTIVE`）。`finish`はしない。最小幅/最大深さで割れない帯は`TRUNCATED_MIN`（`close_reason='DEPTH_LIMIT_MIN_WIDTH'`）で閉じて次の帯へ。取り直しで内容が変わっていれば通常のページとして続ける（#80と同じ）。
+- **帯の末尾**（「次へ」なし）で`DONE`（`END_OF_RESULTS`）にして次の待機帯へ。カーソルは次の帯の1ページ目（`next_url`=その帯のURL、`next_page_no=1`）、`end_reached`は**最後の帯の末尾のときだけ**真。ページ数/ASIN数の上限は従来どおり`SUCCESS_TRUNCATED`/`PAGE_LIMIT`・`ASIN_LIMIT`で`OPEN`のまま閉じ、続きは帯の途中から。
+- **全帯終了**: `SUCCESS_NONEMPTY`で閉じて`COMPLETE`（全帯が空なら`SUCCESS_EMPTY`）。葉の帯が範囲を隙間なく覆っていること（`check_cover`）を確認する。`TRUNCATED_MIN`が1つでもあれば`completeness='TRUNCATED'`・`truncation_reason='BAND_MIN_WIDTH'`（outcomeは成功のまま。`finish(completeness=)`を使用）。最後の帯が空のときは末尾のページが無いので`end_reached`は立たない（全帯の終了で完了を確定する）。
+- **帯の切替時**（分割・末尾・空の帯）に`prev_sig`を初期化する。重なり確認(OVERLAP)は、続きが**最後に保存したページと同じ帯**のときだけ行う（帯が違うときは省略。偽の`OVERLAP_MISMATCH`で一巡全体が`BROKEN`になるのを防ぐ）。
+- **`NO_NEW_ASINS_LOOP`は帯ありでは使わない**（子帯の先頭は親が保存済みのASINと大きく重複するため）。ループは`REVISITED_URL`と繰り返しページの確認で検知する。
+- **空の帯**: 帯の1ページ目がカード0件で「検索結果0件」ウィジェットあり（SELLERは0件判定が検証済み）なら`DONE`（`EMPTY`）にして次へ。ウィジェットが無ければ、保存済みがあれば`PARTIAL`、無ければ`UNVERIFIED_EMPTY`（成功にしない）。1ページ目以外の0件は従来どおり`EMPTY_PAGE_AFTER_RESULTS`（BROKEN）。
+- **帯をまたぐ重複ASIN**は既存の`cycle_asins`（一巡で保存済みを除外）で二重保存されない（変更なし）。
+
+### 再開（帯の状態はDB`acquisition_band`が真実）
+- 続き(CONTINUE)・RETRY_FIRST・FINALIZEは、`ACTIVE`な帯（無ければ待機中の先頭を`ACTIVE`に）をDBから決める。カーソル(`resume_url`)は**同じ帯の中の続き**のときだけ使い、分割直後・帯の切替直後は帯の1ページ目から。保存済みページのある`ACTIVE`な帯でカーソルが帯の外にある場合は、帯の末尾のページを保存した後・帯を閉じる前に止まったと判断して、その帯を閉じてから進む。末尾到達(`end_reached`)を保存済みで止まった場合(FINALIZE)は、取得せずに最後の帯を閉じて完了する。
+- 日次枠切れ（`DAILY_LIMIT`）・lease喪失・プロセス死・帯の遷移（`advance_band`）の前後のどこで止まっても、`CONTINUE`/`RETRY_FIRST`/`FINALIZE`で続けられ、結果（ASIN・葉の帯）は中断なしの実行と一致し、保存済みの帯のページを取り直さないことを、全ての取得位置・遷移位置で確認した（`tests/integration/test_price_band_crawl.py`）。
+- **一巡の方式は開始時に決まり、途中で変えない**: 帯のある一巡は設定を無効にしても帯ありで続ける（設定が無ければ既定の区切り・最小幅・最大深さを使う）。帯のない一巡は設定を有効にしても従来どおり最後まで進める（保存済みページのある一巡を帯ありで最初からやり直さない）。保存済みページの無い一巡(FRESH/RESTART/RETRY_FIRST)は設定に従う。市場・種別が`partition.REGISTRY`に無い出典（US、JPのSELLER以外）は常に帯なし。
+- エラー分離: 帯の中のCAPTCHA未解決・5xx・読込失敗はその出典の実行だけが`PARTIAL`/`FAILED`（一巡は`OPEN`）で、`run_batch`の他の出典は継続。復旧後は保存済みの位置（帯・ページ）から再開。BROKEN（`REVISITED_URL`等）になれば`RESTART_BROKEN`で新しい一巡（新しい帯）を作る。
+
+### 設定（`workflow/config.py`）
+- `partition.price_band`: `markets`（既定`[]`=無効。`validate_markets`でUSは拒否）、`initial_edges_yen`（既定は`partition.DEFAULT_INITIAL_EDGES_YEN`）、`min_width_yen`=100、`max_depth`=8、`treat_end_as_depth_limit_pages`=`null`。`close_on_repeated_page=true`が前提（違えば`ConfigError`）。項目の無い保存済みの設定・状態は無効として読める（#80の`close_on_repeated_page`と同じ手当て。`config_sha256`は表示用で比較しない）。
+- `treat_end_as_depth_limit_pages`（`PartitionConfig`に追加）: 今は`null`。整数Nのとき、「次へ」が消えた帯の末尾が**N ページ以上**なら深さの限界(DEPTH_LIMIT)として扱う（分割できなければ`TRUNCATED_MIN`）。ちょうどNページで自然に終わった帯も限界として扱う（区別できないため安全側）。この場合、カーソルは分割後の左の子の1ページ目を指し（`end_reached`は立てない）、再開時もDBの帯のページ数から同じ結論になる。
+- `RunLimits.price_band`（`PartitionConfig`または`None`）。`close_on_repeated_page=false`との組み合わせは`ValueError`。engineの`RunLimits`生成2か所（`fetch_source`・`_acquire_sources`）は`price_band=self.cfg.price_band_for(market)`を渡す（取得先市場が`markets`にあるときだけ設定が入る）。`asin_collector.cli`の`collect-source`/`collect-next`に`--price-band`（USおよび`--close-on-repeated-page`なしは中止）。`config/workflow.example.json`・`workflow.standard.example.json`に無効の例を追記。`config/workflow.json`は変更していない。
+
+### 日次枠
+- 帯ありでも、実アクセスは全て`fetcher.fetch`を通る（engineの`_BudgetFetcher`が数える）。実アクセス数 = 保存したページ + 重なり確認 + 2 ×（繰り返しの検知と取り直しの件数＝`repeat_check_pages`）+ 空の帯の1ページ目。分割後に子帯が取り直す、親と重複する範囲のページは通常のページとして数える（`pages`にも`max_pages`にも入る）。枠が尽きれば`DAILY_LIMIT`（INTERRUPTED。失敗に数えず、帯の状態を保ったまま翌日に続ける）。
+- `RunReport`に`completeness`・`banded`・`band_splits`・`band_min_width`・`band_empty`を追加。`collect-source`/`collect-next`の画面に帯の件数を表示する。
+
+### 変えていないもの
+- `tool_submission/planner.py`（`COMPLETE`で端数を放出。`completeness='TRUNCATED'`は#81の拡張で「一部のみ」の注記が付く）、alembic、既存テーブル、`config/workflow.json`。帯なしの一巡・設定が無効の間の全動作。
+
+### 判断してほしい点・未確認
+- **実ページでは未確認**: (1) `p_36=<lo>-<hi-1>`（円×100）の指定が実際にセラーのストアフロント検索を絞ること、(2) 「次へ」のURLに`p_36`が残り`band_of_url`が読めること（読めない場合、続きの再開は帯の1ページ目からになる）、(3) 検索結果の深さの限界の実際の形（同じページの繰り返しか、「次へ」が消えるか。後者なら`treat_end_as_depth_limit_pages`を設定する）、(4) 初期帯の区切りが実際の価格分布に合っているか。パソコンで`--close-on-repeated-page --price-band`を小さな`--max-pages`で試してから運用設定にする。
+- 「次へ」が消える形の限界で、`treat_end_as_depth_limit_pages`未設定（null）のままだと、その帯は完了(`DONE`)になり欠落が出る。実ページを確認するまで、運用は`null`のまま小さく試すことを勧める。
+- ページ数/ASIN数の上限（`max_pages`）はこれまで通り1回の実行あたり。帯が多いセラーは複数回の実行（日をまたぐ）で完走する。
+- 実PostgreSQLの結合テストは使い捨てDB（リポジトリ外）で実行した。
+

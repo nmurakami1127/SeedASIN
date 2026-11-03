@@ -20,6 +20,12 @@ heartbeat は別スレッドで続け、CAPTCHAの人の待機中も切らさな
 - INTERRUPTED        実行者のCtrl+C（失敗に数えない）。leaseの失効は別系統（回収）
 - DAILY_LIMIT        日次のページ枠が尽きて止めた（INTERRUPTED(DAILY_LIMIT)として確定。失敗に数えず、保存済みの位置から再開する）
 
+価格帯分割（`RunLimits.price_band`、既定は無効。docs/DEVIATIONS.md #83）: 有効なとき、JP/SELLER の一巡を価格帯ごとに走査する。
+一巡＝セラー1件の全帯の走査で、帯は一巡の内側。初期帯を lo 昇順に走査し、DEPTH_LIMIT（同じページの繰り返しを1回の取り直しで確認）を
+確認した帯だけをその場で二分割する。最小幅/最大深さで割れない帯は TRUNCATED_MIN として閉じて次へ進む。全帯が終われば
+SUCCESS_NONEMPTY（TRUNCATED_MIN があれば completeness='TRUNCATED'・truncation_reason='BAND_MIN_WIDTH'）で一巡を完了にする。
+帯の状態は acquisition_band（DB）が真実で、どこで中断しても CONTINUE で続けられる。帯なしの一巡は従来どおり（`_crawl_banded`とは別経路）。
+
 続き取得（Claim.plan）: CONTINUE=保存済みの次ページから / FINALIZE=末尾到達を保存済みで終了確定前に止まった一巡を、取得せずに完了として確定 /
 RETRY_FIRST=保存済みページが無い一巡を1ページ目から（初回と同じ判定。確認済みの0件はSUCCESS_EMPTY）。
 
@@ -39,6 +45,8 @@ from urllib.parse import quote, quote_plus, urlparse
 from sqlalchemy import text
 
 from acquisition.lease import AcquisitionRunService, Claim, LeaseLost, PageCursor
+from acquisition.partition import Band as PBand
+from acquisition.partition import CoverError, PartitionConfig, PriceBandPartition, check_cover, get_strategy
 from asin_collector.asin_extractor import extract_search_card_asins
 from asin_collector.browser_session import html_is_captcha, html_is_server_error
 from asin_collector.check_recommendations import NO_RESULTS_MARKER, storefront_search_url
@@ -90,6 +98,13 @@ class RunLimits:
     # 同じURLを1回だけ取り直し、同じなら「検索結果の深さの限界」として SUCCESS_TRUNCATED / DEPTH_LIMIT / 再開位置なしで閉じる。
     # しきい値（ページ数など）は設けない。価格帯分割はしない（別案件）。
     close_on_repeated_page: bool = False
+    # None=帯なし（従来どおり）。設定すると、**JP/SELLER の一巡を価格帯ごとに走査する**（登録の無い市場・種別では無視して従来どおり）。
+    # close_on_repeated_page=true が前提（帯の分割は DEPTH_LIMIT の確認を使う）。docs/DEVIATIONS.md #83
+    price_band: PartitionConfig | None = None
+
+    def __post_init__(self) -> None:
+        if self.price_band is not None and not self.close_on_repeated_page:
+            raise ValueError("price_band は close_on_repeated_page=true が前提です（帯の分割は繰り返しページの確認を使います）")
 
 
 @dataclass
@@ -108,6 +123,11 @@ class RunReport:
     drift: bool = False          # 重なり確認で、検索結果の変化を検知した（欠落の可能性）
     plan: str = "FRESH"          # FRESH / CONTINUE / FINALIZE / RETRY_FIRST / RESTART_*
     cycle_id: int | None = None
+    completeness: str | None = None  # 帯あり一巡で、outcomeの既定と違う完全性を記録するとき（'TRUNCATED'）。None=outcomeから決まる既定
+    banded: bool = False             # 帯あり（価格帯）で走査した
+    band_splits: int = 0             # この実行で二分割した帯の数
+    band_min_width: int = 0          # この実行で最小幅/最大深さのため打ち切った帯（TRUNCATED_MIN）の数
+    band_empty: int = 0              # この実行で空（確認済みの0件）として閉じた帯の数
 
 
 @dataclass
@@ -229,9 +249,10 @@ def run_claimed_source(
                     raise LeaseLost("日次枠での中断の確定時に、leaseを失っていました")
                 report.outcome = "DAILY_LIMIT"
                 return report
+            extra = {"completeness": report.completeness} if report.completeness else {}  # 帯ありの一巡だけ（従来の呼び出しは変えない）
             held = service.finish(claim, outcome, truncation_reason=trunc, error_code=report.error_code,
                                   error_message=None if drop_cursor else report.detail, pages_fetched=report.pages,
-                                  drop_cursor=drop_cursor)
+                                  drop_cursor=drop_cursor, **extra)
             report.outcome, report.auto_held = outcome, held is not None
     except LeaseLost as exc:
         report.outcome, report.detail = "LEASE_LOST", str(exc)
@@ -307,10 +328,15 @@ def _crawl(service, fetcher, claim, src, start_url, limits, sleep, hb, report: R
     続き(CONTINUE)では、前回の最後に保存したページを `overlap_pages` だけ取り直して（ASINは入れない）ページ送りが有効か確認し、
     保存済みの次ページから続ける。取得済みのASINは重ねて保存しない。ループする次ページ・繰り返すページ・無効な次ページは
     BROKEN（一巡を完了にも正常な0件にもしない）。検索結果は時間で変わるため、これで欠落が無いとは保証できない（driftとして記録する）。"""
+    band_cfg = _band_config(service, claim, src, limits)
     if claim.plan == "FINALIZE":
         # 前回のrunが末尾のページを正常に解析・保存し（end_reached）、終了確定の前に止まった。取得し直さずに、この一巡を完了として確定する
         # （30日間隔の起点は、この確定の時刻）。前回のrunの行は書き換えない（終了後の行は保護トリガーで不変）。
+        if band_cfg is not None:
+            return _finalize_banded(service, claim, report, band_cfg)
         return "SUCCESS_NONEMPTY", None
+    if band_cfg is not None:
+        return _crawl_banded(service, fetcher, claim, src, start_url, limits, sleep, hb, report, band_cfg)
     # 途中の継続取得は、保存済みページがある一巡だけ（RETRY_FIRSTは保存済みページが無いので、1ページ目から初回と同じ判定をする）
     continuing = claim.plan == "CONTINUE" and bool(claim.resume_url)
     seen: set[str] = service.cycle_asins(claim) if continuing else set()
@@ -380,6 +406,239 @@ def _crawl(service, fetcher, claim, src, start_url, limits, sleep, hb, report: R
         if limits.max_asins is not None and report.asins >= limits.max_asins:
             return "SUCCESS_TRUNCATED", "ASIN_LIMIT"
         target = nxt
+
+
+# ---------------------------------------------------------------------- 価格帯あり（docs/DEVIATIONS.md #83）
+
+def _band_config(service, claim, src, limits: RunLimits) -> PartitionConfig | None:
+    """この一巡を帯ありで走査するなら、その設定を返す（帯なしは None＝従来どおり）。
+    一巡の方式は**開始時に決まり、途中で変えない**: 続き(CONTINUE)・FINALIZE・RETRY_FIRSTでは、この一巡に帯があれば設定が無効になっていても
+    帯ありで続ける（帯の状態はDBが真実。設定を外しても途中の一巡を壊さない）。帯の無い一巡は、設定が有効になっても従来どおり最後まで進める
+    （保存済みページのある一巡を帯ありで最初からやり直さない）。登録の無い市場・種別（US、JP以外の種別）は常に帯なし。"""
+    strat = get_strategy(claim.marketplace, src.source_type)
+    if strat is None or not strat.applies(claim.marketplace, src.source_type):
+        return None
+    if claim.plan in ("CONTINUE", "FINALIZE", "RETRY_FIRST") and claim.cycle_id is not None:
+        if service.load_bands(claim):
+            return limits.price_band or PartitionConfig()
+        return limits.price_band if claim.plan == "RETRY_FIRST" else None
+    return limits.price_band
+
+
+class _Bands:
+    """一巡の帯をメモリに持つ（DBが真実。advance_band などの戻り値で更新する）。"""
+
+    def __init__(self, service, claim, strat: PriceBandPartition, base_url: str, cfg: PartitionConfig) -> None:
+        self.service, self.claim, self.strat, self.base, self.cfg = service, claim, strat, base_url, cfg
+        self.list: list = []
+
+    def url(self, b) -> str:
+        return self.strat.url(self.base, PBand(b.lo_units, b.hi_units))
+
+    def active(self):
+        return next((b for b in self.list if b.state == "ACTIVE"), None)
+
+    def pending(self) -> list:
+        return sorted((b for b in self.list if b.state == "PENDING"), key=lambda b: b.lo_units)
+
+    def next_active(self):
+        """ACTIVEな帯（分割直後の左の子など）を返す。無ければ待機中の先頭をACTIVEにして返す。全帯が終わっていれば None。"""
+        act = self.active()
+        if act is not None:
+            return act
+        pend = self.pending()
+        if not pend:
+            return None
+        self.list = self.service.advance_band(self.claim, pend[0].band_id, "ACTIVE")
+        return self.active()
+
+    def split_of(self, b) -> tuple | None:
+        return self.strat.split(PBand(b.lo_units, b.hi_units, b.depth))
+
+    def close_by_depth(self, b, report: RunReport) -> None:
+        """検索結果の深さの限界を確認した帯を閉じる: 割れれば二分割（親SPLIT・子2つ・左がACTIVE）、割れなければ TRUNCATED_MIN。"""
+        sp = self.split_of(b)
+        if sp is None:
+            self.list = self.service.advance_band(self.claim, b.band_id, "TRUNCATED_MIN", close_reason="DEPTH_LIMIT_MIN_WIDTH")
+            report.band_min_width += 1
+        else:
+            self.list = self.service.advance_band(self.claim, b.band_id, "SPLIT", close_reason="DEPTH_LIMIT", split_at=sp[0].hi)
+            report.band_splits += 1
+
+    def close_at_end(self, b, pages: int, report: RunReport) -> None:
+        """帯の末尾（「次へ」が無い）に着いた。設定 treat_end_as_depth_limit_pages 以上のページ数なら深さの限界として扱い、そうでなければ完了。"""
+        n = self.cfg.treat_end_as_depth_limit_pages
+        if n is not None and pages >= n:
+            self.close_by_depth(b, report)
+        else:
+            self.list = self.service.advance_band(self.claim, b.band_id, "DONE", close_reason="END_OF_RESULTS")
+
+
+def _band_result(bs: _Bands, report: RunReport) -> tuple[str, str | None]:
+    """全帯が終わった一巡の結果。葉の帯が範囲を隙間なく覆っていることを確認する。TRUNCATED_MIN があれば完全性だけ 'TRUNCATED' にする。"""
+    bands = bs.service.load_bands(bs.claim)
+    leaves = [b for b in bands if b.state != "SPLIT"]
+    try:
+        check_cover([PBand(b.lo_units, b.hi_units) for b in leaves], lo=min(b.lo_units for b in leaves), hi=None)
+    except CoverError as exc:
+        raise _Stop("PARTIAL", "BAND_COVER_BROKEN", f"帯が範囲を隙間なく覆っていません: {exc}") from exc
+    if any(b.state not in ("DONE", "TRUNCATED_MIN") for b in leaves):
+        raise _Stop("PARTIAL", "BAND_NOT_FINISHED", "終了していない帯が残っています")
+    outcome = "SUCCESS_NONEMPTY" if sum(b.pages_fetched for b in bands) > 0 else "SUCCESS_EMPTY"
+    if any(b.state == "TRUNCATED_MIN" for b in leaves):
+        report.completeness = "TRUNCATED"
+        return outcome, "BAND_MIN_WIDTH"
+    return outcome, None
+
+
+def _finalize_banded(service, claim, report: RunReport, cfg: PartitionConfig) -> tuple[str, str | None]:
+    """末尾到達を保存済みで終了確定の前に止まった帯ありの一巡: 取得せずに、最後の帯を閉じて完了として確定する。"""
+    report.banded = True
+    bs = _Bands(service, claim, PriceBandPartition(cfg), "", cfg)
+    bs.list = service.load_bands(claim)
+    act = bs.active()
+    if act is not None:  # 最後のページの保存の後、帯を閉じる前に止まった
+        bs.close_at_end(act, act.pages_fetched, report)
+    if bs.active() is not None or bs.pending():
+        raise _Stop("PARTIAL", "BAND_NOT_FINISHED", "末尾到達の保存後に、終了していない帯が残っています")
+    return _band_result(bs, report)
+
+
+def _crawl_banded(service, fetcher, claim, src, base_url, limits, sleep, hb, report: RunReport, cfg: PartitionConfig) -> tuple[str, str | None]:
+    """価格帯ありの一巡。帯は lo 昇順に1つずつ走査する（一巡の中でACTIVEな帯は高々1つ）。
+
+    - 初期帯から始め、DEPTH_LIMIT（保存済みの直後に同じ内容が返り、同じURLの取り直しでも同じ）を確認した帯だけをその場で二分割する。
+    - 帯の末尾で DONE にして次の待機帯へ。カーソルの next_url は次の帯の1ページ目（next_page_no=1）、end_reached は最後の帯の末尾のときだけ。
+    - 帯の切替（分割・末尾・空の帯）で prev_sig をリセットし、重なり確認(OVERLAP)は同じ帯の続きのときだけ行う。
+    - NO_NEW_ASINS_LOOP は使わない（子帯の先頭は親と大きく重複するため）。ループは REPEATED_PAGE の確認と REVISITED_URL で検知する。
+    - 再開の位置は acquisition_band（DB）から決める。カーソルは同じ帯の中の続きのときだけ使い、分割直後・帯の切替直後は帯の1ページ目から。
+    - ページ数/ASIN数の上限は従来どおり SUCCESS_TRUNCATED で OPEN のまま閉じる（続きは帯の途中から）。"""
+    report.banded = True
+    strat = PriceBandPartition(cfg)
+    bs = _Bands(service, claim, strat, base_url, cfg)
+    continuing = claim.plan == "CONTINUE" and bool(claim.resume_url)
+    seen: set[str] = service.cycle_asins(claim) if continuing else set()
+    visited: set[str] = set()
+    bs.list = service.init_bands(claim, [(b.lo, b.hi) for b in strat.initial(cfg)])  # 冪等: 既にこの一巡に帯があれば何も作らない
+    resume_band = strat.band_of_url(claim.resume_url) if continuing else None
+
+    # --- 開始位置: DBの帯が真実。ACTIVEな帯（無ければ待機中の先頭を開く）。保存済みページのある帯でカーソルが帯の外にあれば、末尾に着いた後で止まっていた
+    in_resume = False
+    while True:
+        act = bs.active()
+        if act is None:
+            act = bs.next_active()
+            break
+        if act.pages_fetched == 0:
+            break
+        if resume_band is not None and (resume_band.lo, resume_band.hi) == (act.lo_units, act.hi_units):
+            in_resume = True
+            break
+        bs.close_at_end(act, act.pages_fetched, report)  # 帯の末尾のページを保存した後、帯を閉じる前に止まっていた
+    if act is None:
+        return _band_result(bs, report)
+
+    if in_resume:
+        target, page_no, prev_sig = claim.resume_url, (claim.resume_page_no or 1), claim.last_page_signature
+    else:
+        target, page_no, prev_sig = bs.url(act), 1, None
+        if not continuing:
+            service.set_start(claim, target, 1)
+    cur_pages = act.pages_fetched
+    if in_resume and claim.overlap_pages > 0 and claim.last_page_url:
+        ov = _get(service, fetcher, claim, claim.last_page_url, limits, sleep, hb, report.pages)
+        cards0 = extract_search_card_asins(ov.html)
+        stored = set(claim.last_page_asins or ())
+        ratio = (len(set(cards0) & stored) / len(stored)) if stored else (1.0 if cards0 else 0.0)
+        drift = ratio < 1.0 or (claim.last_page_signature is not None and _signature(cards0) != claim.last_page_signature)
+        report.overlap_pages += 1
+        service.record_overlap(claim, ratio=ratio, drift=drift)
+        report.drift = report.drift or drift
+        if ratio < OVERLAP_MIN_RATIO:
+            raise _Stop("PARTIAL", "OVERLAP_MISMATCH", f"前回の最後のページを取り直したところ、ASINの重なりが{ratio:.0%}しかありません。ページ送りの位置を信頼できません")
+        visited.add(ov.url)
+    elif in_resume and claim.last_page_url:
+        visited.add(claim.last_page_url)
+    max_pages = min(limits.max_pages, _ABSOLUTE_PAGE_LIMIT)
+
+    def switch(next_band):
+        nonlocal act, target, page_no, prev_sig, cur_pages
+        act, target, page_no, prev_sig, cur_pages = next_band, bs.url(next_band), 1, None, 0
+
+    while True:
+        page = _get(service, fetcher, claim, target, limits, sleep, hb, report.pages)
+        if page.url in visited:
+            raise _Stop("PARTIAL", "REVISITED_URL", f"同じURLに戻りました: {page.url}")
+        visited.add(page.url)
+        cards = extract_search_card_asins(page.html)
+        if not cards:
+            if cur_pages > 0:
+                raise _Stop("PARTIAL", "EMPTY_PAGE_AFTER_RESULTS", "結果の途中で0件のページになりました（想定外）")
+            widget = html_has_no_results_widget(page.html)
+            if widget and src.source_type in VERIFIED_EMPTY_TYPES:  # 空の帯: 確認済みの0件。閉じて次へ
+                bs.list = service.advance_band(claim, act.band_id, "DONE", close_reason="EMPTY")
+                report.band_empty += 1
+                nb = bs.next_active()
+                if nb is None:
+                    return _band_result(bs, report)
+                switch(nb)
+                continue
+            code = "EMPTY_NOT_VERIFIED_FOR_TYPE" if widget else "NO_CARDS_NO_WIDGET"
+            saved_any = sum(b.pages_fetched for b in bs.list) > 0
+            raise _Stop("PARTIAL" if saved_any else "UNVERIFIED_EMPTY", code, "帯の1ページ目が0件に見えますが、0件と確認できません（成功に数えません）")
+        sig = _signature(cards)
+        if sig == prev_sig:
+            # 保存済みのページの直後に同じ内容が返った: 同じURLを1回だけ取り直して確認し、同じなら**この帯**の深さの限界
+            page = _get(service, fetcher, claim, target, limits, sleep, hb, report.pages)
+            report.repeat_check_pages += 1
+            cards = extract_search_card_asins(page.html)
+            if not cards:
+                raise _Stop("PARTIAL", "EMPTY_PAGE_AFTER_RESULTS", "繰り返しの確認で取り直したら、0件のページになりました（想定外）")
+            sig = _signature(cards)
+            if sig == prev_sig:
+                bs.close_by_depth(act, report)
+                nb = bs.next_active()  # 分割なら左の子、TRUNCATED_MINなら次の待機帯
+                if nb is None:
+                    return _band_result(bs, report)
+                switch(nb)
+                continue
+            # 取り直したら内容が変わっていた（一時的な不具合）: 通常のページとして処理を続ける
+        prev_sig = sig
+        new = [a for a in cards if a not in seen]
+        seen.update(new)
+        nxt = find_next_url(page.html, page.url)
+        cur_pages += 1
+        if nxt:
+            cursor = PageCursor(nxt, page_no + 1, page.url, sig, tuple(cards), end_reached=False)
+        else:
+            n_end = cfg.treat_end_as_depth_limit_pages
+            sp = bs.split_of(act) if (n_end is not None and cur_pages >= n_end) else None
+            later = bs.pending()
+            if sp is not None:  # 末尾を限界として扱い、二分割する。続きは左の子の1ページ目（再開時もDBの帯から同じ結論になる）
+                cursor = PageCursor(strat.url(base_url, sp[0]), 1, page.url, sig, tuple(cards), end_reached=False)
+            elif later:
+                cursor = PageCursor(bs.url(later[0]), 1, page.url, sig, tuple(cards), end_reached=False)
+            else:
+                cursor = PageCursor(None, None, page.url, sig, tuple(cards), end_reached=True)
+        service.append_asins(claim, new, pages=1, cursor=cursor, band_id=act.band_id)  # ASIN・再開位置・帯の件数を同じトランザクションで保存
+        report.pages += 1
+        report.asins += len(new)
+        page_no += 1
+        if nxt:
+            if report.pages >= max_pages:
+                return "SUCCESS_TRUNCATED", "PAGE_LIMIT"
+            if limits.max_asins is not None and report.asins >= limits.max_asins:
+                return "SUCCESS_TRUNCATED", "ASIN_LIMIT"
+            target = nxt
+            continue
+        bs.close_at_end(act, cur_pages, report)
+        if bs.active() is None and not bs.pending():
+            return _band_result(bs, report)
+        if report.pages >= max_pages:
+            return "SUCCESS_TRUNCATED", "PAGE_LIMIT"
+        if limits.max_asins is not None and report.asins >= limits.max_asins:
+            return "SUCCESS_TRUNCATED", "ASIN_LIMIT"
+        switch(bs.next_active())
 
 
 # ---------------------------------------------------------------------- 実ブラウザ

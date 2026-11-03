@@ -31,6 +31,16 @@
     "notify_minutes": 360
   },
   "cross": {"enabled": true, "fetch_discovered": false},
+  "_comment_partition": "価格帯分割（既定は無効）。使うには markets を [\"JP\"] にし、close_on_repeated_page を true にする（USは指定できない）。docs/DEVIATIONS.md #83",
+  "partition": {
+    "price_band": {
+      "markets": [],
+      "initial_edges_yen": [0, 1000, 2000, 3000, 4000, 5000, 7500, 10000, 15000, 25000, 50000],
+      "min_width_yen": 100,
+      "max_depth": 8,
+      "treat_end_as_depth_limit_pages": null
+    }
+  },
   "brand_enabled": false,
   "tool_max_asins": 5000,
   "result_max_age_days": 30,

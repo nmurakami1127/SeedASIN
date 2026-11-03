@@ -360,6 +360,14 @@ python -m seller_performance.cli watch-activity --days 7
 **取得ページ数の数え方（`--max-pages`・日次上限）**: `--max-pages`（`asin_collector.cli collect-source` / `workflow.cli fetch-source`）は**新しく保存して進むページ数**です。続き取得での前回の最後のページの取り直し（overlap。`overlap_pages`、初期1）は含まない別枠で、実際のページアクセスは最大 `max-pages + overlap_pages` です（5xxの再試行・CAPTCHA後の取り直しも実アクセスとして数えます）。workflow経由の取得は、overlapと再試行を含む実アクセス数を日次（JST）の上限に対して確保してから行い、枠を使い切ったら、それ以上は取得しません（失敗には数えず、翌JST日付に保存済みの位置から続けます）（`fetch-source --total-cap N` で、overlapを含む総アクセス数の上限も指定できます）。冷却中の出典は30分ごとに再試行せず、冷却が明ける時刻まで飛ばします。
 **検索結果の深さの限界で閉じる設定（`close_on_repeated_page`、既定 false）**: 大きいセラーでは、あるページ数から先は同じページが返ると考えられます（約2,700件・約170ページ付近と推定。実ページでは未確認）。既定（false）では、保存済みのページの直後に同じ内容が返ると `REPEATED_PAGE` で一巡が BROKEN になり、先頭から同じASINを取り直します。`true` にすると、同じURLを**1回だけ**取り直して確認し、同じなら「限界」として、そこまでを保存して `SUCCESS_TRUNCATED`（`truncation_reason=DEPTH_LIMIT`、再開位置なし）で閉じます（取り直しで内容が変わっていれば、そのまま続けます）。しきい値（ページ数など）はありません。取り直しは日次のページ使用量に1ページとして数え、CAPTCHA・5xx・間隔の仕組みは他のページと同じです。設定は `config/workflow.json` のトップレベルに `"close_on_repeated_page": true`、`asin_collector.cli` の `collect-source` / `collect-next` では `--close-on-repeated-page`。詳細と制約は docs/DEVIATIONS.md #80。
 
+**価格帯分割（`partition.price_band`、既定は無効。JPのSELLER出典のみ）**: 大きいセラーで検索結果の深さの限界（上の `close_on_repeated_page`）に当たったとき、そこで閉じずに、価格帯で区切って取り直す機能です。一巡（セラー1件の全帯の走査）の中で、初期の帯（既定: 0・1,000・2,000・3,000・4,000・5,000・7,500・10,000・15,000・25,000・50,000円で区切った11帯）を安い順に1つずつ走査し、深さの限界を確認した帯**だけ**をその場で二分割します（親は`SPLIT`、子2つ、左の子から続行）。最小幅（既定100円）・最大深さ（既定8）で割れない帯は`TRUNCATED_MIN`として打ち切って次へ進みます。全帯が終われば一巡は`SUCCESS_NONEMPTY`・`COMPLETE`で完了し、打ち切った帯が1つでもあれば`completeness='TRUNCATED'`・`truncation_reason='BAND_MIN_WIDTH'`が付きます（投入計画の「一部のみ」の注記に出ます）。帯の状態はDB（`acquisition_band`）にあり、日次枠・Ctrl+C・lease喪失・プロセス死のどこで止まっても、次回は保存済みの帯・ページから続きます。
+- 設定（`config/workflow.json` に追記。`workflow.example.json` に例）: `"close_on_repeated_page": true` と `"partition": {"price_band": {"markets": ["JP"], "initial_edges_yen": [...], "min_width_yen": 100, "max_depth": 8, "treat_end_as_depth_limit_pages": null}}`。`markets` が空（既定）なら無効で、従来どおりに動きます。USを入れると設定エラー、`close_on_repeated_page`がtrueでなくてもエラーです。項目の無い保存済みのworkflowは無効として読みます。
+- `asin_collector.cli` の `collect-source` / `collect-next` では `--close-on-repeated-page --price-band`（初期の区切り・最小幅・最大深さは既定値。USでは使えません）。
+- 一巡の方式は開始時に決まり、途中で変わりません: 帯のある一巡は設定を外しても帯ありで続き、帯のない一巡は設定を有効にしても従来どおり最後まで進めます。
+- 日次のページ枠: 帯の切替・分割で取り直す子帯のページは通常のページとして数えます。繰り返しの検知と取り直しは1件につき2アクセスです。
+- `treat_end_as_depth_limit_pages` は今は`null`（使わない）。整数Nにすると、「次へ」が消えたN ページ以上の帯を深さの限界として扱います（実ページで限界が「同じページの繰り返し」ではなく「次へが消える」形だった場合の備え）。
+- 実ページでは未確認です（`p_36`の価格帯指定が検索結果に効くこと、「次へ」のURLに`p_36`が残ること、深さの限界の実際の形）。パソコンでの確認が要ります。詳細は docs/DEVIATIONS.md #83。
+
 # 探索と統合ツール登録の分離（2026-10-28）
 
 5,000件蓄積モードでは、同じ取得先市場・出典・業務方向・一巡の保存済みASINを

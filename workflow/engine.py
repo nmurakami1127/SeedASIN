@@ -329,7 +329,8 @@ class Engine:
         with self._fetcher(market, True) as fetcher:
             bf = self._budget(fetcher, rid, granted, task)
             items = run_batch(self.runs, self.factory, bf, market, [source_id], limits=RunLimits(max_pages=granted - d.overlap_pages,
-                                                               close_on_repeated_page=self.cfg.close_on_repeated_page),
+                                                               close_on_repeated_page=self.cfg.close_on_repeated_page,
+                                                               price_band=self.cfg.price_band_for(market)),
                               sleep=self.sleep)
         it = items[0]
         if it.result == "SKIPPED":
@@ -509,7 +510,8 @@ class Engine:
                                           "reason": f"本日(JST)のAmazon新規取得ページの上限（{self.cfg.daily.max_pages}）に達しています"}
                         continue
                     limits = RunLimits(max_pages=granted - overlap, max_asins=lim.max_asins_per_source,
-                                       close_on_repeated_page=self.cfg.close_on_repeated_page)
+                                       close_on_repeated_page=self.cfg.close_on_repeated_page,
+                                       price_band=self.cfg.price_band_for(market))
                     bf = self._budget(fetcher, rid, granted, t)
                     items = run_batch(self.runs, self.factory, bf, market, [sid], limits=limits, sleep=self.sleep)
                     it = items[0]

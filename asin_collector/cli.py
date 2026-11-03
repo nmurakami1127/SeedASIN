@@ -176,15 +176,27 @@ def _print_batch(items) -> None:
         held = " 【連続失敗により自動保留】" if r.auto_held else ""
         cyc = f" cycle={r.cycle_id}({r.plan})" if r.cycle_id is not None else ""
         done = " 一巡完了" if r.outcome in ("SUCCESS_NONEMPTY", "SUCCESS_EMPTY") else ""
+        if r.banded:
+            done += f" [価格帯: 分割{r.band_splits} 最小幅打切り{r.band_min_width} 空{r.band_empty}" + (f" 完全性={r.completeness}" if r.completeness else "") + "]"
         print(f"  source_id={it.source_id} run={r.run_id}{cyc}: {r.outcome}{done} ページ{r.pages} ASIN{r.asins}{extra}{held}"
               + (f" {r.detail}" if r.detail and r.outcome != "SUCCESS_NONEMPTY" else ""))
 
 
 def _limits(args: argparse.Namespace):
+    from acquisition.partition import PartitionConfig, PartitionError, validate_markets
     from asin_collector.source_runner import RunLimits
 
-    return RunLimits(max_pages=args.max_pages, max_asins=args.max_asins,
-                     close_on_repeated_page=getattr(args, "close_on_repeated_page", False))
+    close = getattr(args, "close_on_repeated_page", False)
+    band = None
+    if getattr(args, "price_band", False):
+        try:
+            validate_markets([args.market], "SELLER")  # USなど、価格帯分割が登録されていない市場は拒否
+        except PartitionError as exc:
+            raise SystemExit(f"[中止] --price-band: {exc}")
+        if not close:
+            raise SystemExit("[中止] --price-band には --close-on-repeated-page が必要です（帯の分割は繰り返しページの確認を使います）")
+        band = PartitionConfig()  # 初期の区切り・最小幅・最大深さは既定（変えたい場合は workflow の設定 partition.price_band）
+    return RunLimits(max_pages=args.max_pages, max_asins=args.max_asins, close_on_repeated_page=close, price_band=band)
 
 
 def _run_in_browser(factory: SessionFactory, marketplace: str, source_ids: list[int], args: argparse.Namespace) -> None:
@@ -368,6 +380,9 @@ def _add_run_options(sp: argparse.ArgumentParser) -> None:
                     help="保存済みのページの直後に同じ内容が返ったら、同じURLを1回だけ取り直して確認し、同じなら検索結果の深さの限界として"
                          "SUCCESS_TRUNCATED(DEPTH_LIMIT)・再開位置なしで閉じる（既定は従来どおり REPEATED_PAGE で一巡を BROKEN にする）。"
                          "取り直しは日次のページ使用量に1ページとして数える（docs/DEVIATIONS.md #80）")
+    sp.add_argument("--price-band", action="store_true",
+                    help="JP/SELLER の出典を価格帯ごとに走査し、深さの限界(DEPTH_LIMIT)を確認した帯だけを二分割する（既定は無効＝従来どおり）。"
+                         "--close-on-repeated-page が必要。USでは使えない。帯の状態はDBに保存され、中断しても続きから再開できる（docs/DEVIATIONS.md #83）")
     sp.add_argument("--require-delivery-match", action="store_true",
                     help="配送先表示が想定の郵便番号と確認できない場合は、claimせずに中止する（既定は警告のみ）")
 

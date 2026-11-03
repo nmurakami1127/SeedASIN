@@ -74,6 +74,9 @@ class PartitionConfig:
     initial_edges_yen: tuple[int, ...] = DEFAULT_INITIAL_EDGES_YEN
     min_width_yen: int = DEFAULT_MIN_WIDTH_YEN
     max_depth: int = DEFAULT_MAX_DEPTH
+    # null=使わない。整数Nのとき、帯の末尾（「次へ」が消えた）が N ページ以上の帯なら、検索結果の深さの限界(DEPTH_LIMIT)と同じに扱う
+    # （限界で「同じページの繰り返し」ではなく「次へが消える」形になる場合への備え。実ページでは未確認なので既定は使わない）
+    treat_end_as_depth_limit_pages: int | None = None
 
     def __post_init__(self) -> None:
         edges = tuple(self.initial_edges_yen)
@@ -88,6 +91,9 @@ class PartitionConfig:
             raise PartitionError("min_width_yen は1以上")
         if self.max_depth < 0:
             raise PartitionError("max_depth は0以上")
+        n = self.treat_end_as_depth_limit_pages
+        if n is not None and (isinstance(n, bool) or not isinstance(n, int) or n < 1):
+            raise PartitionError("treat_end_as_depth_limit_pages は1以上の整数またはnull")
 
     @property
     def min_width(self) -> int:

@@ -10,6 +10,10 @@ import json
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
+from acquisition.partition import (
+    DEFAULT_INITIAL_EDGES_YEN, DEFAULT_MAX_DEPTH, DEFAULT_MIN_WIDTH_YEN, PartitionConfig, PartitionError, validate_markets,
+)
+
 MARKETS = ("US", "JP")
 OPPOSITE = {"US": "JP", "JP": "US"}
 ROUTES = ("SELLER", "BRAND")
@@ -85,6 +89,22 @@ class Cross:
 
 
 @dataclass
+class PriceBand:
+    """価格帯分割（docs/DEVIATIONS.md #83）。markets に書いた**取得先市場**のSELLER出典の一巡だけを、価格帯ごとに走査する。既定は空（無効）。
+    使えるのはJPのみ（USは検証で拒否）。close_on_repeated_page=true が前提。"""
+    markets: list[str] = field(default_factory=list)
+    initial_edges_yen: list[int] = field(default_factory=lambda: list(DEFAULT_INITIAL_EDGES_YEN))
+    min_width_yen: int = DEFAULT_MIN_WIDTH_YEN
+    max_depth: int = DEFAULT_MAX_DEPTH
+    treat_end_as_depth_limit_pages: int | None = None  # 今は使わない（null）。整数Nなら、「次へ」が消えたN ページ以上の帯を深さの限界として扱う
+
+
+@dataclass
+class Partition:
+    price_band: PriceBand = field(default_factory=PriceBand)
+
+
+@dataclass
 class WorkflowConfig:
     lanes: dict[str, Lane]
     limits: Limits = field(default_factory=Limits)
@@ -107,6 +127,7 @@ class WorkflowConfig:
     tool_session_monitor: bool = False  # ログインの定期監視・維持アクセスは明示的に有効化した場合だけ
     close_on_repeated_page: bool = False  # true=保存済みのページの直後に同じ内容が返ったら、1回取り直して確認し、同じなら検索結果の深さの限界として
     #                                      SUCCESS_TRUNCATED(DEPTH_LIMIT)・再開位置なしで閉じる。false=従来どおり（REPEATED_PAGEで一巡をBROKENにする）。docs/DEVIATIONS.md #80
+    partition: Partition = field(default_factory=Partition)  # 価格帯分割（既定は無効）。docs/DEVIATIONS.md #83
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -125,10 +146,36 @@ class WorkflowConfig:
     def page_market(self, lane: str) -> str:
         return self.lanes[lane].page_market or lane
 
+    def price_band_for(self, market: str) -> PartitionConfig | None:
+        """取得先市場 market の出典の取得に使う価格帯の設定。無効（その市場が markets に無い）なら None。"""
+        pb = self.partition.price_band
+        if market not in pb.markets:
+            return None
+        return PartitionConfig(tuple(pb.initial_edges_yen), pb.min_width_yen, pb.max_depth, pb.treat_end_as_depth_limit_pages)
+
+    def _validate_partition(self) -> None:
+        pb = self.partition.price_band
+        if not isinstance(pb.markets, list) or any(not isinstance(m, str) for m in pb.markets):
+            raise ConfigError("partition.price_band.markets は市場名（\"JP\"）のリストで指定してください")
+        if not isinstance(pb.initial_edges_yen, list) or any(isinstance(e, bool) or not isinstance(e, int) for e in pb.initial_edges_yen):
+            raise ConfigError("partition.price_band.initial_edges_yen は整数（円）のリストで指定してください")
+        for name in ("min_width_yen", "max_depth"):
+            v = getattr(pb, name)
+            if isinstance(v, bool) or not isinstance(v, int):
+                raise ConfigError(f"partition.price_band.{name} は整数で指定してください（指定: {v!r}）")
+        try:
+            validate_markets(pb.markets, "SELLER")  # USなど、価格帯分割が登録されていない市場は拒否
+            PartitionConfig(tuple(pb.initial_edges_yen), pb.min_width_yen, pb.max_depth, pb.treat_end_as_depth_limit_pages)
+        except PartitionError as exc:
+            raise ConfigError(f"partition.price_band: {exc}") from exc
+        if pb.markets and self.close_on_repeated_page is not True:
+            raise ConfigError("partition.price_band を使うには close_on_repeated_page=true が必要です（帯の分割は繰り返しページの確認を使います）")
+
     def validate(self) -> "WorkflowConfig":
         for name in ("submission_enabled", "tool_session_monitor", "close_on_repeated_page"):
             if not isinstance(getattr(self, name), bool):
                 raise ConfigError(f"{name} はtrue/falseで指定してください")
+        self._validate_partition()
         if not self.lanes:
             raise ConfigError("lanes（市場ごとの起点レポート）が空です")
         for m, ln in self.lanes.items():
@@ -182,12 +229,33 @@ class WorkflowConfig:
         return self
 
 
+def _partition_from_dict(raw) -> Partition:
+    if raw is None:
+        return Partition()
+    if not isinstance(raw, dict):
+        raise ConfigError("partition はオブジェクトで指定してください")
+    raw = {k: v for k, v in raw.items() if not k.startswith("_")}
+    unknown = set(raw) - {"price_band"}
+    if unknown:
+        raise ConfigError(f"partition に未知の項目があります: {sorted(unknown)}")
+    pb = raw.get("price_band")
+    if pb is None:
+        return Partition()
+    if not isinstance(pb, dict):
+        raise ConfigError("partition.price_band はオブジェクトで指定してください")
+    try:
+        return Partition(price_band=PriceBand(**{k: v for k, v in pb.items() if not k.startswith("_")}))
+    except TypeError as exc:
+        raise ConfigError(f"partition.price_band に未知の項目があります: {exc}") from exc
+
+
 def config_from_dict(d: dict) -> WorkflowConfig:
     d = {k: v for k, v in d.items() if not k.startswith("_")}  # "_comment" など説明用のキーは無視する
     try:
         lanes = {m: Lane(**v) for m, v in (d.get("lanes") or {}).items()}
         cfg = WorkflowConfig(
             lanes=lanes, limits=Limits(**d.get("limits", {})), totals=Totals(**d.get("totals", {})), cross=Cross(**d.get("cross", {})),
+            partition=_partition_from_dict(d.get("partition")),
             daily=Daily(**d.get("daily", {})), watch=Watch(**d.get("watch", {})), stall=Stall(**d.get("stall", {})),
             **{k: d[k] for k in ("brand_enabled", "tool_max_asins", "result_max_age_days", "state_dir", "submission_dir",
                                  "page_revisit_days", "profile", "listing_feedback", "skip_failures", "batch_target_asins",
