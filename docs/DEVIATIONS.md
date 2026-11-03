@@ -1529,3 +1529,77 @@ Amazonのナビゲーションはdomcontentloadedで待機し、第三者リソ�
 
 ### テスト
 `tests/unit/test_hold_recovery.py`（自動／意図的の分類・バーストの境界・設定・上限の境界・各条件の候補判定・表示）、`tests/integration/test_hold_recovery.py`（実PostgreSQL。意図的な保留が要解除から除外／バーストの警告／OPEN・lease・MANUAL・セラー側・US価格帯・冷却・バースト・要人手確認・上限・`--limit`／ドライランの前後で全表のハッシュと行数が同じ／読み取り専用接続が書き込みを拒否／市場ごとの失敗の隔離／CLI）、`tests/integration/test_workflow_watch.py`（表示する解除コマンドが実在のサブコマンドとして解釈できる）。**未検証**: 実DB・実運用データでの判定結果。
+
+## 86. 自動解除の実行（`recovery-run`）と監査記録 `AUTO_RELEASE`（alembic 0020）（2026-11-03）
+
+利用者承認済みの方針（P3）。#84のドライランが「候補」と判定した自動保留を、**既定では実行しない**自動解除の経路で解除できるようにした。**本番DBへの適用・本番設定の変更・watchへの組み込みはしていない**（コードとテストのみ）。`acquisition/`・`asin_collector/`・`workflow/watch.py`は変更していない。
+
+### DB変更（alembic 0020、本番には未適用）
+- 変更はこの1つだけ: `acquisition_source_event.ck_ase_type`（CHECK制約）の許可する `event_type` に `'AUTO_RELEASE'`（12文字。列は `VARCHAR(14)` のまま収まる）を追加する（`DROP CONSTRAINT IF EXISTS` → `ADD CONSTRAINT`。冪等）。列・索引・RLS・GRANT/REVOKE・トリガー・他の表は変更しない。既存行は変更しない（許可する値が増えるだけ）。
+- **追記専用ルール（CLAUDE.md 3）は変更しない**: 0016のとおり `acquisition_source_event` は `app_role` に `SELECT, INSERT` のみ（`REVOKE UPDATE, DELETE`）。`tests/integration/test_auto_release.py::test_migration_0020_*` が、0020の適用後も `app_role` が UPDATE/DELETE できないこと（`has_table_privilege` と実際の失敗）を確認する。RLSも0016のポリシーのまま（別の市場の接続からAUTO_RELEASEは見えない）。
+- **downgradeの方針**: `AUTO_RELEASE` の行が1件でもあれば**中止して何も変更しない**（0019のdowngradeが、途中の帯が残るとき中止するのと同じ流儀）。理由: このテーブルは追記専用なので、記録を `'RELEASE'` に読み替える（UPDATE）・消す（DELETE）には `app_role` の権限を超える操作が要り、監査記録の改ざんになる。また「30日で2回」の上限の根拠（件数）が失われ、再発判定（#88）の根拠も消える。AUTO_RELEASEが無いときだけ、制約を0016の元の6種類へ戻す。テスト: upgrade → downgrade（記録ありで中止・状態不変）→ 記録を退避して削除 → downgrade → AUTO_RELEASEが拒否される → 再upgrade → 書ける、を実PostgreSQLで確認。
+- テスト基盤: `tests/integration/conftest.py` に、テスト専用DBのAUTO_RELEASE行を `downgrade base` の前にsuperuserで消す処理を追加（`_clear_price_bands` と同じ理由）。headのバージョン断言（`0019`→`0020`）を `test_acquisition_schema.py`・`test_migration_0014.py` で更新。
+
+### AUTO_RELEASE の記録（`workflow/auto_release.py`）
+- `actor='system:auto-recovery'`（人の解除は利用者名。区別できる）。`occurred_at` は `clock_timestamp()`。`detail` はJSON: `cause_code`・`evidence_run_id`（根拠にした失敗run）・`evidence_run_completed_at`・`failure_codes_since_hold`・`cycle_state`・`cursor_present`・`cycle_has_pages`・`asin_count`・`candidate_class`（`PRICE_BAND_REPEATED_PAGE`／`RETRY_PAGE_LOAD`／`RESUME_OPEN`）・`burst_free`／`burst_codes_checked`／`burst_window_hours`／`burst_min_sources`（バースト無しの確認）・`auto_releases_in_window_before`／`_after`（30日内の自動解除回数）・`max_auto_releases`・`window_days`・`cooldown_hours`・`prior_status`／`prior_hold_reason`・`summary`（日本語の一文）。
+- #84のP2の暫定（`RELEASE`＋`actor='system'` を数える）は `AUTO_RELEASE` を数える実装に差し替えた（`count_recent_auto_releases`）。人の `RELEASE` は数えない。`release_count`（表示用の総数）は `RELEASE` と `AUTO_RELEASE` の合計。
+
+### 実行経路 `python -m workflow.cli recovery-run --config ... --market JP|US [--limit N] [--apply] [--out run.json]`
+- **3つの状態**: (1) `--apply` なし → ドライラン／(2) `--apply` あり・`recovery.auto_release.enabled=false`（**既定**）→ 同じくドライラン／(3) 両方そろったときだけ解除。(1)(2)は読み取り専用接続（`SET TRANSACTION READ ONLY`）で判定し、書き込み用の接続を開かない。表示は `recovery-plan` と同じ候補・対象外の行（先頭の説明行だけ異なり、(2)は「enabled が false のため解除しません」と明示）。テストで3状態の全表ハッシュ前後比較（(1)(2)は不変、(3)は変化）と、表示本体が(1)(2)で同一であることを確認。
+- 設定（`workflow/config.py`）: `recovery.auto_release.enabled`（既定false。bool厳密）・`recovery.auto_release.max_per_run`（既定3。0〜100）。解除件数の上限は `max_per_run` と `--limit` の小さい方。`--market` 必須（US/JPは別の実行。市場ごとに別接続で、一方の失敗は他方を止めない）。
+- 解除の直前に、**1出典ごとに1トランザクション**で: 識別ロック → `acquisition_source` を `FOR UPDATE`（claim・手動の保留/解除と同じロック順序なので、watch・手動取得とは直列化される）→ **ロックの下で再判定**（`evaluate()`、ドライランと同じ判定。ドライラン時点の判定は信用しない）→ 候補のままなら解除のUPDATEとAUTO_RELEASEのINSERTを**同一トランザクション**で実行。候補でなくなっていれば何もせず理由を報告（`NOT_HELD`＝すでに自動保留でない＝二重解除しない、`LEASE_ACTIVE`、`BURST_DEFERRED`、`RECOVERY_LIMIT_REACHED`、意図的な保留の各コードなど）。例外はその出典だけを `ERROR` として報告し、その出典の変更は巻き戻る。他の出典は続行。終了コード: 0=正常／3=出典単位の失敗あり／2=設定・市場単位の失敗。
+- **既存の `release-hold`（`SourceRegistry.release`）は再利用できなかった**: 自前のトランザクションを開くため、解除とAUTO_RELEASEを同一トランザクションにできない。`acquisition/`は変更禁止なので、**同等のSQL**を `workflow/auto_release.py::_apply_release` に持つ（ON_HOLD → `status='ACTIVE'`・`hold_reason/hold_detail/held_at=NULL`・`failure_streak_reset_at=clock_timestamp()`。ACTIVEのままCYCLE_RESTART_LIMITは `failure_streak_reset_at` のみ）。`test_jp_repeated_page_hold_is_recovered_like_a_manual_release_*` が、同じ状態の2出典を片方は `registry.release`、片方は自動解除した結果の行（status・hold項目・間隔）と取得の判定（`ELIGIBLE_RESTART`／`RESTART_BROKEN`）が同じになることを確認する。**将来 `registry.release` の内部が変わったら、この同等SQLの追従が必要**（結合テストが検出する）。
+- 解除されないもの（テストで確認）: 意図的な保留（MANUAL）・除外・セラー側の `COMPETITOR_SAME_SERVICE`／`RETRY_LATER`／`PERMANENTLY_EXCLUDED`（これらは自動保留でもあっても人の記録を優先）／実行中のlease／バースト中のPAGE_LOAD_FAILED／30日で2回に達した出典／再発した出典（#88）／USの `REPEATED_PAGE`（USは `partition.price_band.markets` に書くと設定の検証で拒否される＝価格帯分割を有効化できない。この変更でも有効化していない）。
+- 並行実行: 4スレッドで同じ出典を同時に解除しようとして、解除1件・見送り3件・AUTO_RELEASE 1件になることを確認（識別ロックによる直列化＋再判定）。
+- **ロックに参加しない読み取り**: `storefront_blocked_seller` は既存の更新経路が識別ロックに参加しないため、再判定と同時にコミットされた更新は反映されない可能性がある（`acquisition/locks.py` に既述の既存の制約。ここで悪化させていない）。
+
+### 本番適用手順（案。未実施。利用者の承認と実行が必要）
+1. 本番DBをバックアップ（`pg_dump`）。watch・手動取得を止める。
+2. `git pull` → `alembic upgrade head`（0020。制約1つの付け替えのみ）。`alembic current` が `0020`。
+3. `python -m workflow.cli recovery-plan --config ... --market JP` / `US` で候補を目視（読み取りのみ）。続けて `recovery-run`（`--apply` なし）で同じ表示を確認。
+4. 設定で `recovery.auto_release.enabled` を true にするのは利用者の判断。最初は `--limit 1` で `--apply` を1回だけ実行し、`AUTO_RELEASE` の `detail` と出典の状態を確認する。
+5. watchを再開。watchへの組み込みは行わない（#88の案を承認するまで）。
+
+### ロールバック手順
+- 運用上の停止: `recovery.auto_release.enabled` を false（または項目を削除）に戻す。`--apply` を付けなければ何も解除されない。
+- 個別の解除を取り消す: `python -m acquisition.cli hold-source --market <US|JP> --source-id <ID> --reason ...`（手動保留に戻す。`AUTO_RELEASE` の記録は監査として残る）。
+- コードを戻す: 本ブランチのコミットを戻す。`AUTO_RELEASE` の行がDBにあるうちは0020をdowngradeできない（上記）。行を `pg_dump` で退避し、人が確認したうえで削除してから `alembic downgrade 0019`。
+
+### 未確認・限界
+- 実DB・実運用データ・実際のAmazon上での挙動は未確認（テストの疑似サイトで再現した範囲のみ）。実際に解除した後の取得が成功するか、再び同じ原因で保留されるかは、実運用で見るしかない（再発時は #88 により自動解除が止まる）。
+- 実PostgreSQLの結合テストは、使い捨てのローカルPostgreSQL 16（DB名 seedasin_test）で実行した。
+
+## 87. OPENな一巡の `PAGE_LOAD_FAILED` を、一巡を閉じずに再開する（候補区分 `RESUME_OPEN`）（2026-11-03）
+
+#84のP3への申し送り（「OPENのまま解除して続き(CONTINUE)から再開するのは安全に見えるが、別承認が必要」）に対する検討と実装。**一巡・再開位置・取得結果を破棄する操作（一巡を閉じる／BROKENにする／next_url・next_page_noを消す／ASINを消す）は存在しない。**
+
+### 事実: 解除後に何が起きるか（`acquisition/eligibility.py::decide` / `resolve_cycle` の読み、および結合テストで確認）
+- `release-hold`（と同等の自動解除）が更新するのは `acquisition_source` だけ（`status`・hold項目・`failure_streak_reset_at`）。`collector_run`（一巡・位置）と`collector_asin`には触れない（結合テストで `collector_run`／`collector_asin` の全行・全列のハッシュが解除の前後で同じことを確認）。
+- 解除後の `decide()`: 保留のblockerが消え、連続失敗は `failure_streak_reset_at` 以前の失敗を数えないので `COOLDOWN` も出ない。OPEN一巡で保存済みページがあれば `plan='CONTINUE'`、`state='ELIGIBLE_CONTINUATION'`（`TOO_RECENT` は継続には適用されない）。結合テストで `decide()` がこの値になること、`cycle.cycle_id` が解除前と同じ・状態がOPENのまま・`resume_url` が解除前に保存した位置と一致することを確認。
+- さらに実際に次のrunを走らせると、**同じ一巡**（`cycle_id` 同じ）で、重なり確認の1ページ（直前の最後のページ）の次から続けて取得し（テストでは取得したページが 2→3→4。1ページ目などは取り直さない）、取得済みASIN（6件）に新しい分が足されて12件になる（重複なし）。
+- **再開位置の持ち方（事実）**: 再開位置（`next_url`/`next_page_no`）を持つのは「最後にページを保存したrun」。保存前にネットワーク障害で失敗したrunは1ページも保存しないので `next_url` はNULLで、代わりに `start_url`（claim時に直前の再開位置をコピー。`acquisition/lease.py`）に位置が残る。`resolve_cycle` の `resume_url = last.next_url or last.start_url` がそれを解決する。したがって「再開位置が残っているか」は**最後のrunの `next_url` ではなく `resolve_cycle` の `resume_url`**で判定する（最初の実装は最後のrunの`next_url`を見て、PAGE_LOAD_FAILEDで失敗したOPEN一巡が全て『再開位置なし』になる誤りがあった。結合テストで発見・修正）。
+- 放置期限（`cycle_max_age_days`、既定14日）を過ぎたOPEN（`EXPIRED`）は解除すると `RESTART_EXPIRED`（先頭から取り直し）になり保存済みの位置を捨てるため、**対象外**。末尾到達（`END_REACHED`、終了確定が必要）も対象外。
+
+### 候補区分 `RESUME_OPEN` の条件（全部満たす場合だけ。`workflow/hold_recovery.py::_judge_resume_open`）
+自動保留／lease無し／一巡がOPEN（放置期限内）／`resume_url` が残り保存済みページがある／保留以降の失敗（最後の成功または解除以後の `status=FAILED` のrun）の `error_code` が**全て** `PAGE_LOAD_FAILED`／バースト中でない／最後の失敗から `recovery.cooldown_hours`（既定24。ちょうどで可）／30日で2回の上限内／前回の自動解除の後に同じ原因で再発していない。
+再開できない場合は保留のまま、人が読める日本語の理由を表示（ドライランと `recovery-run` の両方）: `OPEN_NO_CURSOR`（再開位置または保存済みページが無い）／`OPEN_MIXED_FAILURES`（保留以降の失敗にPAGE_LOAD_FAILED以外・原因不明が含まれる、または根拠の失敗が見つからない）／`OPEN_CYCLE`（OPENだが原因がPAGE_LOAD_FAILEDでない、末尾到達済み、放置期限切れ。各々の説明つき）／`BURST_DEFERRED`／`COOLDOWN_PENDING`（候補になる時刻つき）／`RECOVERY_LIMIT_REACHED`。
+環境障害の疑い（バースト）の間は再試行を抑制する: ドライランで候補にせず、`--apply` でも解除直前の再判定で拒否する（計画の後にバーストが起きた場合もテストで確認）。バーストは #84 と同じ検知（`stall.burst_window_hours`/`burst_min_sources`）。
+
+### 既存の判定の変更
+- 原因がPAGE_LOAD_FAILEDで一巡がBROKENまたは一巡なしの出典（#84の`RETRY_PAGE_LOAD`相当）、REPEATED_PAGE（JP/SELLER/価格帯分割有効）の判定は変えていない。OPEN一巡の`PAGE_LOAD_FAILED`だけが、`OPEN_CYCLE`（常に対象外）から上記の判定に変わった。`tests/unit/test_hold_recovery.py` の『OPENは常に対象外』のテストを、END_REACHED/EXPIRED/原因が別のOPENは対象外のまま、OPEN＋PAGE_LOAD_FAILEDは条件次第、に更新した。
+- 実Amazonでの挙動（ネットワーク障害が収まった後に続きが取れるか）は未確認。
+
+## 88. 解除後の再発で自動解除を止める／watch組み込みの設計案（未実装）（2026-11-03）
+
+### 再発（`RECURRED_AFTER_AUTO_RELEASE`）
+- 自動解除した出典が、解除の**後**に**同じ原因コード**で異常終了（`status=FAILED` で `error_code` が同じ、または一巡がBROKENで `cursor_error`/`error_code` が同じ）したら、以後その出典は自動解除の対象外（`find_recurrence`。純粋関数）。再保留は既存の自動保留の仕組みに任せ、判定側で「前回の自動解除（日時・原因）の後、runNが…で異常終了 → 要人手確認」と表示する。解除時刻ちょうどの失敗は『後』ではない。解除時の原因が読めない（`detail` のJSONが壊れている等）場合は、解除後のあらゆる異常終了を再発として扱う（安全側）。**一度再発した出典は、人が手動で解除した後でも自動解除に戻らない**（過去の自動解除の記録は残るため）。解除後の失敗が別の原因なら再発ではない。
+- この判定は `lease` の次、OPEN一巡・原因別の判定より前で行うので、RESUME_OPENでもREPEATED_PAGEでも同じ。30日で2回の上限とは別の歯止め（上限は再発が無くても効く）。
+
+### watchへの組み込み設計案（**実装していない。承認が出るまで組み込まない**）
+- 組み込む場合は `workflow/watch.py` の確認サイクル（停止の兆候の確認 `stall`、#79/#84）の直後に、市場ごとに `run_market(factory, market, cfg, apply=True, limit=<小さい値>)` を呼ぶ形が最小。ただし次の条件を満たす設計を提案する: (1) `recovery.auto_release.enabled` を二重のスイッチにする（今の`--apply`相当を、`recovery.auto_release.watch_enabled` のような別の既定false設定にして、手動実行用の`enabled`とは分ける）。(2) watchが取得中の市場では実行しない（lease・`engine_lock` を尊重。同じ市場の取得と同時に走らせない）。(3) 1サイクルの解除は1件まで、1日の解除は`max_per_run`まで（日次上限は`daily_usage`と同様に再起動で消えない形で持つ）。(4) 解除ごとにターミナル通知と`watch_status.json`へ記録し、`notify_minutes`で間引く。(5) 失敗・バースト検知時は通知のみで解除しない。(6) 解除したrunの結果を次の確認で見て、再発（本項）なら要人手の警告に載せる。
+- 組み込まない理由: 取得中の出典と解除の競合・日次上限との関係・通知の形は、運用してみないと妥当性が判断できない。まず `recovery-run` を人が実行して挙動を観察するのが安全。
+
+### 申し送り・未解決
+- `engine.py` の `needs_release`（意図的な保留も含めて要解除と表示）は変えていない（#84から継続）。
+- 連続失敗が環境障害の間にも数えられて3回で自動保留になる根本対策（バーストの間は失敗を数えない）は `acquisition/` の変更なので未実施。この変更は『保留になったあと安全に戻す』ことだけを扱う。
+- 実運用で自動解除した後、同じ原因で再び保留になる頻度は未確認。
