@@ -4,6 +4,7 @@
     python -m workflow.cli plan   --config config/workflow.json           # 外部アクセス・DB更新なし。対象・予定・上限を表示
     python -m workflow.cli run    --config config/workflow.json           # 計画に従って実行（人の操作が必要な所で待機/保留）
     python -m workflow.cli recovery-plan --config config/workflow.json [--market JP|US] [--limit N] [--out plan.json]   # 自動保留の復旧候補（ドライラン・読み取り専用）
+    python -m workflow.cli recovery-run  --config config/workflow.json --market JP|US [--limit N] [--apply] [--out run.json]   # 自動保留の自動解除（既定はドライラン。--apply かつ recovery.auto_release.enabled=true のときだけ解除）
     python -m workflow.cli status [--id wf-…]                             # 工程別の完了・待機・保留・失敗・結果不明
     python -m workflow.cli resume [--id wf-…] [--allow-duplicate <投入キー>]   # 保存済み状態から再開（完了工程は繰り返さない）
     python -m workflow.cli backup  --out backups/wf.zip                    # workflow状態・投入台帳・マニフェストをまとめて保存
@@ -316,6 +317,26 @@ def _cmd_recovery_plan(a, factory=None, **_) -> int:
     return 2 if any(p.error for p in plans.values()) else 0
 
 
+def _cmd_recovery_run(a, factory=None, **_) -> int:
+    """自動保留の自動解除（workflow/auto_release.py）。`--apply` と 設定 recovery.auto_release.enabled=true が両方そろったときだけDBを更新する。
+    それ以外は recovery-plan と同じ判定のドライラン（読み取り専用）。watchには組み込まれていない。"""
+    from workflow.auto_release import format_runs, has_failures, run_markets
+
+    cfg = load_config(a.config)
+    if a.limit is not None and a.limit < 1:
+        print("[中止] --limit は1以上を指定してください")
+        return 2
+    runs = run_markets(factory or _factory(), [a.market], cfg, apply=a.apply, limit=a.limit)
+    print("\n".join(format_runs(runs, limit=a.limit)))
+    if a.out:
+        Path(a.out).parent.mkdir(parents=True, exist_ok=True)
+        Path(a.out).write_text(json.dumps({m: r.to_dict() for m, r in runs.items()}, ensure_ascii=False, indent=2), encoding="utf-8")
+        print(f"\nJSONを書きました: {a.out}")
+    if any(r.error for r in runs.values()):
+        return 2
+    return 3 if has_failures(runs) else 0
+
+
 def _cmd_status(a, **_) -> int:
     from workflow.daily_usage import DailyUsage
     from workflow.planning import usage_lines
@@ -385,6 +406,12 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--config", default="config/workflow.json")
     sp.add_argument("--market", choices=list(MARKETS), default=None, help="省略すると両市場")
     sp.add_argument("--limit", type=int, default=None, help="候補として表示する最大件数（市場ごと）")
+    sp.add_argument("--out", default=None, help="結果をJSONでも書き出す先")
+    sp = add("recovery-run", _cmd_recovery_run, "自動保留の自動解除（既定はドライラン。--apply かつ recovery.auto_release.enabled=true のときだけ解除）")
+    sp.add_argument("--config", default="config/workflow.json")
+    sp.add_argument("--market", choices=list(MARKETS), required=True, help="市場ごとに実行する（US/JPは別の実行）")
+    sp.add_argument("--limit", type=int, default=None, help="今回解除する最大件数（recovery.auto_release.max_per_run との小さい方）")
+    sp.add_argument("--apply", action="store_true", help="実際に解除する（設定 recovery.auto_release.enabled=true も必要。どちらかが欠ければドライラン）")
     sp.add_argument("--out", default=None, help="結果をJSONでも書き出す先")
     sp = add("status", _cmd_status, "工程別の状態")
     sp.add_argument("--id", default=None)

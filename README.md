@@ -339,6 +339,16 @@ python -m workflow.cli recovery-plan --config config/workflow.json [--market JP|
 - 原因別: `REPEATED_PAGE` はJPのSELLERで `partition.price_band` が有効なときだけ候補（USは未検証のため常に対象外 `US_PRICE_BAND_UNVERIFIED`）。`PAGE_LOAD_FAILED` はバースト中でなく、最後の失敗から `recovery.cooldown_hours`（既定24）時間が過ぎていれば候補。`OVERLAP_MISMATCH` などその他のコード・原因不明は「要人手確認」で対象外。
 - 出力: 市場ごとの対象件数・候補・対象外の理由別の内訳と、出典ごとの直近run・一巡の状態・保留理由・error_code・取得済みASIN数・解除回数。`--limit` は候補として表示する最大件数（市場ごと。総数は残る）。
 - 設定は `config/workflow.json` の `recovery`（`cooldown_hours`・`max_auto_releases`・`window_days`）と `stall`（`burst_window_hours`・`burst_min_sources`）。省略すれば既定値。
+- OPENな一巡の `PAGE_LOAD_FAILED` は、再開位置と保存済みページが残り、保留以降の失敗が全て `PAGE_LOAD_FAILED`、バースト中でなく、冷却期間が過ぎていれば候補区分 `RESUME_OPEN`（一巡を閉じずに解除して続きから再開）。再開できないときは保留のまま、理由を日本語で表示（docs/DEVIATIONS.md #86・#87）。
+
+**自動保留の自動解除 `recovery-run`（既定はドライラン。docs/DEVIATIONS.md #86）**: 上の候補を、安全条件を**解除の直前にロックの下で再判定**したうえで解除する。解除と監査記録（`acquisition_source_event` の `AUTO_RELEASE`、実行者 `system:auto-recovery`）は同一トランザクション。**watchの自動実行には組み込まれていない**（人が実行したときだけ動く）。Amazonにはアクセスしない。**使うにはマイグレーション0020が必要**。
+```
+python -m workflow.cli recovery-run --config config/workflow.json --market JP|US [--limit N] [--apply] [--out exports/recovery_run.json]
+```
+- 3つの状態: (1) `--apply` なし → ドライラン（`recovery-plan` と同じ判定・表示。DBは更新しない）／(2) `--apply` あり・設定 `recovery.auto_release.enabled` が false（既定）→ 同じくドライラン（DBは更新しない）／(3) `--apply` あり・`enabled` が true → 再判定に通った候補だけを、古い失敗の順に上限件数まで解除。
+- 1回の解除件数の上限は `recovery.auto_release.max_per_run`（既定3）と `--limit` の小さい方。市場ごとに別の実行（`--market` 必須）。1出典の失敗は他の出典を止めず（その出典の変更は巻き戻る）、終了コードは 0=正常／3=出典単位の失敗あり／2=設定・市場単位の失敗。
+- 解除されない: 意図的な保留・除外・セラー側の記録（`COMPETITOR_SAME_SERVICE`／`RETRY_LATER`／`PERMANENTLY_EXCLUDED`）、実行中のlease、バースト中の `PAGE_LOAD_FAILED`、30日で2回に達した出典、前回の自動解除の後に同じ原因で再発した出典（以後は要人手確認）、USの `REPEATED_PAGE`、再開できないOPEN一巡。OPEN一巡の再開（`RESUME_OPEN`）でも `collector_run`／`collector_asin` には一切書き込まない。
+- 設定例: `"recovery": {"auto_release": {"enabled": true, "max_per_run": 3}}`
 
 **出典ごとの新規ASIN率**（読み取り専用。USとJPは別々に実行）:
 

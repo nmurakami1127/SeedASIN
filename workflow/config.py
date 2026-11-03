@@ -85,11 +85,20 @@ class Stall:
 
 
 @dataclass
+class AutoRelease:
+    """自動解除の実行（`workflow.cli recovery-run --apply`。docs/DEVIATIONS.md #86）。**既定は無効**。enabled=true かつ --apply のときだけ解除する。
+    watchの自動実行ループには組み込まれていない（設定を有効にしても、人が recovery-run を実行しない限り何も解除しない）。"""
+    enabled: bool = False
+    max_per_run: int = 3               # 1回の recovery-run で解除する最大件数（--limit との小さい方）
+
+
+@dataclass
 class Recovery:
-    """自動保留の復旧候補の判定（読み取り専用のドライラン。workflow/hold_recovery.py、docs/DEVIATIONS.md #84）。今は何も解除しない。"""
+    """自動保留の復旧候補の判定（ドライラン。workflow/hold_recovery.py、docs/DEVIATIONS.md #84）と、その自動解除の設定（#86。既定は無効）。"""
     cooldown_hours: int = 24           # PAGE_LOAD_FAILEDで止まった出典を、最後の失敗からこの時間は候補にしない
     max_auto_releases: int = 2         # 同じ出典の過去の自動復旧がこの回数に達していたら候補にしない（window_days日以内）
     window_days: int = 30
+    auto_release: AutoRelease = field(default_factory=AutoRelease)
 
 
 @dataclass
@@ -231,6 +240,11 @@ class WorkflowConfig:
             v = getattr(self.recovery, name)
             if isinstance(v, bool) or not isinstance(v, int) or not lo <= v <= hi:
                 raise ConfigError(f"recovery.{name} は{lo}〜{hi}の整数で指定してください（指定: {v!r}）")
+        ar = self.recovery.auto_release
+        if not isinstance(ar.enabled, bool):
+            raise ConfigError(f"recovery.auto_release.enabled はtrue/falseで指定してください（指定: {ar.enabled!r}）")
+        if isinstance(ar.max_per_run, bool) or not isinstance(ar.max_per_run, int) or not 0 <= ar.max_per_run <= 100:
+            raise ConfigError(f"recovery.auto_release.max_per_run は0〜100の整数で指定してください（指定: {ar.max_per_run!r}）")
         if not isinstance(self.page_revisit_days, int) or not 1 <= self.page_revisit_days <= 365:
             raise ConfigError("page_revisit_days は1〜365")
         mn = self.totals.max_new_submissions_per_direction
@@ -265,6 +279,25 @@ def _partition_from_dict(raw) -> Partition:
         raise ConfigError(f"partition.price_band に未知の項目があります: {exc}") from exc
 
 
+def _recovery_from_dict(raw) -> Recovery:
+    if raw is None:
+        return Recovery()
+    if not isinstance(raw, dict):
+        raise ConfigError("recovery はオブジェクトで指定してください")
+    raw = {k: v for k, v in raw.items() if not k.startswith("_")}
+    ar = raw.pop("auto_release", None)
+    if ar is None:
+        auto = AutoRelease()
+    elif isinstance(ar, dict):
+        try:
+            auto = AutoRelease(**{k: v for k, v in ar.items() if not k.startswith("_")})
+        except TypeError as exc:
+            raise ConfigError(f"recovery.auto_release に未知の項目があります: {exc}") from exc
+    else:
+        raise ConfigError("recovery.auto_release はオブジェクトで指定してください")
+    return Recovery(auto_release=auto, **raw)
+
+
 def config_from_dict(d: dict) -> WorkflowConfig:
     d = {k: v for k, v in d.items() if not k.startswith("_")}  # "_comment" など説明用のキーは無視する
     try:
@@ -273,7 +306,7 @@ def config_from_dict(d: dict) -> WorkflowConfig:
             lanes=lanes, limits=Limits(**d.get("limits", {})), totals=Totals(**d.get("totals", {})), cross=Cross(**d.get("cross", {})),
             partition=_partition_from_dict(d.get("partition")),
             daily=Daily(**d.get("daily", {})), watch=Watch(**d.get("watch", {})), stall=Stall(**d.get("stall", {})),
-            recovery=Recovery(**d.get("recovery", {})),
+            recovery=_recovery_from_dict(d.get("recovery")),
             **{k: d[k] for k in ("brand_enabled", "tool_max_asins", "result_max_age_days", "state_dir", "submission_dir",
                                  "page_revisit_days", "profile", "listing_feedback", "skip_failures", "batch_target_asins",
                                  "submission_enabled", "tool_session_monitor", "close_on_repeated_page") if k in d},

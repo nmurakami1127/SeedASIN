@@ -126,10 +126,23 @@ def _clear_price_bands(superuser_url: str) -> None:
         engine.dispose()
 
 
+def _clear_auto_release_events(superuser_url: str) -> None:
+    """0020のdowngradeはAUTO_RELEASE（自動解除の監査記録）が1件でもあると中止する（仕様。docs/DEVIATIONS.md #86）。テストが残した記録で
+    `downgrade base` が止まらないよう、テスト専用DBの記録だけをsuperuserで先に消す（表が無ければ何もしない。app_roleは削除できないまま）。"""
+    engine = create_engine(superuser_url)
+    try:
+        with engine.begin() as conn:
+            if conn.execute(text("SELECT to_regclass('acquisition_source_event') IS NOT NULL")).scalar_one():
+                conn.execute(text("DELETE FROM acquisition_source_event WHERE event_type = 'AUTO_RELEASE'"))
+    finally:
+        engine.dispose()
+
+
 @pytest.fixture(scope="module", autouse=True)
 def _migrated_schema(superuser_url: str):
     _dispose_cached_engines()
     _clear_price_bands(superuser_url)
+    _clear_auto_release_events(superuser_url)
 
     env = os.environ.copy()
     env["SEEDASIN_DATABASE_URL"] = superuser_url
@@ -152,6 +165,7 @@ def _migrated_schema(superuser_url: str):
     yield
 
     _clear_price_bands(superuser_url)
+    _clear_auto_release_events(superuser_url)
     subprocess.run(
         [sys.executable, "-m", "alembic", "downgrade", "base"], check=True, cwd=_PROJECT_ROOT, env=env
     )

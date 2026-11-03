@@ -12,8 +12,9 @@ import pytest
 
 from workflow.cli import stall_status_lines
 from workflow.config import ConfigError, config_from_dict
-from workflow.hold_recovery import (CANDIDATE, EXCLUDED, MarketPlan, RecoveryContext, SourceInfo, auto_release_limit_reached,
-                                    count_recent_auto_releases, dump_json, format_plans, judge)
+from workflow.hold_recovery import (CANDIDATE, EXCLUDED, REASON_LABELS, FailedRun, MarketPlan, RecoveryContext, SourceInfo,
+                                    auto_release_limit_reached, count_recent_auto_releases, dump_json, failure_codes_since, find_recurrence,
+                                    format_plans, judge, parse_auto_release_cause)
 from workflow.stall import MarketStall, classify_hold, detect_error_bursts
 
 UTC = timezone.utc
@@ -87,10 +88,24 @@ def test_recovery_and_burst_defaults_and_json_override():
     c = config_from_dict({"lanes": {"US": {"origin_import": 1}}})
     assert (c.stall.burst_window_hours, c.stall.burst_min_sources) == (3, 5)
     assert (c.recovery.cooldown_hours, c.recovery.max_auto_releases, c.recovery.window_days) == (24, 2, 30)
+    assert (c.recovery.auto_release.enabled, c.recovery.auto_release.max_per_run) == (False, 3)         # 自動解除は既定で無効・1回3件まで
     c2 = config_from_dict({"lanes": {"US": {"origin_import": 1}}, "stall": {"burst_window_hours": 6, "burst_min_sources": 3},
                            "recovery": {"cooldown_hours": 12, "max_auto_releases": 1, "window_days": 7}})
     assert (c2.stall.burst_window_hours, c2.stall.burst_min_sources, c2.recovery.cooldown_hours, c2.recovery.max_auto_releases) == (6, 3, 12, 1)
     assert "server_error_streak" in json.dumps(c2.to_dict()) and c2.to_dict()["recovery"]["window_days"] == 7
+
+
+def test_auto_release_config_is_nested_validated_and_roundtrips():
+    base = {"lanes": {"US": {"origin_import": 1}}}
+    c = config_from_dict({**base, "recovery": {"cooldown_hours": 12, "auto_release": {"enabled": True, "max_per_run": 5}}})
+    assert (c.recovery.cooldown_hours, c.recovery.auto_release.enabled, c.recovery.auto_release.max_per_run) == (12, True, 5)
+    assert config_from_dict(c.to_dict()).recovery.auto_release.enabled is True               # 保存した設定の再読込（resume）で保たれる
+    assert config_from_dict({**base, "recovery": {"max_auto_releases": 1}}).recovery.auto_release.enabled is False
+    for bad in ({"enabled": "yes"}, {"enabled": 1}, {"max_per_run": -1}, {"max_per_run": 101}, {"max_per_run": True}, {"max_per_run": "3"}, {"unknown": 1}):
+        with pytest.raises(ConfigError):
+            config_from_dict({**base, "recovery": {"auto_release": bad}})
+    with pytest.raises(ConfigError):
+        config_from_dict({**base, "recovery": {"auto_release": True}})
 
 
 @pytest.mark.parametrize("section,key,bad", [("stall", "burst_window_hours", 0), ("stall", "burst_window_hours", 169), ("stall", "burst_min_sources", 1),
@@ -108,11 +123,12 @@ def test_existing_stall_only_configs_still_load():
 
 # ---------------------------------------------------------------- 自動復旧の上限
 
-def test_recent_auto_releases_counts_only_system_release_events_inside_the_window():
-    events = [("RELEASE", "system", NOW - timedelta(days=1)), ("RELEASE", "system", NOW - timedelta(days=30)),          # 窓の開始ちょうどは内側
-              ("RELEASE", "system", NOW - timedelta(days=30, seconds=1)),                                                # 窓の外
-              ("RELEASE", "taro", NOW - timedelta(days=1)),                                                              # 人の解除は数えない
-              ("AUTO_HOLD", "system", NOW - timedelta(days=1)), ("RELEASE", "system", NOW + timedelta(seconds=1))]       # 別のイベント／未来
+def test_recent_auto_releases_counts_only_auto_release_events_inside_the_window():
+    a = "system:auto-recovery"
+    events = [("AUTO_RELEASE", a, NOW - timedelta(days=1)), ("AUTO_RELEASE", a, NOW - timedelta(days=30)),               # 窓の開始ちょうどは内側
+              ("AUTO_RELEASE", a, NOW - timedelta(days=30, seconds=1)),                                                  # 窓の外
+              ("RELEASE", "taro", NOW - timedelta(days=1)), ("RELEASE", "system", NOW - timedelta(days=1)),              # 人の解除・旧暫定の'system'のRELEASEは数えない
+              ("AUTO_HOLD", "system", NOW - timedelta(days=1)), ("AUTO_RELEASE", a, NOW + timedelta(seconds=1))]         # 別のイベント／未来
     assert count_recent_auto_releases(events, NOW, 30) == 2
     assert count_recent_auto_releases([], NOW, 30) == 0
 
@@ -174,9 +190,97 @@ def test_unknown_cause_is_excluded():
     assert reason_of(info(cause_code=None, cause_at=None)) == (EXCLUDED, "UNKNOWN_CAUSE")
 
 
-@pytest.mark.parametrize("state", ["OPEN", "END_REACHED", "EXPIRED"])
-def test_an_open_cycle_is_never_a_candidate(state):
-    assert reason_of(info(cycle_state=state)) == (EXCLUDED, "OPEN_CYCLE")
+@pytest.mark.parametrize("state", ["END_REACHED", "EXPIRED"])
+def test_an_ended_or_expired_open_cycle_is_never_a_candidate(state):
+    assert reason_of(info(cycle_state=state, failure_codes=("PAGE_LOAD_FAILED",), cursor_present=True, cycle_has_pages=True)) == (EXCLUDED, "OPEN_CYCLE")
+
+
+def test_an_open_cycle_with_a_cause_other_than_page_load_failed_is_never_a_candidate():
+    for code in ("REPEATED_PAGE", "SERVER_ERROR", "OVERLAP_MISMATCH", None):
+        assert reason_of(info(cycle_state="OPEN", cause_code=code, failure_codes=(code or "-",), cursor_present=True, cycle_has_pages=True)) == (EXCLUDED, "OPEN_CYCLE")
+
+
+def open_info(**kw):
+    base = dict(cycle_state="OPEN", failure_codes=("PAGE_LOAD_FAILED",) * 3, cursor_present=True, cycle_has_pages=True)
+    base.update(kw)
+    return info(**base)
+
+
+def test_resume_open_is_a_candidate_only_when_every_condition_holds():
+    v = judge(open_info(), ctx())
+    assert (v.verdict, v.reason, v.candidate_class) == (CANDIDATE, "PAGE_LOAD_FAILED", "RESUME_OPEN") and "続きから再開" in v.proposal
+    assert reason_of(open_info(failure_codes=())) == (EXCLUDED, "OPEN_MIXED_FAILURES")                                         # 根拠の失敗が見つからない
+    assert reason_of(open_info(failure_codes=("PAGE_LOAD_FAILED", "SERVER_ERROR"))) == (EXCLUDED, "OPEN_MIXED_FAILURES")       # 原因が別コードを含む
+    assert reason_of(open_info(failure_codes=("PAGE_LOAD_FAILED", "-"))) == (EXCLUDED, "OPEN_MIXED_FAILURES")                  # 原因不明を含む
+    assert reason_of(open_info(cursor_present=False)) == (EXCLUDED, "OPEN_NO_CURSOR")
+    assert reason_of(open_info(cycle_has_pages=False)) == (EXCLUDED, "OPEN_NO_CURSOR")
+    assert reason_of(open_info(), ctx(burst_codes=frozenset({"PAGE_LOAD_FAILED"}))) == (EXCLUDED, "BURST_DEFERRED")
+    assert reason_of(open_info(), ctx(burst_codes=frozenset({"SERVER_ERROR"}))) == (CANDIDATE, "PAGE_LOAD_FAILED")
+    assert reason_of(open_info(cause_at=NOW - timedelta(hours=23))) == (EXCLUDED, "COOLDOWN_PENDING")
+    assert reason_of(open_info(cause_at=NOW - timedelta(hours=24))) == (CANDIDATE, "PAGE_LOAD_FAILED")                        # ちょうど冷却期間は候補
+    assert reason_of(open_info(recent_auto_releases=2)) == (EXCLUDED, "RECOVERY_LIMIT_REACHED")
+    assert reason_of(open_info(recent_auto_releases=1)) == (CANDIDATE, "PAGE_LOAD_FAILED")
+
+
+def test_resume_open_exclusions_are_shown_in_readable_japanese():
+    burst = ctx(burst_codes=frozenset({"PAGE_LOAD_FAILED"}))
+    for i, c, want in ((open_info(cursor_present=False), ctx(), "再開位置"), (open_info(), burst, "バースト"),
+                       (open_info(cause_at=NOW - timedelta(hours=1)), ctx(), "冷却期間中"), (open_info(recent_auto_releases=2), ctx(), "上限"),
+                       (open_info(failure_codes=("SERVER_ERROR",)), ctx(), "PAGE_LOAD_FAILED以外")):
+        p = MarketPlan(c.market, now=NOW.isoformat(), verdicts=[judge(i, c)], burst={"window_hours": 3, "min_sources": 5, "codes": {}})
+        assert want in "\n".join(format_plans({"JP": p}))
+
+
+def test_resume_open_proposal_keeps_the_cycle():
+    """RESUME_OPENの提案文は『一巡を閉じない・保持』。一巡を閉じる／強制終了する／破棄する提案は存在しない。"""
+    v = judge(open_info(), ctx())
+    assert "閉じない" in v.proposal and "保持" in v.proposal
+    for bad in ("閉じて", "強制終了", "破棄", "BROKENにして", "位置を消"):
+        assert bad not in v.proposal
+
+
+# ---------------------------------------------------------------- 自動解除後の再発
+
+REL_AT = NOW - timedelta(days=2)
+
+
+def failed(run_id, hours_after=1.0, code="PAGE_LOAD_FAILED", status="FAILED", cycle_state=None, cursor_error=None):
+    return FailedRun(run_id, REL_AT + timedelta(hours=hours_after), status, code, cycle_state, cursor_error)
+
+
+def test_find_recurrence_same_code_failed_or_broken_after_the_release():
+    rel = [(REL_AT, "PAGE_LOAD_FAILED")]
+    assert find_recurrence(rel, [failed(1)])[2].run_id == 1                                     # 解除後に同じerror_codeで失敗
+    assert find_recurrence(rel, [failed(1, code="SERVER_ERROR")]) is None                         # 別の原因は再発ではない
+    assert find_recurrence(rel, [failed(1, hours_after=-1)]) is None                              # 解除より前の失敗
+    assert find_recurrence(rel, [failed(1, hours_after=0)]) is None                               # ちょうど解除時刻は『後』ではない
+    assert find_recurrence(rel, []) is None and find_recurrence([], [failed(1)]) is None
+    broken = [(REL_AT, "REPEATED_PAGE")]
+    assert find_recurrence(broken, [failed(2, code=None, status="COMPLETED", cycle_state="BROKEN", cursor_error="REPEATED_PAGE")])          # BROKEN（同じ原因）
+    assert find_recurrence(broken, [failed(2, code=None, status="COMPLETED", cycle_state="BROKEN", cursor_error="OVERLAP_MISMATCH")]) is None
+    assert find_recurrence([(REL_AT, None)], [failed(3, code="WHATEVER")])                       # 解除時の原因が読めなければ、どんな異常終了も再発（安全側）
+    assert find_recurrence([(REL_AT, "A"), (REL_AT + timedelta(days=1), "B")], [failed(4, hours_after=30, code="B")])[1] == "B"
+
+
+def test_a_source_that_recurred_after_an_auto_release_is_never_a_candidate_again():
+    rel = ((REL_AT, "PAGE_LOAD_FAILED"),)
+    v = judge(info(auto_releases=rel, failed_runs=(failed(7),)), ctx())
+    assert (v.verdict, v.reason) == (EXCLUDED, "RECURRED_AFTER_AUTO_RELEASE") and "run=7" in v.detail
+    assert reason_of(info(auto_releases=rel, failed_runs=(failed(7, code="SERVER_ERROR"),))) == (CANDIDATE, "PAGE_LOAD_FAILED")
+    assert reason_of(open_info(auto_releases=rel, failed_runs=(failed(7),))) == (EXCLUDED, "RECURRED_AFTER_AUTO_RELEASE")      # RESUME_OPENでも同じ
+    assert "要人手確認" in REASON_LABELS["RECURRED_AFTER_AUTO_RELEASE"]
+
+
+def test_failure_codes_since_the_last_success_or_release():
+    fs = [failed(1, 1, "SERVER_ERROR"), failed(2, 2, "PAGE_LOAD_FAILED"), failed(3, 3, None), failed(4, 4, "REPEATED_PAGE", status="COMPLETED", cycle_state="BROKEN")]
+    assert failure_codes_since(fs, None) == ("SERVER_ERROR", "PAGE_LOAD_FAILED", "-")            # BROKENのCOMPLETED行はstatus=FAILEDではない
+    assert failure_codes_since(fs, REL_AT + timedelta(hours=2)) == ("-",)                         # cutより後だけ（ちょうどcutは含まない）
+    assert failure_codes_since(fs, REL_AT + timedelta(hours=5)) == ()
+
+
+def test_parse_auto_release_cause():
+    assert parse_auto_release_cause('{"cause_code": "PAGE_LOAD_FAILED"}') == "PAGE_LOAD_FAILED"
+    assert parse_auto_release_cause("not json") is None and parse_auto_release_cause(None) is None and parse_auto_release_cause("[1]") is None
 
 
 @pytest.mark.parametrize("state", [None, "BROKEN", "COMPLETE"])

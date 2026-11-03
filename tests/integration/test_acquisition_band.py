@@ -80,7 +80,7 @@ def _states(runs, claim):
 def test_fresh_build_has_table_rls_policy_triggers_and_is_not_in_all_tables(owner):
     assert not set(ACQUISITION_BAND_RLS_TABLES) & set(ALL_TABLES)
     with owner.connect() as conn:
-        assert conn.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0019"
+        assert conn.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0020"
         assert conn.execute(text("SELECT relrowsecurity FROM pg_class WHERE relname = 'acquisition_band'")).scalar_one() is True
         assert conn.execute(text("SELECT count(*) FROM pg_policies WHERE tablename = 'acquisition_band'")).scalar_one() == 1
         trg = {r[0] for r in conn.execute(text("SELECT tgname FROM pg_trigger WHERE tgrelid = 'acquisition_band'::regclass AND NOT tgisinternal"))}
@@ -111,7 +111,7 @@ def test_downgrade_is_refused_while_a_band_is_unfinished_and_succeeds_when_all_a
     res = _alembic(superuser_url, "downgrade", "0018", check=False)
     assert res.returncode != 0 and "downgradeを中止" in (res.stderr + res.stdout) and "PENDING/ACTIVE" in (res.stderr + res.stdout)
     with owner.connect() as conn:  # 何も変更されていない
-        assert conn.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0019"
+        assert conn.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0020"
         assert conn.execute(text("SELECT count(*) FROM acquisition_band")).scalar_one() == 2
     bands = runs.load_bands(claim)
     for b in bands:  # 全て終端にする（1つずつ開いて閉じる）

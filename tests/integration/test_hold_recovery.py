@@ -210,7 +210,8 @@ def test_dry_run_candidates_and_exclusions_by_condition(app_role_factory, regist
     assert v[s["manual"]] == (EXCLUDED, "MANUAL_HOLD")
     assert v[s["blocked"]] == (EXCLUDED, "SELLER_COMPETITOR_SAME_SERVICE")
     assert v[s["lease"]] == (EXCLUDED, "LEASE_ACTIVE")
-    assert v[s["open"]] == (EXCLUDED, "OPEN_CYCLE")
+    # 手で足した失敗runは、最後の成功(1ページ取得のCOMPLETED)より前なので『保留以降の失敗』の根拠にならず、OPEN一巡は再開の対象外（#86）
+    assert v[s["open"]] == (EXCLUDED, "OPEN_MIXED_FAILURES")
     # 価格帯分割が無効な設定なら、JPのREPEATED_PAGEも候補にならない
     assert verdicts(build_market_plan(f, "JP", cfg_with(band=False)))[s["repeated_jp"]] == (EXCLUDED, "PRICE_BAND_NOT_ENABLED")
     # 出典ごとの情報（直近run・一巡・error_code・取得済みASIN・解除回数）が付く
@@ -255,12 +256,14 @@ def test_past_automatic_recoveries_at_the_limit_block_a_candidate(app_role_facto
     sid = held_source(registry, f, "JP", "PAGE_LOAD_FAILED", 30)
     with f.get_session("JP") as conn, conn.begin():
         for _ in range(2):
-            conn.execute(text("INSERT INTO acquisition_source_event (source_id, marketplace, event_type, detail, actor) VALUES (:id, 'JP', 'RELEASE', 'auto', 'system')"),
-                         {"id": sid})
+            conn.execute(text("INSERT INTO acquisition_source_event (source_id, marketplace, event_type, detail, actor) "
+                              "VALUES (:id, 'JP', 'AUTO_RELEASE', '{\"cause_code\": \"PAGE_LOAD_FAILED\"}', 'system:auto-recovery')"), {"id": sid})
         conn.execute(text("INSERT INTO acquisition_source_event (source_id, marketplace, event_type, detail, actor) VALUES (:id, 'JP', 'RELEASE', 'manual', 'taro')"),
                      {"id": sid})
+        conn.execute(text("INSERT INTO acquisition_source_event (source_id, marketplace, event_type, detail, actor) VALUES (:id, 'JP', 'RELEASE', 'old provisional', 'system')"),
+                     {"id": sid})   # P2の暫定（RELEASE+system）は数えない
     v = {x.source_id: x for x in build_market_plan(f, "JP", cfg_with()).verdicts}[sid]
-    assert (v.verdict, v.reason) == (EXCLUDED, "RECOVERY_LIMIT_REACHED") and v.info.release_count == 3 and v.info.recent_auto_releases == 2
+    assert (v.verdict, v.reason) == (EXCLUDED, "RECOVERY_LIMIT_REACHED") and v.info.release_count == 4 and v.info.recent_auto_releases == 2
     assert {x.source_id: x for x in build_market_plan(f, "JP", cfg_with(recovery={"max_auto_releases": 3})).verdicts}[sid].verdict == CANDIDATE
 
 
