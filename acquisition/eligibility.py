@@ -24,6 +24,9 @@ from typing import Iterable
 
 from sqlalchemy import Connection, text
 
+from acquisition.env_failure import (
+    DISABLED as ENV_GUARD_DISABLED, EnvGuardSettings, env_failure_run_ids, load_env_failure_events, load_env_guard_settings,
+)
 from acquisition.legacy_state import LegacyGroupState, fold_legacy
 from acquisition.normalize import normalize_key
 
@@ -44,6 +47,7 @@ class Config:
     cycle_max_age_days: int = 14   # 続き取得の一巡を放置してよい期間（超えたら新しい一巡へ）
     overlap_pages: int = 1         # 続きの前に取り直す「前回の最後のページ」の数（0=確認しない / 1。実装が1ページしか取り直さないため2以上は設定エラー）
     max_cycle_restarts: int = 2    # 一巡が異常終了（BROKEN）したあと、先頭から取り直す連続回数の上限（放置による期限切れは数えない）
+    env_guard: EnvGuardSettings = ENV_GUARD_DISABLED   # 環境障害（多数の出典の同時失敗）を連続失敗に数えない設定（DBではなくJSON。既定は無効。docs/DEVIATIONS.md #90）
 
 
 OVERLAP_PAGES_ALLOWED = (0, 1)
@@ -77,6 +81,7 @@ class RunFact:
     last_page_signature: str | None = None
     last_page_asins: tuple[str, ...] | None = None
     end_reached: bool | None = None         # 1ページを正常に解析・保存し、そのページに次ページが無かった（末尾到達。ASIN保存と同じトランザクションで記録）
+    error_code: str | None = None           # 失敗の理由（環境障害の判定に使う）
 
 
 @dataclass(frozen=True)
@@ -147,6 +152,7 @@ class SourceFacts:
     legacy: list[LegacyGroupState] = field(default_factory=list)
     legacy_unclassified: list[LegacyGroupState] = field(default_factory=list)  # 種別未確定・未却下の旧証拠（推測しない）
     blocked_reason: str | None = None
+    env_events: list = field(default_factory=list)  # 同じ市場の環境障害コードの失敗 (source_id, error_code, completed_at)。ガード無効時は空
 
 
 @dataclass(frozen=True)
@@ -175,6 +181,7 @@ class Decision:
     cycle: CycleView | None = None
     plan: str | None = None    # FRESH / CONTINUE / RESTART_EXPIRED / RESTART_BROKEN（実行できる場合の始め方）
     overlap_pages: int = 0     # 続き取得で、前回の最後のページを取り直す数（日次のページ使用量に含める）
+    env_failures: int = 0      # 環境障害の疑いとして、連続失敗に数えなかった失敗の数（cut後。COOLDOWNには含める）
 
     @property
     def eligible(self) -> bool:
@@ -308,15 +315,20 @@ def decide(facts: SourceFacts, cfg: Config, as_of: datetime) -> Decision:
         if r.outcome in COUNTED_FAILURE_OUTCOMES and r.completed_at is not None
         and (cut is None or r.completed_at > cut)
     ]
-    consecutive_failures = len(failures)
+    # 環境障害の疑い（多数の出典で同時に起きた一時的なアクセス障害）の失敗は、連続失敗にも自動保留の根拠にも数えない。
+    # 数えないだけ（run・cursor・ASINは変えない）。冷却は全ての失敗から数える（障害中に同じ出典を即座に取り直さない）。既定は無効。
+    env_ids = env_failure_run_ids(
+        facts.source_id, [(r.run_id, r.error_code, r.completed_at) for r in failures], facts.env_events, cfg.env_guard)
+    consecutive_failures = len(failures) - len(env_ids)
     if failures:
         last_failure_at = max(r.completed_at for r in failures)
         cooldown_until = last_failure_at + timedelta(minutes=cfg.retry_cooldown_minutes)
         if as_of < cooldown_until:
+            env_note = f"。うち{len(env_ids)}回は環境障害の疑いで連続失敗に数えていません" if env_ids else ""
             blockers.append(
                 Blocker(
                     "COOLDOWN",
-                    f"直近の失敗から{cfg.retry_cooldown_minutes}分の冷却中です（連続失敗{consecutive_failures}回）。"
+                    f"直近の失敗から{cfg.retry_cooldown_minutes}分の冷却中です（連続失敗{consecutive_failures}回{env_note}）。"
                     f"再試行可能: {cooldown_until:%Y-%m-%d %H:%M} UTC",
                     cooldown_until,
                 )
@@ -348,6 +360,7 @@ def decide(facts: SourceFacts, cfg: Config, as_of: datetime) -> Decision:
         cycle=cyc,
         plan=plan,
         overlap_pages=cfg.overlap_pages if plan == "CONTINUE" and cyc.last_page_url else 0,
+        env_failures=len(env_ids),
     )
 
 
@@ -360,7 +373,9 @@ def db_now(conn: Connection) -> datetime:
     return conn.execute(text("SELECT clock_timestamp()")).scalar_one()
 
 
-def load_configs(conn: Connection, marketplace: str) -> dict[str, Config]:
+def load_configs(conn: Connection, marketplace: str, env_guard: EnvGuardSettings | None = None) -> dict[str, Config]:
+    """env_guard=None なら設定ファイル（acquisition.env_failure.load_env_guard_settings。既定は無効）から読む。"""
+    guard = env_guard if env_guard is not None else load_env_guard_settings()
     rows = conn.execute(
         text(
             "SELECT source_type, min_interval_days, empty_counts_as_success, truncated_counts_as_success, "
@@ -380,13 +395,17 @@ def load_configs(conn: Connection, marketplace: str) -> dict[str, Config]:
         r.source_type: Config(
             r.min_interval_days, r.empty_counts_as_success, r.truncated_counts_as_success,
             r.retry_cooldown_minutes, r.max_consecutive_failures, r.lease_seconds, r.captcha_lease_seconds,
-            r.cycle_max_age_days, r.overlap_pages, r.max_cycle_restarts,
+            r.cycle_max_age_days, r.overlap_pages, r.max_cycle_restarts, guard,
         )
         for r in rows
     }
 
 
-def load_facts(conn: Connection, marketplace: str, source_ids: Iterable[int] | None = None) -> list[SourceFacts]:
+def load_facts(conn: Connection, marketplace: str, source_ids: Iterable[int] | None = None,
+               env_guard: EnvGuardSettings | None = None) -> list[SourceFacts]:
+    """env_guard=None なら設定ファイルから読む。有効なときだけ、市場全体の環境障害コードの失敗（出典をまたぐ判定の入力）を各factsに付ける
+    （source_idsで絞っても、判定には市場全体の失敗が要る）。"""
+    guard = env_guard if env_guard is not None else load_env_guard_settings()
     ids = list(source_ids) if source_ids is not None else None
     where = "" if ids is None else " WHERE source_id = ANY(:ids)"
     params = {"ids": ids} if ids is not None else {}
@@ -413,7 +432,7 @@ def load_facts(conn: Connection, marketplace: str, source_ids: Iterable[int] | N
         text(
             "SELECT source_id, id, status, outcome, completed_at, lease_expires_at, interrupt_kind, completeness, "
             "cycle_id, cycle_seq, cycle_state, supersedes_cycle_id, cycle_start_reason, restart_streak, start_url, start_page_no, "
-            "next_url, next_page_no, last_page_url, last_page_signature, last_page_asins, end_reached "
+            "next_url, next_page_no, last_page_url, last_page_signature, last_page_asins, end_reached, error_code "
             f"FROM collector_run WHERE source_id IS NOT NULL{run_where} ORDER BY id"
         ),
         params,
@@ -423,7 +442,7 @@ def load_facts(conn: Connection, marketplace: str, source_ids: Iterable[int] | N
                 RunFact(r.id, r.status, r.outcome, r.completed_at, r.lease_expires_at, r.interrupt_kind, r.completeness,
                         r.cycle_id, r.cycle_seq, r.cycle_state, r.supersedes_cycle_id, r.cycle_start_reason, r.restart_streak,
                         r.start_url, r.start_page_no, r.next_url, r.next_page_no, r.last_page_url, r.last_page_signature,
-                        tuple(r.last_page_asins) if r.last_page_asins is not None else None, r.end_reached)
+                        tuple(r.last_page_asins) if r.last_page_asins is not None else None, r.end_reached, r.error_code)
             )
     blocked = {
         row.seller_id.strip().upper(): row.reason
@@ -432,6 +451,10 @@ def load_facts(conn: Connection, marketplace: str, source_ids: Iterable[int] | N
     for f in facts.values():
         if f.source_type == "SELLER":
             f.blocked_reason = blocked.get(f.key_primary)
+    if guard.enabled:
+        events = load_env_failure_events(conn, marketplace)
+        for f in facts.values():
+            f.env_events = events
     legacy_rows = conn.execute(text("SELECT * FROM acquisition_legacy_evidence ORDER BY evidence_id")).all()
     legacy_states = fold_legacy(legacy_rows, marketplace)
     unclassified = [s for s in legacy_states if not s.classified and s.market_state != "DISMISSED"]

@@ -12,7 +12,7 @@
    7日分の日次データが足りない市場（最も古い取得runが8日前より新しい）は警告を出さず「判定不能」と表示する。中央値が0のときも警告しない。
 
 4. バースト（環境障害の疑い）: 直近`burst_window_hours`時間に、異なる`burst_min_sources`出典以上で同じerror_code（特にPAGE_LOAD_FAILED）の失敗が出たか。
-   ネットワークやAmazon側の一時的な障害で出典がまとめて失敗している可能性を示す（警告のみ。連続失敗のカウントや自動保留の挙動は変えない）。
+   ネットワークやAmazon側の一時的な障害で出典がまとめて失敗している可能性を示す（警告のみ。判定そのものは`acquisition.env_failure`が正。env_failure_guardが有効なときだけ、acquisition側が同じ窓・出典数でその失敗を連続失敗に数えない。無効（既定）なら従来どおり。docs/DEVIATIONS.md #90）。
 
 US/JPは別々のDB接続（`SessionFactory.get_session(market)`）で独立に調べ、一方の失敗や遅延が他方の検知を止めない（失敗はその市場のerrorに入れる）。
 警告の繰り返し表示は、既存の人手待ちと同じ`watch.notify_minutes`で抑える（watch.py側）。
@@ -26,6 +26,7 @@ from statistics import median
 from sqlalchemy import text
 
 from acquisition.eligibility import decide, db_now, load_configs, load_facts
+from acquisition.env_failure import ENV_FAILURE_CODES, detect_error_bursts, load_env_guard_settings  # detect_error_bursts は acquisition 側が正（再公開。hold_recovery等が従来どおり import できる）
 from seller_performance.source_yield import first_seen_daily_counts
 
 RELEASE_CODES = ("CYCLE_RESTART_LIMIT", "ON_HOLD")
@@ -106,22 +107,6 @@ def classify_hold(status: str, hold_reason: str | None, blocked_reason: str | No
     return None, ""
 
 
-def detect_error_bursts(events: list[tuple[int, str | None, datetime]], as_of: datetime, window_hours: int, min_sources: int) -> dict[str, list[int]]:
-    """バースト（環境障害の疑い）の判定。純粋関数。events=(source_id, error_code, 失敗の完了時刻)。
-
-    窓は `as_of - window_hours <= 完了時刻 <= as_of`（ちょうど窓の開始時刻は窓の内側。as_ofより未来は数えない）。
-    同じerror_codeが `min_sources` 個以上の**異なる出典**で出ていれば、そのコードをバーストとして返す（ちょうどその数で成立）。
-    同じ出典の失敗が何回出ても1出典として数える。戻り値は {error_code: [source_id, ...昇順]}（バーストのコードだけ）。error_codeがNoneの行は無視。
-    """
-    start = as_of - timedelta(hours=window_hours)
-    by_code: dict[str, set[int]] = {}
-    for sid, code, at in events:
-        if code is None or at is None or at < start or at > as_of:
-            continue
-        by_code.setdefault(code, set()).add(sid)
-    return {c: sorted(ids) for c, ids in sorted(by_code.items()) if len(ids) >= min_sources}
-
-
 def load_error_burst_events(conn, market: str, as_of: datetime, window_hours: int) -> list[tuple[int, str, datetime]]:
     """窓の中で終了した、出典つきの失敗run（collector_run.status='FAILED'、error_codeあり）。読み取りのみ。"""
     rows = conn.execute(
@@ -194,6 +179,9 @@ def check_market(factory, market: str, limits, as_of: datetime) -> MarketStall:
         items, res.intentional_hold_count = _find_needs_release(conn, market)
         res.needs_release_count, res.needs_release = len(items), items[:MAX_LISTED]
         window_h, min_src = getattr(limits, "burst_window_hours", 3), getattr(limits, "burst_min_sources", 5)
+        guard = load_env_guard_settings()
+        if guard.enabled:   # ガード有効時は、連続失敗に数えない判定と同じ窓・出典数で表示する（表示と判定の食い違いを避ける。#90）
+            window_h, min_src = guard.window_hours, guard.min_sources
         now_db = db_now(conn)
         bursts = detect_error_bursts(load_error_burst_events(conn, market, now_db, window_h), now_db, window_h, min_src)
         res.burst = {"window_hours": window_h, "min_sources": min_src, "codes": {c: len(ids) for c, ids in bursts.items()}}
@@ -212,7 +200,8 @@ def check_market(factory, market: str, limits, as_of: datetime) -> MarketStall:
                             f"`python -m acquisition.cli release-hold --market {market} --source-id <ID> --reason ...`"))
     for code, n in res.burst["codes"].items():
         res.warnings.append((f"burst:{code}", f"{market}: 環境障害の疑い: 直近{window_h}時間に{n}出典で{code}の失敗が出ています"
-                            f"（目安 {min_src}出典以上）。ネットワーク・Amazon側の状態を確認してください（個々の出典を解除する前に）"))
+                            f"（目安 {min_src}出典以上）。ネットワーク・Amazon側の状態を確認してください（個々の出典を解除する前に）"
+                            + ("。この失敗は出典ごとの連続失敗に数えていません（env_failure_guard 有効）" if guard.enabled and code in ENV_FAILURE_CODES else "")))
     if server_error_warning(res.server_error_streak, limits.server_error_streak):
         res.warnings.append(("server_error", f"{market}: 商品ページの取得がSERVER_ERRORで{res.server_error_streak}回連続しています"
                             f"（警告の目安 {limits.server_error_streak}回・最後 {res.server_error_last_at or '-'}）"))

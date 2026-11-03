@@ -1529,3 +1529,43 @@ Amazonのナビゲーションはdomcontentloadedで待機し、第三者リソ�
 
 ### テスト
 `tests/unit/test_hold_recovery.py`（自動／意図的の分類・バーストの境界・設定・上限の境界・各条件の候補判定・表示）、`tests/integration/test_hold_recovery.py`（実PostgreSQL。意図的な保留が要解除から除外／バーストの警告／OPEN・lease・MANUAL・セラー側・US価格帯・冷却・バースト・要人手確認・上限・`--limit`／ドライランの前後で全表のハッシュと行数が同じ／読み取り専用接続が書き込みを拒否／市場ごとの失敗の隔離／CLI）、`tests/integration/test_workflow_watch.py`（表示する解除コマンドが実在のサブコマンドとして解釈できる）。**未検証**: 実DB・実運用データでの判定結果。
+
+## 90. 環境障害ガード: 多数の出典の同時失敗を、出典単位の連続失敗に数えない（2026-11-03）
+
+背景: #84で「`AUTO_FAILURES`の連続失敗は環境障害の間にも数えられ、3回で自動保留になる」と報告した懸念への対応。Amazon側・ネットワーク・自分のIP/セッションの一時的な問題で多数の出典が同じ時間帯に失敗すると、それだけで多数の出典が一斉に自動保留される。**スキーマ変更なし（alembicなし）。runの記録・cursor・取得済みASIN・leaseの検証は一切変えない。** 判定は読み取りだけ。
+
+### 判定式（`acquisition/env_failure.py`。純関数）
+失敗run r（出典s・error_code=c・完了時刻t）は、次を**両方**満たすとき「環境障害の疑い」として、連続失敗にも自動保留の根拠にも**数えない**:
+1. c が `ENV_FAILURE_CODES = {PAGE_LOAD_FAILED, SERVER_ERROR}`（`asin_collector/source_runner.py`の`_get`が出す一時的なもの。実在のコードを読んで選んだ。`TIMEOUT`というコードは存在しない）。
+2. 同じ市場で、同じ error_code の失敗が `[t − W時間, t + W時間]`（**両端を含む**）に、**異なる出典で N 個以上**（rの出典sも1つとして数える。同じ出典の繰り返しは1出典）。既定 W=3、N=5（`workflow.stall`のバースト検知の既定と同じ）。
+
+対象外（常に数える）: REPEATED_PAGE・OVERLAP_MISMATCH・CURSOR_INVALID・REVISITED_URL・EMPTY_PAGE_AFTER_RESULTS・NO_NEW_ASINS_LOOP・BAND_*・CAPTCHA_UNSOLVED（人の対応を伴う別の扱い）・EXCEPTION・error_codeなし。
+
+「別の出典がN個以上」ではなく「自分を含めてN出典以上」にした理由: 「5出典が同時にPAGE_LOAD_FAILED」で各出典を環境障害と扱い、`workflow.stall`のバースト（異なる5出典以上）と同じ数え方にそろえるため。厳密に「他にN個」にしたい場合は、`min_sources`を1つ増やす。
+
+### 組み込み（食い違いを避ける）
+- `acquisition/eligibility.py`: `Config.env_guard`（設定）、`SourceFacts.env_events`（市場全体の環境障害コードの失敗。**ガード有効時だけ**`load_facts`が読む。`source_ids`で絞っても市場全体を読む）、`RunFact.error_code`、`Decision.env_failures`（数えなかった件数）を追加。`decide`は`consecutive_failures = 失敗数 − 環境障害の疑いの数`とし、`should_auto_hold`もこれを使う。**`lease.finish`は元から`load_facts`+`decide`の結果で自動保留を決めるため、コードの変更なしで同じ判定になる**（`acquisition/lease.py`は変更していない）。`plan`・`claim`・`workflow.stall`の要解除の判定も同じ`decide`。
+- **冷却（COOLDOWN）は全ての失敗から数える**（環境障害の疑いの失敗も含む）。障害の最中に同じ出典を冷却なしで取り直さないため。理由文に「うちN回は環境障害の疑いで連続失敗に数えていません」と出る。
+- 成功による連続の打ち切り・`failure_streak_reset_at`・ユーザー中断/lease失効を数えない仕様は変えていない。
+- **既に付いた自動保留（status=ON_HOLD）は外れない**: `should_auto_hold`は`status='ACTIVE'`の出典にだけ立つ。ガードは「新しい自動保留を付けない・連続失敗に加算しない」方向にだけ働く。窓の端での揺れによる、保留の付いたり外れたりは起きない。数え方は、後から他の出典の失敗が増えると「遡って数えなくなる」方向にだけ変わる（記録は追記のみで窓は固定。設定を変えない限り、一度数えなくなった失敗が後で再び数えられることはない）。
+- `workflow/stall.py`: `detect_error_bursts`の本体を`acquisition/env_failure.py`へ移し、stallは再公開（`from workflow.stall import detect_error_bursts`は従来どおり動く。`workflow/hold_recovery.py`は未変更）。ガード有効時だけ、バースト警告の窓・出典数をガードの設定にそろえ、「この失敗は出典ごとの連続失敗に数えていません」を付記。無効時の表示は従来どおり。
+
+### 設定（DB変更なし）と既定
+- JSONファイル `config/env_failure_guard.json`（Git管理外。例: `config/env_failure_guard.example.json`）。場所は環境変数 `SEEDASIN_ENV_FAILURE_GUARD_CONFIG` で変更できる。形式: `{"enabled": true, "window_hours": 3, "min_sources": 5}`（範囲: window_hours 1〜168、min_sources 2〜1000。省略は既定）。
+- **既定は無効**（ファイルが無い／壊れている場合も無効。壊れている場合は警告ログを出して無効にする。取得の終了処理を設定の誤りで失敗させないため）。理由: 有効にすると既存の自動保留の挙動が変わる（保留されにくくなる）ため、ユーザーの判断が要る。`acquisition_interval_config`にDB列を足す案は、alembicが要るため取らなかった。
+- 有効化の手順: `config/env_failure_guard.example.json` を `config/env_failure_guard.json` にコピーして `"enabled": true` にする。**取得を実行するプロセス（`asin_collector`・watch）と、判定を見るプロセスが同じファイルを読む**ように、同じ作業ディレクトリ／同じ環境変数で起動する（設定は`load_configs`/`load_facts`の呼び出しごとに読むので、再起動は不要）。無効化（ロールバック）は、`"enabled": false`にするか、ファイルを削除する。無効化すれば、以降の判定は従来と同じ（過去の失敗は再び数えられる。DBには何も書いていないので、データの戻しは不要）。
+
+### 限界・未解決
+- **障害の初期の出典は守れない**: 障害が始まった直後、まだ他の出典の失敗が出ていない時点で3回目の失敗に達した出典は、従来どおり自動保留される（保留は外さない）。出典の取得は順に進むため、複数回失敗する出典が先に出る可能性がある。
+- **単に出典固有の原因で同時に失敗した場合と区別できない**: 同じ時間帯に同じコードで5出典が失敗していれば、原因が環境か個別か判定できない（例: 5人のセラーが同時に非公開になった）。そのためコードを一時的なもの2つに限り、N・Wを設定可能にした。
+- `workflow/hold_recovery.py`（ドライラン）のバースト判定は、引き続き`stall.burst_window_hours`/`burst_min_sources`（workflow.json）を使う。ガードの設定（別ファイル）と値が異なると、ドライランの「バースト中のため見送り」とガードの判定の窓がずれうる。**両方を同じ値（既定3時間・5出典）に保つこと**。統合は別Workerの作業（hold_recovery/watch）と衝突するため行っていない。
+- 環境障害の疑いの失敗の履歴（どの失敗を数えなかったか）は、DBに残していない（判定は都度計算）。`python -m acquisition.cli`への表示は追加していない。
+- 市場全体の環境障害コードの失敗を、ガード有効時は判定のたびに読む（時間で絞らない。`collector_run`の行が極端に多い市場では`plan`が重くなりうる）。実運用データでの負荷は未確認。
+
+### テスト
+`tests/unit/test_env_failure.py`（40件。設定の検証・判定式・窓の境界（前後とも含む）・N−1出典・同一出典の繰り返し・コードの混在・出典固有のコード・`decide`への組み込み・冷却・既存の保留・成功による打ち切り・`detect_error_bursts`の既存の境界が不変）、`tests/integration/test_env_failure_guard.py`（実PostgreSQL。5出典の同時失敗→保留なし（有効）／同じ状況で無効→従来どおり保留／1出典の3回→保留／N−1出典では発動しない／REPEATED_PAGEは常に数える／実DBの行での窓の境界／数えなかった失敗でもrun・cursor・ASIN不変＋CONTINUEで再開可能／失効したleaseは従来どおり拒否／判定が読み取りだけ（前後のハッシュ一致）／既に付いた保留は後のバーストで外れない／US⇄JPの分離とRLS／stall表示の整合）。**未検証**: 実運用データ・実Amazonでの効果。
+
+## 91. 環境障害ガードの運用上の決定（#90の補足。2026-11-03）
+- **既定を無効にした理由**: このガードは自動保留の付き方を変える（付きにくくする）。#84の「必要性の報告」を実装したものだが、閾値（3時間・5出典）が実運用に合うかは未確認で、誤って有効にすると、本当に壊れた出典が環境障害として見過ごされる期間が延びうる。そのため有効化はユーザーの判断（設定ファイルの作成）とした。
+- **有効化前に確認してほしいこと**: (1) 取得を実行するプロセスと止まり検知を見るプロセスが同じ設定ファイルを読むこと。(2) `stall.burst_window_hours`/`burst_min_sources`とガードの値を同じにしておくこと（#90の限界）。(3) 有効化後の最初の障害時に、`watch_status.json`のburst警告（「連続失敗に数えていません」）と、`acquisition.cli`の出典の状態で`ON_HOLD`が付かないことを確認する。
+- **`lease.py`を変更しなかった理由**: 自動保留の判定は`decide`の結果に一本化されており、`finish`は同じトランザクション内で`load_facts`+`decide`を呼ぶ。判定を二重に実装しないため。自動保留の詳細文（`hold_detail`）に「環境障害の疑いで除いた件数」は書いていない（必要なら別途）。

@@ -1,0 +1,5 @@
+{
+  "enabled": false,
+  "window_hours": 3,
+  "min_sources": 5
+}

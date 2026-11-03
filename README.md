@@ -331,6 +331,8 @@ Amazonへのアクセスは増えません。DBの読み取りと、`exports/wor
 - 直近24時間の初見ASIN数が、その前の7日間の日次（24時間ごと）の中央値の `stall.new_asin_min_percent`%（既定30）**未満**なら警告。7日分のデータが足りない市場（最も古い取得runが8日前より新しい）は警告せず「判定不能」と表示。中央値が0のときも警告しない。
 - 設定は `config/workflow.json` の `stall` 項目（例: `"stall": {"server_error_streak": 5, "new_asin_min_percent": 30}`）。範囲は `server_error_streak` 1〜1000、`new_asin_min_percent` 1〜100の整数。省略すれば既定値（既存の設定ファイルはそのまま使える）。
 
+**環境障害ガード（既定は無効。docs/DEVIATIONS.md #90・#91）**: 多数の出典が同じ時間帯に同じ一時的なエラー（`PAGE_LOAD_FAILED`／`SERVER_ERROR`）で失敗したとき、それを出典ごとの連続失敗に数えず、環境障害だけで多数の出典が`AUTO_FAILURES`で自動保留されるのを防ぐ。数えないだけで、run・cursor・取得済みASINは変えない。1出典だけの失敗・出典固有の失敗（`REPEATED_PAGE`等）は従来どおり数える。既に付いた自動保留は外れない。有効化: `config/env_failure_guard.example.json` を `config/env_failure_guard.json` にコピーして `"enabled": true`（`window_hours` 既定3、`min_sources` 既定5）。無効化: `"enabled": false` にするかファイルを削除。取得を実行するプロセスと止まり検知は同じ設定ファイルを読むこと（`SEEDASIN_ENV_FAILURE_GUARD_CONFIG`で場所を変更可）。
+
 **自動保留の復旧候補のドライラン（読み取り専用。docs/DEVIATIONS.md #84）**: 自動保留された出典のうち、安全に復旧できそうなものを判定して表示するだけのコマンド。**何も解除せず**、DBを更新せず（読み取り専用トランザクション）、Amazonにもアクセスしない。
 ```
 python -m workflow.cli recovery-plan --config config/workflow.json [--market JP|US] [--limit N] [--out exports/recovery_plan.json]

@@ -55,6 +55,8 @@ run_ai_worker.sh
 
 # workflow: 運用値(import_id等)を含む実設定はGit管理しない（例は config/workflow.example.json）
 config/workflow.json
+# 環境障害ガードの実設定（有効化の判断を含む。例は config/env_failure_guard.example.json。docs/DEVIATIONS.md #90）
+config/env_failure_guard.json
 
 # Claude Code の Worker の作業ツリー（.claude/ 全体は除外しない）
 .claude/worktrees/
