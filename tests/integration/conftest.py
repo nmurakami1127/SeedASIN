@@ -114,9 +114,22 @@ def _dispose_cached_engines() -> None:
     db_session._ENGINES.clear()
 
 
+def _clear_price_bands(superuser_url: str) -> None:
+    """0019のdowngradeは取得途中(PENDING/ACTIVE)の帯があると中止する（仕様。docs/DEVIATIONS.md #82）。テストが残した帯や、前回の中断で
+    残った帯で `downgrade base` が止まらないよう、テスト専用DBの帯だけを先に空にする（表が無ければ何もしない）。"""
+    engine = create_engine(superuser_url)
+    try:
+        with engine.begin() as conn:
+            if conn.execute(text("SELECT to_regclass('acquisition_band') IS NOT NULL")).scalar_one():
+                conn.execute(text("TRUNCATE acquisition_band"))
+    finally:
+        engine.dispose()
+
+
 @pytest.fixture(scope="module", autouse=True)
 def _migrated_schema(superuser_url: str):
     _dispose_cached_engines()
+    _clear_price_bands(superuser_url)
 
     env = os.environ.copy()
     env["SEEDASIN_DATABASE_URL"] = superuser_url
@@ -138,6 +151,7 @@ def _migrated_schema(superuser_url: str):
 
     yield
 
+    _clear_price_bands(superuser_url)
     subprocess.run(
         [sys.executable, "-m", "alembic", "downgrade", "base"], check=True, cwd=_PROJECT_ROOT, env=env
     )

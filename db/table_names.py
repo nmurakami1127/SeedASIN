@@ -126,6 +126,11 @@ ACQUISITION_RLS_TABLES = (
     "acquisition_legacy_evidence",
 )
 
+# 0019（価格帯の表、docs/DEVIATIONS.md #82）も同じ流儀: 増分マイグレーションだけで完結し、ALL_TABLESには含めない。テスト・文書専用。
+ACQUISITION_BAND_RLS_TABLES = (
+    "acquisition_band",
+)
+
 ALL_TABLES = NORMAL_CRUD_TABLES + APPEND_ONLY_APP_TABLES + KPI_REPORT_ONLY_TABLES + DEPRECATED_TABLES
 
 assert len(NORMAL_CRUD_TABLES) == 17

@@ -20,6 +20,7 @@ from __future__ import annotations
 import getpass
 import uuid
 from dataclasses import dataclass
+from typing import Sequence
 
 from sqlalchemy import Connection, text
 from sqlalchemy.exc import IntegrityError
@@ -98,6 +99,33 @@ class Claim:
     last_page_signature: str | None = None
     last_page_asins: tuple[str, ...] | None = None
     overlap_pages: int = 0              # CONTINUE: 取り直すページ数（設定。0なら確認しない）
+
+
+BAND_TERMINAL_STATES = ("DONE", "SPLIT", "TRUNCATED_MIN")
+_BAND_COLUMNS = ("band_id, axis, lo_units, hi_units, parent_band_id, depth, state, close_reason, open_run_id, close_run_id, "
+                 "pages_fetched, asins_new")
+
+
+@dataclass(frozen=True)
+class Band:
+    """一巡の価格帯（acquisition_band の1行）。範囲は [lo_units, hi_units) の半開区間で、hi_units が None なら上限なし。"""
+    band_id: int
+    axis: str
+    lo_units: int
+    hi_units: int | None
+    parent_band_id: int | None
+    depth: int
+    state: str                  # PENDING / ACTIVE / DONE / SPLIT / TRUNCATED_MIN
+    close_reason: str | None
+    open_run_id: int | None
+    close_run_id: int | None
+    pages_fetched: int
+    asins_new: int
+
+
+def _band(row) -> Band:
+    return Band(row.band_id, row.axis, row.lo_units, row.hi_units, row.parent_band_id, row.depth, row.state, row.close_reason,
+                row.open_run_id, row.close_run_id, row.pages_fetched, row.asins_new)
 
 
 def _actor() -> str:
@@ -245,11 +273,15 @@ class AcquisitionRunService:
                 {"ls": claim.lease_seconds, "id": claim.run_id},
             )
 
-    def append_asins(self, claim: Claim, asins: list[str], pages: int = 1, *, cursor: PageCursor | None = None) -> int:
+    def append_asins(self, claim: Claim, asins: list[str], pages: int = 1, *, cursor: PageCursor | None = None,
+                     band_id: int | None = None) -> int:
         """1ページ分のASINを追記する。run行をロックし、leaseが有効なときだけ書く。
         回収と競合した場合は、回収後なら何も書かずに LeaseLost。
         cursorを渡すと、**ASINの保存と同じトランザクション**で再開位置（次ページ・最後に保存したページ）を更新する
-        （保存済みのページと再開位置が食い違わない: どちらも書かれる/どちらも書かれない）。"""
+        （保存済みのページと再開位置が食い違わない: どちらも書かれる/どちらも書かれない）。
+        band_idを渡すと、同じトランザクションでその帯（この一巡のACTIVEな帯）の pages_fetched・asins_new も加算する
+        （ページ・カーソル・帯の件数は全て同時に書かれる。帯がこの一巡のACTIVEでなければ ValueError で全体を取り消す）。
+        省略時は従来どおり帯に触れない。"""
         if cursor is not None and cursor.end_reached and cursor.next_url is not None:
             raise ValueError("末尾到達(end_reached)のページに次ページURLは持てません")
         with self._app.get_session(claim.marketplace) as conn, conn.begin():
@@ -279,6 +311,16 @@ class AcquisitionRunService:
                 ),
                 params,
             )
+            if band_id is not None:
+                done = conn.execute(
+                    text(
+                        "UPDATE acquisition_band SET pages_fetched = pages_fetched + :pages, asins_new = asins_new + :n "
+                        "WHERE band_id = :b AND cycle_id = :c AND source_id = :s AND state = 'ACTIVE'"
+                    ),
+                    {"pages": pages, "n": len(asins), "b": band_id, "c": claim.cycle_id, "s": claim.source_id},
+                ).rowcount
+                if done != 1:
+                    raise ValueError(f"band_id={band_id} はこの一巡のACTIVEな帯ではありません（ページ・カーソルの保存も取り消しました）")
         return len(asins)
 
     def set_start(self, claim: Claim, url: str, page_no: int = 1) -> None:
@@ -324,6 +366,7 @@ class AcquisitionRunService:
         error_message: str | None = None,
         pages_fetched: int | None = None,
         drop_cursor: bool = False,
+        completeness: str | None = None,
     ) -> Decision | None:
         """終了確定。leaseが失効していれば拒否（LeaseLost）。失敗系は連続失敗を再判定し、閾値に達したら
         同じトランザクションで自動保留にする（戻り値は自動保留した場合の判定）。
@@ -331,13 +374,18 @@ class AcquisitionRunService:
         drop_cursor=True（SUCCESS_TRUNCATEDのみ）: 保存済みの再開位置（next_url・next_page_no）を捨て、一巡を CLOSED_NO_CURSOR
         で閉じる。検索結果の深さの限界に達した出典（`close_on_repeated_page`、truncation_reason='DEPTH_LIMIT'）用。続きは無く、
         BROKENでもないので先頭からの取り直し(RESTART_BROKEN)にならない。取得間隔は従来の CLOSED_NO_CURSOR と同じく
-        truncated_counts_as_success で判定する。"""
+        truncated_counts_as_success で判定する。
+
+        completeness: 完全性の上書き（'COMPLETE'/'TRUNCATED'/'PARTIAL'）。省略時は outcome から決まる既定値（従来どおり）。
+        例: 全ての帯を取り終えたが最小幅の帯で打ち切りがあった一巡を、outcome は成功のまま 'TRUNCATED' として記録する。"""
         if outcome not in OUTCOME_STATUS:
             raise ValueError(f"unknown outcome: {outcome!r}")
         if outcome == "SUCCESS_TRUNCATED" and not truncation_reason:
             raise ValueError("SUCCESS_TRUNCATEDにはtruncation_reasonが必要です")
         if drop_cursor and outcome != "SUCCESS_TRUNCATED":
             raise ValueError("drop_cursor は SUCCESS_TRUNCATED のときだけ指定できます")
+        if completeness is not None and completeness not in ("COMPLETE", "TRUNCATED", "PARTIAL"):
+            raise ValueError(f"unknown completeness: {completeness!r}")
         status = OUTCOME_STATUS[outcome]
         held: Decision | None = None
         with self._app.get_session(claim.marketplace) as conn, conn.begin():
@@ -372,7 +420,7 @@ class AcquisitionRunService:
                     "next_page_no = CASE WHEN CAST(:cmp AS boolean) OR CAST(:dc AS boolean) THEN NULL ELSE next_page_no END "
                     "WHERE id = :id"
                 ),
-                {"status": status, "outcome": outcome, "comp": DEFAULT_COMPLETENESS[outcome], "tr": truncation_reason,
+                {"status": status, "outcome": outcome, "comp": completeness or DEFAULT_COMPLETENESS[outcome], "tr": truncation_reason,
                  "ec": error_code, "em": error_message, "pf": pages_fetched, "id": claim.run_id, "cs": cycle_state,
                  "ce": error_code if cycle_state == "BROKEN" else None, "cmp": cycle_state == "COMPLETE", "dc": drop_cursor},
             )
@@ -430,6 +478,118 @@ class AcquisitionRunService:
             return True
         except LeaseLost:
             return False
+
+    # ------------------------------------------------------------------ 価格帯（acquisition_band）
+
+    @staticmethod
+    def _require_cycle(claim: Claim) -> int:
+        if claim.cycle_id is None:
+            raise ValueError("この実行には一巡(cycle)がありません（帯は一巡に属します）")
+        return claim.cycle_id
+
+    @staticmethod
+    def _read_bands(conn: Connection, claim: Claim) -> list[Band]:
+        return [
+            _band(r) for r in conn.execute(
+                text(f"SELECT {_BAND_COLUMNS} FROM acquisition_band WHERE cycle_id = :c AND source_id = :s ORDER BY lo_units, depth, band_id"),
+                {"c": claim.cycle_id, "s": claim.source_id},
+            )
+        ]
+
+    def load_bands(self, claim: Claim) -> list[Band]:
+        """この一巡の全ての帯（分割済み SPLIT の親も含む）を下限の昇順で返す。leaseが有効なときだけ読める。"""
+        self._require_cycle(claim)
+        with self._app.get_session(claim.marketplace) as conn, conn.begin():
+            self._lock_valid_run(conn, claim)
+            return self._read_bands(conn, claim)
+
+    def init_bands(self, claim: Claim, initial: Sequence[tuple[int, int | None]], *, axis: str = "PRICE") -> list[Band]:
+        """最初の帯（PENDING）を作る。**冪等**: この一巡に帯が1つでもあれば何も作らず、いまの帯を返す
+        （分割後に再実行しても初期の帯が増えない。続きのrunが同じ呼び出しをしても安全）。
+        initial は (lo_units, hi_units) の列。昇順・重ならない・最後だけ hi_units=None（上限なし）可。"""
+        self._require_cycle(claim)
+        spans = list(initial)
+        if not spans:
+            raise ValueError("initial が空です")
+        prev_hi: int | None = 0
+        for lo, hi in spans:
+            if prev_hi is None:
+                raise ValueError("上限なし(hi=None)の帯は最後にだけ置けます")
+            if lo < prev_hi or lo < 0 or (hi is not None and hi <= lo):
+                raise ValueError(f"帯の範囲が不正です（昇順・重ならない・lo<hi）: [{lo}, {hi})")
+            prev_hi = hi
+        with self._app.get_session(claim.marketplace) as conn, conn.begin():
+            self._lock_valid_run(conn, claim)
+            existing = self._read_bands(conn, claim)
+            if existing:
+                return existing
+            conn.execute(
+                text(
+                    "INSERT INTO acquisition_band (marketplace, source_id, cycle_id, axis, lo_units, hi_units) "
+                    "VALUES (:mp, :s, :c, :axis, :lo, :hi) ON CONFLICT DO NOTHING"
+                ),
+                [{"mp": claim.marketplace, "s": claim.source_id, "c": claim.cycle_id, "axis": axis, "lo": lo, "hi": hi} for lo, hi in spans],
+            )
+            return self._read_bands(conn, claim)
+
+    def advance_band(self, claim: Claim, band_id: int, to_state: str, *, close_reason: str | None = None,
+                     split_at: int | None = None) -> list[Band]:
+        """帯の状態を1段進める（lease有効な実行だけ。全体が1トランザクション）。戻り値は変更後のこの一巡の全ての帯。
+        - ACTIVE: PENDING → ACTIVE（この実行を open_run_id に記録。一巡に既にACTIVEがあれば ValueError）。
+        - DONE / TRUNCATED_MIN: ACTIVE → 終端（close_reason 必須。TRUNCATED_MIN は最小幅でこれ以上分割できないまま打ち切った帯）。
+        - SPLIT: ACTIVE → SPLIT。split_at（lo < split_at < hi）で [lo, split_at) と [split_at, hi) の子2つ（深さ+1）を作り、左の子をACTIVEにする。
+          close_reason は省略時 'SPLIT'。
+        PENDING から DONE/SPLIT へは進められない（先に ACTIVE で開く）。DBのトリガーも同じ規則で拒否する。"""
+        self._require_cycle(claim)
+        if to_state not in ("ACTIVE", *BAND_TERMINAL_STATES):
+            raise ValueError(f"unknown band state: {to_state!r}")
+        if to_state != "SPLIT" and split_at is not None:
+            raise ValueError("split_at は SPLIT のときだけ指定できます")
+        reason = close_reason if close_reason else ("SPLIT" if to_state == "SPLIT" else None)
+        if to_state in BAND_TERMINAL_STATES and not reason:
+            raise ValueError(f"{to_state} には close_reason が必要です")
+        if reason is not None and len(reason) > 40:
+            raise ValueError("close_reason は40文字以内です")
+        with self._app.get_session(claim.marketplace) as conn, conn.begin():
+            self._lock_valid_run(conn, claim)
+            cur = conn.execute(
+                text(f"SELECT {_BAND_COLUMNS} FROM acquisition_band WHERE band_id = :b AND cycle_id = :c AND source_id = :s FOR UPDATE"),
+                {"b": band_id, "c": claim.cycle_id, "s": claim.source_id},
+            ).one_or_none()
+            if cur is None:
+                raise ValueError(f"band_id={band_id} はこの一巡に存在しません")
+            if to_state == "ACTIVE":
+                if cur.state != "PENDING":
+                    raise ValueError(f"band_id={band_id} は{cur.state}です（PENDINGからだけACTIVEにできます）")
+                if conn.execute(text("SELECT 1 FROM acquisition_band WHERE cycle_id = :c AND state = 'ACTIVE'"), {"c": claim.cycle_id}).first():
+                    raise ValueError("この一巡には既にACTIVEな帯があります")
+                conn.execute(text("UPDATE acquisition_band SET state = 'ACTIVE', open_run_id = :r WHERE band_id = :b"),
+                             {"r": claim.run_id, "b": band_id})
+            else:
+                if cur.state != "ACTIVE":
+                    raise ValueError(f"band_id={band_id} は{cur.state}です（ACTIVEの帯だけ{to_state}にできます）")
+                if to_state == "SPLIT":
+                    if split_at is None or not (cur.lo_units < split_at and (cur.hi_units is None or split_at < cur.hi_units)):
+                        raise ValueError(f"split_at は帯の内側(lo < split_at < hi)で指定してください: [{cur.lo_units}, {cur.hi_units}) split_at={split_at}")
+                conn.execute(
+                    text("UPDATE acquisition_band SET state = :st, close_reason = :r, close_run_id = :run, closed_at = clock_timestamp() "
+                         "WHERE band_id = :b"),
+                    {"st": to_state, "r": reason, "run": claim.run_id, "b": band_id},
+                )
+                if to_state == "SPLIT":
+                    # 親をSPLITにした後に子を作る（子の挿入トリガーは親がSPLIT済みであることを要求する）。左の子をACTIVEにして続ける。
+                    kids = conn.execute(
+                        text(
+                            "INSERT INTO acquisition_band (marketplace, source_id, cycle_id, axis, lo_units, hi_units, parent_band_id, depth) "
+                            "VALUES (:mp, :s, :c, :axis, :lo, :mid, :p, :d), (:mp, :s, :c, :axis, :mid, :hi, :p, :d) RETURNING band_id, lo_units"
+                        ),
+                        {"mp": claim.marketplace, "s": claim.source_id, "c": claim.cycle_id, "axis": cur.axis, "lo": cur.lo_units,
+                         "mid": split_at, "hi": cur.hi_units, "p": band_id, "d": cur.depth + 1},
+                    ).all()
+                    left = next(k.band_id for k in kids if k.lo_units == cur.lo_units)
+                    conn.execute(text("UPDATE acquisition_band SET state = 'ACTIVE', open_run_id = :r WHERE band_id = :b"),
+                                 {"r": claim.run_id, "b": left})
+            return self._read_bands(conn, claim)
 
     # ------------------------------------------------------------------ 人による操作・回収
 

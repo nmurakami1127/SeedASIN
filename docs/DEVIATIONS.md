@@ -1421,3 +1421,44 @@ Amazonのナビゲーションはdomcontentloadedで待機し、第三者リソ�
 - DEPTH_LIMITの端数の放出は「検索結果の深さの限界が実際に約170ページ付近で起きる」ことを前提にしているが、実ページでは未確認（#80のまま）。
 
 スキーマ変更なし（alembic追加なし）。追記専用・RLS・US/JP分離は変更なし。テスト: `tests/integration/test_planner_depth_limit_flush.py`（実PostgreSQL）。
+
+## 82. 価格帯の台帳 `acquisition_band`（alembic 0019、段階C）（2026-11-03）
+
+利用者承認済み（2026-11-03）: DBに新テーブル `acquisition_band` を1つ追加する。**既存テーブルは変更しない**。この段階では帯を使う経路（`source_runner`・`workflow`・`planner`・`partition`・設定）は無く、**動作は変わらない**（帯は誰も作らない・読まない）。
+
+### 内容
+- 列: `band_id`（IDENTITY主キー）、`marketplace`（**取得先ページの市場**。0016と同じ）、`source_id`、`cycle_id`、`axis`（今は`'PRICE'`のみ）、`lo_units`/`hi_units`（`[lo, hi)`の半開区間、`hi`がNULLなら上限なし）、`parent_band_id`、`depth`、`state`（`PENDING`/`ACTIVE`/`DONE`/`SPLIT`/`TRUNCATED_MIN`）、`close_reason`、`open_run_id`、`close_run_id`、`pages_fetched`、`asins_new`、`created_at`、`closed_at`。
+- 制約: `hi>lo`、`lo>=0`、`(parent IS NULL)=(depth=0)`、状態と列の組（PENDING=未着手で件数0、ACTIVE=開始runあり、終端=開始run・終了run・終了時刻・理由あり）。一意: `(cycle_id, axis, lo, coalesce(hi,-1))`。**一巡にACTIVEは高々1つ**（部分一意索引）。索引 `(cycle_id, state, lo_units)`。
+- 複合外部キー: `(source_id, marketplace)`→`acquisition_source`、`(cycle_id, source_id, marketplace)`→`collector_run`（0017の`uk_collector_run_ref`）、`(open_run_id|close_run_id, source_id, marketplace, cycle_id)`→`collector_run`（0017の`uk_collector_run_chain`。帯を開閉したrunが**同じ一巡のrun**であることをDBが保証）、`(parent_band_id, cycle_id)`→同表（親は同じ一巡のみ）。
+- 保護トリガー（`collector_run_guard`と同じ型）:
+  - UPDATE: 識別列（`band_id`・市場・出典・一巡・軸・範囲・親・深さ・`created_at`）は不変。状態は `PENDING→ACTIVE→{DONE,SPLIT,TRUNCATED_MIN}` の一方向のみ。終端の行は一切変更不可。`open_run_id`は`PENDING→ACTIVE`で一度だけ入り以後不変。件数は減らせない。
+  - INSERT: 新しい帯は`PENDING`のみ。親があれば「同じ一巡のSPLIT済みの帯で、新しい範囲を含み、深さが+1」であること。同じ一巡・軸で`SPLIT`以外の帯と**範囲が重なる帯は作れない**（葉の帯は互いに重ならない）。
+- RLS: `ENABLE ROW LEVEL SECURITY`、USING/WITH CHECK `marketplace = current_setting('app.current_marketplace')`（missing_ok省略）。0016と同じく共有metadata・`ALL_TABLES`には入れず、生SQLで完結（`db/table_names.py`の`ACQUISITION_BAND_RLS_TABLES`はテスト・文書専用）。
+- 権限: `app_role`は`SELECT, INSERT`と列限定`UPDATE(open_run_id, state, close_reason, close_run_id, pages_fetched, asins_new, closed_at)`、DELETEなし。`kpi_report_role`は`SELECT`（BYPASSRLS）。`admin_role`は付与なし。
+
+### 設計判断（報告）
+- **`PENDING`から`DONE`/`SPLIT`/`TRUNCATED_MIN`への直行は不可**とした（先に`ACTIVE`で開く）。理由: 帯を開いたrun（`open_run_id`）と取得件数を必ず残すため、また「帯を取り終えた」ことを取得せずに宣言できないようにするため。取得せず閉じたい帯があれば、`ACTIVE`にしてすぐ閉じる。
+- **`app_role`の列限定UPDATEに`open_run_id`を追加**した（依頼文の列リストにはなかった）。`PENDING→ACTIVE`でどのrunが開いたかを記録するために必要。以後はトリガーで不変。
+- `ACTIVE`の帯は、runが途中で止まっても`ACTIVE`のまま残り、続きのrunが同じ帯を続ける（`open_run_id`は最初に開いたrun、`close_run_id`は閉じたrun）。
+- 帯の範囲が親を完全に覆う（子2つで隙間なく分割）ことはアプリ層（`advance_band`）が保証する。DBは「親に含まれる」「葉が重ならない」までを守り、隙間は検査しない。
+
+### アプリ層（`acquisition/lease.py`、すべて`_lock_valid_run`の下。leaseを失った実行は読み書きとも`LeaseLost`）
+- `load_bands(claim)`: この一巡の全ての帯（`SPLIT`の親を含む）を下限の昇順で返す。
+- `init_bands(claim, initial)`: 最初の帯を`PENDING`で作る。**冪等**（この一巡に帯が1つでもあれば何も作らず現状を返す）。範囲は昇順・重ならない・`hi=None`は最後だけ。
+- `advance_band(claim, band_id, to_state, close_reason=, split_at=)`: `ACTIVE`化／`DONE`・`TRUNCATED_MIN`（理由必須）／`SPLIT`（親を閉じ、`split_at`で子2つを作り、**左の子を`ACTIVE`にする**）。全体が1トランザクション。
+- `append_asins(..., band_id=)`: 任意引数。渡すと、ページ・カーソル・帯の`pages_fetched`/`asins_new`を**同一トランザクション**で更新（帯がこの一巡の`ACTIVE`でなければ`ValueError`で全体を取り消す）。省略時は従来動作。
+- `finish(..., completeness=)`: 任意引数。完全性（`COMPLETE`/`TRUNCATED`/`PARTIAL`）を上書きする（例: 全帯を取り終えたが最小幅の帯で打ち切りがあった一巡を、outcomeは成功のまま`TRUNCATED`にする）。省略時は従来動作。
+
+### その他の変更
+- `db/schema_guard.py`: `acquisition_band`が無いDB（0019未適用）への`UndefinedTable`を`MESSAGE_0019`で案内（DBは変更しない）。
+- 既存テスト`tests/integration/test_acquisition_schema.py`・`test_migration_0014.py`: headのバージョン`"0018"`→`"0019"`、0016の再実行テストの表数（5→6）、RLS対象表の集合に価格帯を追加、0017の再実行テストは**0018まで戻してから実行**するよう変更（価格帯表が0017の一意制約を外部キーで参照するため、head上で0017の関数を直接再実行すると制約を作り直せない。alembic経由の通常の昇降格には影響しない）。
+- `tests/integration/conftest.py`: `alembic downgrade base`の前後に`acquisition_band`を空にする（テスト専用DB。0019のdowngradeは途中の帯があると中止するため）。
+
+### downgrade
+- `PENDING`/`ACTIVE`の帯が1つでも残っていれば**中止**（`RuntimeError`、何も変更しない。件数と一巡数を表示）。全て終端のときだけ`acquisition_band`と2つのトリガー関数を削除する。失われるのは帯の履歴のみで、`collector_run`・`collector_asin`は変更しない。
+- 事前に`pg_dump`すること。
+
+### 適用手順（実DB。未実施）
+1. 取得系のプロセス（`workflow`・`asin_collector`）を停止。2. `pg_dump`。3. `alembic upgrade head`（0019のみ。既存データには触れない）。4. `\d acquisition_band`でRLS・トリガー・権限を確認。動作は変わらない（帯を使う経路はまだ無い）。
+
+テスト: `tests/integration/test_acquisition_band.py`（実PostgreSQL。マイグレーションの冪等・downgradeの中止と成功、保護トリガー、同時ACTIVEの拒否、3ロールのRLS・権限、leaseのメソッド）、`tests/unit/test_schema_guard.py`。

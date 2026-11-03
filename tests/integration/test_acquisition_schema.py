@@ -20,7 +20,7 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.exc import DBAPIError, IntegrityError, ProgrammingError
 
 from acquisition.registry import SourceRegistry
-from db.table_names import ACQUISITION_RLS_TABLES, ALL_TABLES
+from db.table_names import ACQUISITION_BAND_RLS_TABLES, ACQUISITION_RLS_TABLES, ALL_TABLES
 from tests.integration.acq_helpers import make_runs, new_source, unique_key
 from tests.integration.conftest import role_url
 
@@ -51,11 +51,11 @@ def owner(superuser_url):
 def test_fresh_build_has_tables_rls_policies_seed_trigger_and_not_in_all_tables(owner):
     assert not set(ACQUISITION_RLS_TABLES) & set(ALL_TABLES)  # 0003/0004が実行時に読むタプルに入れない
     with owner.connect() as conn:
-        assert conn.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0018"
+        assert conn.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0019"
         rls = dict(conn.execute(text("SELECT relname, relrowsecurity FROM pg_class WHERE relname LIKE 'acquisition%' AND relkind = 'r'")).all())
-        assert rls == {t: True for t in ACQUISITION_RLS_TABLES}
+        assert rls == {t: True for t in ACQUISITION_RLS_TABLES + ACQUISITION_BAND_RLS_TABLES}  # 0016の5表＋0019の価格帯
         pol = {r[0] for r in conn.execute(text("SELECT tablename FROM pg_policies WHERE tablename LIKE 'acquisition%'"))}
-        assert pol == set(ACQUISITION_RLS_TABLES)
+        assert pol == set(ACQUISITION_RLS_TABLES + ACQUISITION_BAND_RLS_TABLES)
         seed = conn.execute(text("SELECT marketplace, source_type, min_interval_days, retry_cooldown_minutes, max_consecutive_failures, "
                                  "lease_seconds, captcha_lease_seconds, empty_counts_as_success, truncated_counts_as_success "
                                  "FROM acquisition_interval_config ORDER BY 1, 2")).all()
@@ -214,7 +214,7 @@ def test_downgrade_to_0015_and_upgrade_again_on_an_existing_db_preserves_legacy_
                for i, st in enumerate(("RUNNING", "COMPLETED", "FAILED", "CAPTCHA_WAIT"))]
     _alembic(superuser_url, "upgrade", "head")
     with owner.begin() as conn:
-        assert conn.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0018"
+        assert conn.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0019"
         rows = conn.execute(text("SELECT id, status, source_id, attempt_token, lease_expires_at, outcome FROM collector_run WHERE id = ANY(:ids) ORDER BY id"),
                             {"ids": ids}).all()
         assert [r.status for r in rows] == ["RUNNING", "COMPLETED", "FAILED", "CAPTCHA_WAIT"]
@@ -250,7 +250,7 @@ def test_upgrade_function_is_idempotent_when_rerun(owner):
             module.upgrade()
         n = conn.execute(text("SELECT count(*) FROM pg_tables WHERE tablename LIKE 'acquisition%'")).scalar_one()
         seed = conn.execute(text("SELECT count(*) FROM acquisition_interval_config")).scalar_one()
-    assert (n, seed) == (5, 8)  # 再実行でも重複しない
+    assert (n, seed) == (6, 8)  # 再実行でも重複しない（0016の5表＋0019の価格帯1表）
 
 
 def test_downgrade_keeps_every_collector_run_and_collector_asin_row(owner, superuser_url, app_role_factory, registry):
@@ -307,7 +307,7 @@ def test_0017_upgrade_from_0016_keeps_existing_runs_untouched_and_downgrade_keep
         conn.execute(text("INSERT INTO collector_asin (marketplace, collector_run_id, asin) VALUES ('US', :r, 'B0OLDRUN01'), ('US', :r, 'B0OLDRUN02')"), {"r": rid})
     _alembic(superuser_url, "upgrade", "head")
     with owner.begin() as conn:
-        assert conn.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0018"
+        assert conn.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0019"
         r = conn.execute(text("SELECT status, outcome, truncation_reason, cycle_id, cycle_seq, cycle_state, next_url, cursor_error FROM collector_run WHERE id = :i"),
                          {"i": rid}).one()
         assert (r.status, r.outcome, r.truncation_reason) == ("COMPLETED", "SUCCESS_TRUNCATED", "PAGE_LIMIT")
@@ -334,11 +334,14 @@ def test_0017_upgrade_from_0016_keeps_existing_runs_untouched_and_downgrade_keep
                 conn.execute(text("UPDATE collector_run SET pages_fetched = 9 WHERE id = :i"), {"i": rid})  # 0016の保護は維持
     _alembic(superuser_url, "upgrade", "head")
     with owner.begin() as conn:
-        assert conn.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0018"
+        assert conn.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0019"
         assert conn.execute(text("SELECT cycle_id FROM collector_run WHERE id = :i"), {"i": rid}).scalar_one() is None
 
 
-def test_0017_upgrade_function_is_idempotent_when_rerun(owner):
+def test_0017_upgrade_function_is_idempotent_when_rerun(owner, superuser_url):
+    # 0019の価格帯表は0017の一意制約(uk_collector_run_ref等)を複合外部キーで参照するため、0017の関数をheadの上で直接再実行すると
+    # その制約を作り直せない。0018まで戻して（価格帯表は空なので戻せる）から再実行し、終わったらheadへ戻す。
+    _alembic(superuser_url, "downgrade", "0018")
     path = _ROOT / "alembic" / "versions" / "0017_collector_run_cycles.py"
     spec = importlib.util.spec_from_file_location("mig0017", path)
     module = importlib.util.module_from_spec(spec)
@@ -349,6 +352,7 @@ def test_0017_upgrade_function_is_idempotent_when_rerun(owner):
             module.upgrade()
         n = conn.execute(text("SELECT count(*) FROM pg_trigger WHERE tgname IN ('trg_collector_run_cycle_init', 'trg_collector_run_guard')")).scalar_one()
     assert n == 2
+    _alembic(superuser_url, "upgrade", "head")
 
 
 # ---------------------------------------------------------------- 0018（続き取得のレビュー対応）の移行
@@ -371,7 +375,7 @@ def test_0018_upgrade_from_0017_keeps_rows_and_an_existing_overlap_above_one_is_
         before = conn.execute(text("SELECT count(*) FROM collector_run")).scalar_one()
     _alembic(superuser_url, "upgrade", "head")
     with owner.begin() as conn:
-        assert conn.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0018"
+        assert conn.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0019"
         assert conn.execute(text("SELECT count(*) FROM collector_run")).scalar_one() == before
         r = conn.execute(text("SELECT status, cycle_state, end_reached FROM collector_run WHERE id = :i"), {"i": c.run_id}).one()
         assert tuple(r) == ("COMPLETED", "CLOSED_NO_CURSOR", None)
@@ -413,7 +417,7 @@ def test_0018_downgrade_keeps_daily_limit_rows_unchanged_and_can_be_reapplied(ow
         assert "DAILY_LIMIT" in conn.execute(text("SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conname = 'ck_collector_run_interrupt_values'")).scalar_one()
     _alembic(superuser_url, "upgrade", "head")
     with owner.begin() as conn:
-        assert conn.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0018"
+        assert conn.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0019"
         assert conn.execute(text("SELECT interrupt_kind FROM collector_run WHERE id = :i"), {"i": c.run_id}).scalar_one() == "DAILY_LIMIT"
 
 
@@ -452,4 +456,4 @@ def test_0018_rollback_past_0017_with_daily_limit_rows_keeps_every_row_and_upgra
         assert conn.execute(text("SELECT status FROM collector_run WHERE id = :i"), {"i": c.run_id}).scalar_one() == "FAILED"  # 0016のdowngradeの既存規則
     _alembic(superuser_url, "upgrade", "head")
     with owner.begin() as conn:
-        assert count(conn) == n and conn.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0018"
+        assert count(conn) == n and conn.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0019"
