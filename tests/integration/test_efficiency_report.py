@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import sys
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -287,35 +288,49 @@ def test_recovery_counts_success_reheld_and_undetermined_separately(app_role_fac
     assert (us.auto_releases, us.manual_releases, us.auto_holds, us.success_rate) == (0, 0, 0, None)
 
 
-def test_works_without_auto_release_in_the_check_constraint_and_counts_zero(app_role_factory, registry, owner):  # noqa: F811
-    # 既定のDB（P3の未マイグレーション）: CHECK制約にAUTO_RELEASEが無い
+@contextmanager
+def event_type_check(owner, allowed):
+    """ck_ase_type（acquisition_source_event.event_type）を、指定の許可リストに張り替える。マイグレーション状態（P3の0020の前後）に依存しないよう、
+    実行開始時の定義をpg_get_constraintdefで退避し、終了時に（例外時も）その定義へ戻す。戻す前に、このテストで入れたイベントを消す。"""
     with owner.connect() as conn:
-        ck = conn.execute(text("SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conname = 'ck_ase_type'")).scalar_one()
-    assert "AUTO_RELEASE" not in ck
-    src = new_source(registry, "JP").source_id
-    ev(owner, src, "JP", "AUTO_HOLD", "system", now_utc() - timedelta(hours=2))
-    ev(owner, src, "JP", "RELEASE", "bob", now_utc() - timedelta(hours=1))
-    rc = report(app_role_factory, "JP").recovery
-    assert (rc.auto_holds, rc.manual_releases, rc.auto_releases, rc.success_rate, rc.decided_success_rate, rc.reheld_rate) == (1, 1, 0, None, None, None)
-    assert "期間内に自動復旧はありません" in "\n".join(format_report(report(app_role_factory, "JP")))
-
-
-def test_counts_auto_release_event_type_when_the_check_allows_it(app_role_factory, registry, owner):  # noqa: F811
-    with owner.begin() as conn:                                # P3のマイグレーション後を模擬（テストDBだけ。終わりに元へ戻す）
+        original = conn.execute(text("SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conname = 'ck_ase_type' "
+                                     "AND conrelid = 'acquisition_source_event'::regclass")).scalar_one()
+    listed = ",".join(f"'{t}'" for t in allowed)
+    with owner.begin() as conn:
+        conn.execute(text("DELETE FROM acquisition_source_event"))
         conn.execute(text("ALTER TABLE acquisition_source_event DROP CONSTRAINT ck_ase_type"))
-        conn.execute(text("ALTER TABLE acquisition_source_event ADD CONSTRAINT ck_ase_type CHECK "
-                          "(event_type IN ('REGISTERED','HOLD','AUTO_HOLD','EXCLUDE','RELEASE','INTERVAL_SET','AUTO_RELEASE'))"))
+        conn.execute(text(f"ALTER TABLE acquisition_source_event ADD CONSTRAINT ck_ase_type CHECK (event_type IN ({listed}))"))
     try:
-        s = recovery_scenario(owner, app_role_factory, registry, release_type="AUTO_RELEASE", actor="system")
-        rc = report(app_role_factory, "JP").recovery
-        assert (rc.auto_releases, rc.manual_releases, rc.success, rc.reheld, rc.undetermined) == (5, 1, 1, 1, 3)
-        assert (s.a, "SUCCESS") in {(o.source_id, o.kind) for o in rc.outcomes}
+        yield
     finally:
         with owner.begin() as conn:
             conn.execute(text("DELETE FROM acquisition_source_event"))
             conn.execute(text("ALTER TABLE acquisition_source_event DROP CONSTRAINT ck_ase_type"))
-            conn.execute(text("ALTER TABLE acquisition_source_event ADD CONSTRAINT ck_ase_type CHECK "
-                              "(event_type IN ('REGISTERED','HOLD','AUTO_HOLD','EXCLUDE','RELEASE','INTERVAL_SET'))"))
+            conn.execute(text(f"ALTER TABLE acquisition_source_event ADD CONSTRAINT ck_ase_type {original}"))
+
+
+OLD_EVENT_TYPES = ("REGISTERED", "HOLD", "AUTO_HOLD", "EXCLUDE", "RELEASE", "INTERVAL_SET")
+
+
+def test_works_without_auto_release_in_the_check_constraint_and_counts_zero(app_role_factory, registry, owner):  # noqa: F811
+    with event_type_check(owner, OLD_EVENT_TYPES):              # 旧形式（P3の0020の前）に張り替えて検証し、終わりに元の定義へ戻す
+        with owner.connect() as conn:
+            ck = conn.execute(text("SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conname = 'ck_ase_type'")).scalar_one()
+        assert "AUTO_RELEASE" not in ck
+        src = new_source(registry, "JP").source_id
+        ev(owner, src, "JP", "AUTO_HOLD", "system", now_utc() - timedelta(hours=2))
+        ev(owner, src, "JP", "RELEASE", "bob", now_utc() - timedelta(hours=1))
+        rc = report(app_role_factory, "JP").recovery
+        assert (rc.auto_holds, rc.manual_releases, rc.auto_releases, rc.success_rate, rc.decided_success_rate, rc.reheld_rate) == (1, 1, 0, None, None, None)
+        assert "期間内に自動復旧はありません" in "\n".join(format_report(report(app_role_factory, "JP")))
+
+
+def test_counts_auto_release_event_type_when_the_check_allows_it(app_role_factory, registry, owner):  # noqa: F811
+    with event_type_check(owner, OLD_EVENT_TYPES + ("AUTO_RELEASE",)):      # P3の0020の後の形に張り替えて検証し、終わりに元の定義へ戻す
+        s = recovery_scenario(owner, app_role_factory, registry, release_type="AUTO_RELEASE", actor="system")
+        rc = report(app_role_factory, "JP").recovery
+        assert (rc.auto_releases, rc.manual_releases, rc.success, rc.reheld, rc.undetermined) == (5, 1, 1, 1, 3)
+        assert (s.a, "SUCCESS") in {(o.source_id, o.kind) for o in rc.outcomes}
 
 
 def test_recovery_events_outside_the_window_are_not_counted(app_role_factory, registry, owner):  # noqa: F811
