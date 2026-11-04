@@ -479,14 +479,14 @@ class Engine:
 
     def _existing_sources(self, t: Task, plan, market: str) -> list[dict]:
         """発見に関係なく取得できる、この市場・この起点レポート(入口)の既存の出典。選び方は既存の取得計画(build_plan)の順位と
-        `select_targets`（起点のある出典・注文点数0点の起点のみは対象外・1方向あたりの上限）をそのまま使う。
+        `select_targets`（起点の経路を持つ出典。注文点数0の起点だけの出典も含む・1方向あたり20件まで。起点の経路が全く無い出典は対象外）をそのまま使う。
         除外・保留・期間内・実行中の出典はplanの実行可能な一覧に入らないので選ばれない（上限・保留を迂回しない）。
         最初に選んだ一覧を工程に保存し、再開しても同じ一覧を使う（resumeのたびに対象が広がらない）。"""
         saved = t.result.get("existing_sources")
         if saved is None:
             saved, seen = [], set()
             for sec in ("EXPORT", "IMPORT"):
-                for e in select_targets(plan, sec, MAX_SOURCES_HARD_CAP):
+                for e in select_targets(plan, sec, MAX_SOURCES_HARD_CAP, include_zero_units=True):
                     if e.facts.source_id not in seen:
                         seen.add(e.facts.source_id)
                         saved.append({"source_id": e.facts.source_id, "market": market, "source_type": e.facts.source_type,

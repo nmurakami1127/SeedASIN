@@ -206,3 +206,73 @@ def test_sources_found_by_a_later_discover_retry_are_fetched_without_refetching_
     new_ids = [str(s["source_id"]) for s in eng2.st.tasks["discover:US"].result["sources"]]
     assert new_ids and all(i in recs for i in new_ids) and statuses(eng2)["acquire:US"] == "DONE"
     assert _runs(world, "US", ex_sid) == 1  # 取得済みの出典は取り直さない
+
+
+# ---------------------------------------------------------------- 注文点数0の起点だけを持つ出典（#629相当）
+
+def _zero_world(app_role_factory, tmp_path, n: int = 1, **kw):
+    import uuid
+    t = uuid.uuid4().hex[:6].upper()
+    us0 = [f"B0{t}Z{i}" for i in range(n)]
+    jp0 = [f"B0{t}Y{i}" for i in range(n)]
+    w = World(app_role_factory, tmp_path, us_extra=[(a, 5, 1.0, 0) for a in us0], jp_extra=[(a, 5, 1.0, 0) for a in jp0], **kw)
+    return w, us0, jp0
+
+
+@pytest.mark.parametrize("kind", ["RAISE", "SERVER_ERROR", "BLOCKED", "CAPTCHA_UNSOLVED"])
+def test_zero_unit_origin_sources_are_fetched_when_discover_does_not_finish(app_role_factory, tmp_path, own, monkeypatch, kind):
+    w, us0, jp0 = _zero_world(app_role_factory, tmp_path)
+    us_s, jp_s = uid("AZUS"), uid("AZJP")
+    w.us.seller_asins[us_s], w.jp.seller_asins[jp_s] = w.us_asins[:1], w.jp_asins[:1]
+    us_sid, jp_sid = _register(w, "US", us_s, us0[0]), _register(w, "JP", jp_s, jp0[0])
+    with w.f.get_session("US") as conn, conn.begin():  # 経路は注文点数0（#629と同じ形）
+        assert conn.execute(text("SELECT origin_units FROM acquisition_path WHERE source_id = :s"), {"s": us_sid}).scalar_one() == 0
+    _discover_ends_with(monkeypatch, kind)
+    eng = w.run()
+    assert list(_fetched(eng, "US")) == [str(us_sid)] and list(_fetched(eng, "JP")) == [str(jp_sid)]
+    assert any(us_s in u for u in w.us.urls) and any(jp_s in u for u in w.jp.urls)
+
+
+def test_positive_unit_sources_come_first_and_the_page_cap_stops_the_rest(app_role_factory, tmp_path, own, monkeypatch):
+    w, us0, _ = _zero_world(app_role_factory, tmp_path, cfg_extra={"totals": {"max_total_pages": 1}, "cross": {"enabled": False}})
+    zs, ps = uid("AZERO"), uid("APOS")
+    w.us.seller_asins[zs], w.us.seller_asins[ps] = w.us_asins[:1], w.us_asins[1:2]
+    z_sid = _register(w, "US", zs, us0[0])
+    p_sid = _register(w, "US", ps, w.us_top)  # 注文点数>0
+    _discover_ends_with(monkeypatch, "RAISE")
+    eng = w.run()
+    recs = eng.st.tasks["acquire:US"].result["sources"]
+    assert recs[str(p_sid)]["mode"] == "FETCHED" and recs[str(z_sid)]["mode"] == "HELD"
+
+
+def test_existing_source_selection_is_capped_per_direction(app_role_factory, tmp_path, own, monkeypatch):
+    w, us0, _ = _zero_world(app_role_factory, tmp_path, n=1)
+    for i in range(23):
+        _register(w, "US", uid("ACAP"), us0[0])
+    _discover_ends_with(monkeypatch, "RAISE")
+    eng = w.run()
+    assert len(eng.st.tasks["acquire:US"].result["existing_sources"]) == 20  # MAX_SOURCES_HARD_CAP
+
+
+def test_held_excluded_running_zero_unit_sources_and_no_origin_sources_are_not_fetched(app_role_factory, tmp_path, own, monkeypatch):
+    w, us0, _ = _zero_world(app_role_factory, tmp_path)
+    held, excl, running, ok, noorigin = (uid(p) for p in ("AZH", "AZE", "AZR", "AZO", "AZN"))
+    for s in (held, excl, running, ok, noorigin):
+        w.us.seller_asins[s] = w.us_asins[:1]
+    h, x, r, k = (_register(w, "US", s, us0[0]) for s in (held, excl, running, ok))
+    reg = SourceRegistry(w.f, actor="tester")
+    n_sid = reg.register_path("US", "SELLER", noorigin, "").source.source_id  # 起点の経路なし
+    reg.set_status("US", h, "ON_HOLD", "テスト保留")
+    reg.set_status("US", x, "EXCLUDED", "テスト除外")
+    from acquisition.lease import AcquisitionRunService
+    AcquisitionRunService(w.f, actor="tester").claim("US", r)
+    _discover_ends_with(monkeypatch, "RAISE")
+    eng = w.run()
+    assert list(_fetched(eng, "US")) == [str(k)]
+    for s in (held, excl, running, noorigin):
+        assert not any(s in u for u in w.us.urls), s
+    assert str(n_sid) not in eng.st.tasks["acquire:US"].result["sources"]
+    # 取得間隔内: 新しいworkflowでは選ばれず、取り直さない
+    cfg2 = config_from_dict({**w.cfg_dict, "state_dir": str(tmp_path / "wf_again")})
+    eng2 = w.run(w.engine(cfg2))
+    assert _runs(w, "US", k) == 1 and str(k) not in eng2.st.tasks["acquire:US"].result["sources"]

@@ -1508,7 +1508,7 @@ Amazonのナビゲーションはdomcontentloadedで待機し、第三者リソ�
 - **変更（`workflow/engine.py`・`workflow/store.py`・`workflow/watch.py`）**:
   - 依存の判定を `store.dep_blocks` に集約（`Engine._ready` と `Watcher._due` が同じ規則を使う）。`acquire` は `discover` が**実行前(PENDING)の間だけ**待つ。実行後に FAILED/HELD/WAITING/UNKNOWN で終わっていても待たない。`expand`/`cross` 等の他の依存と、取得に使える結果があれば先へ進める規則（`usable`）は変えない。
   - 判定は実行時に行うため、保存済みの古い状態（`acquire:{L}` の `deps=["discover:{L}"]`）にも効く（状態の書き換え・移行は不要）。
-  - `_run_acquire` の入力 = 発見の結果の出典（あれば）+ この市場・この起点レポートの既存の取得可能な出典（重複なし）。既存の出典は既存の `build_plan`（除外・保留・取得間隔・実行中・lease を判定済みの実行可能な一覧）から `select_targets`（起点を持つ出典、注文点数0の起点のみは対象外、1方向20件まで）で選ぶ。新しい独自の選択ロジックは作っていない。選んだ一覧は工程に保存し（`existing_sources`）、再開しても対象が広がらない。
+  - `_run_acquire` の入力 = 発見の結果の出典（あれば）+ この市場・この起点レポートの既存の取得可能な出典（重複なし）。既存の出典は既存の `build_plan`（除外・保留・取得間隔・実行中・lease を判定済みの実行可能な一覧）から `select_targets`（起点の経路を持つ出典、1方向20件まで。`include_zero_units=True`）で選ぶ。注文点数0の起点だけを持つ出典（例: US #629）も対象にした理由: USレーンは `ordered_then_zero`（注文点数0の起点も対象）の設計で、除外すると発見が失敗するUSで取得されないため。planが取得可能と判定した出典を、planの順位（注文点数>0が先）のまま選ぶ。起点の経路が全く無い出典（NO_ORIGIN）は対象外のまま。新しい独自の選択ロジックは作っていない。選んだ一覧は工程に保存し（`existing_sources`）、再開しても対象が広がらない。
   - 発見が失敗の後の再試行で成功し、取得が先に終わっていた場合は、新しく登録された出典を取得するため `acquire`（と、その結果から作る `expand`）を `drive` の中でPENDINGに戻す（`_reopen_acquire`）。取得済みの出典の記録は残り、取り直さない。人が「失敗をスキップ」した工程は戻さない。
 - **変えていないもの**: 出典ごとの枝の分離、取得履歴・cycle/cursor・lease、日次・合計の取得上限（`max_total_pages`・`daily`・`max_new_sources`）、保留・除外判定（`acquisition.eligibility`、HOLD/EXCLUDE、`storefront_blocked_seller`）。DBスキーマ・alembic・`acquisition/`・`asin_collector/`。
 - **発見がDONEのときの変化**: 発見の出典に加えて既存の取得可能な出典も同じ取得工程で処理される（従来は発見で登録された出典だけ）。上限は同じものが効く。

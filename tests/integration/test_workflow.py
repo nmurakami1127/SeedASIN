@@ -178,7 +178,8 @@ class FakePorts:
 class World:
     """US・JPの架空データ一式（起点ASIN・販売元・出典のASIN）と、設定。"""
 
-    def __init__(self, app_role_factory, tmp_path, *, cfg_extra: dict | None = None, single: bool = False) -> None:
+    def __init__(self, app_role_factory, tmp_path, *, cfg_extra: dict | None = None, single: bool = False,
+                 us_extra: list | None = None, jp_extra: list | None = None) -> None:
         self.f, self.tmp = app_role_factory, tmp_path
         t = uuid.uuid4().hex[:6].upper()
         self.us_top, self.us_low = f"B0{t}U1", f"B0{t}U2"
@@ -187,9 +188,9 @@ class World:
         self.us_asins = [f"B0{t}A{i}" for i in range(3)]
         self.jp_asins = [f"B0{t}B{i}" for i in range(3)]
         self.cross_jp_seller, self.cross_us_seller = uid("AXJ"), uid("AXU")
-        us_rows = [(self.us_top, 80, 3.0, 9)] + ([] if single else [(self.us_low, 10, 1.0, 2)])
+        us_rows = [(self.us_top, 80, 3.0, 9)] + ([] if single else [(self.us_low, 10, 1.0, 2)]) + list(us_extra or [])
         self.us_import = make_active_report(app_role_factory, tmp_path, "US", us_rows, name="us.csv")
-        self.jp_import = make_active_report(app_role_factory, tmp_path, "JP", [(self.jp_top, 60, 2.0, 7)], name="jp.csv")
+        self.jp_import = make_active_report(app_role_factory, tmp_path, "JP", [(self.jp_top, 60, 2.0, 7)] + list(jp_extra or []), name="jp.csv")
         self.us = Routing({self.us_top: self.us_seller, self.us_low: "A9SECOND0001", self.us_asins[0]: self.cross_us_seller,
                            self.jp_asins[0]: self.cross_us_seller}, {self.us_seller: self.us_asins})
         self.jp = Routing({self.jp_top: self.jp_seller, self.us_asins[0]: self.cross_jp_seller}, {self.jp_seller: self.jp_asins})
