@@ -146,6 +146,65 @@ def compute_source_yield(conn: Connection, marketplace: str, hours: float = 24, 
     return rep
 
 
+# ---------------------------------------------------------------------- 期間の合計と終了理由の内訳（workflow outcome用の薄い関数。docs/DEVIATIONS.md #97）
+
+_OUTCOME_SQL = text("""
+SELECT COALESCE(outcome, status) AS o, COALESCE(truncation_reason, '') AS tr, COALESCE(interrupt_kind, '') AS ik, count(*) AS n
+FROM collector_run
+WHERE marketplace = :m AND started_at >= :s AND started_at < :e AND run_type <> 'ASIN_PAGE'
+GROUP BY 1, 2, 3
+""")
+
+
+_UNFINISHED = "('RUNNING', 'CAPTCHA_WAIT')"   # 実行中（途中・未確定）のrun。確定値には含めない
+
+
+def _confirmed(sql: str) -> str:
+    return sql.replace("run_type <> 'ASIN_PAGE'", f"run_type <> 'ASIN_PAGE' AND status NOT IN {_UNFINISHED}", 1)
+
+
+def compute_window_totals(conn: Connection, marketplace: str, start: datetime, end: datetime, *, confirmed_only: bool = True) -> YieldRow:
+    """[start, end) の合計行だけを求める（`compute_source_yield`の合計と同じSQL・同じ初見の定義）。SELECTのみ。
+    confirmed_only=True（既定）は、実行中(RUNNING/CAPTCHA_WAIT)のrunを除く（途中のrunは確定値に含めない）。"""
+    if not start < end:
+        raise ValueError("startはendより前にしてください")
+    sql = _confirmed(_TOTAL_SQL.text) if confirmed_only else _TOTAL_SQL.text
+    t = conn.execute(text(sql), {"m": marketplace, "s": start, "e": end}).one()
+    return YieldRow("合計", None, "", t.runs, int(t.pages), t.rows_, t.uniq, t.new_)
+
+
+def compute_window_by_source(conn: Connection, marketplace: str, start: datetime, end: datetime, *, confirmed_only: bool = True) -> list[YieldRow]:
+    """[start, end) の出典別の行（run数・ページ数・保存行・重複なしASIN・初見ASIN）。`source-yield`と同じSQL。SELECTのみ。"""
+    sql = _confirmed(_BY_SOURCE_SQL.text) if confirmed_only else _BY_SOURCE_SQL.text
+    rows = []
+    for r in conn.execute(text(sql), {"m": marketplace, "s": start, "e": end}):
+        name, kind = _label(r.source_id, r.run_type, r.source_type, r.display_primary, r.display_qualifier)
+        rows.append(YieldRow(name, r.source_id, kind, r.runs, int(r.pages), r.rows_, r.uniq, r.new_))
+    return rows
+
+
+def run_outcome_counts(conn: Connection, marketplace: str, start: datetime, end: datetime) -> list[dict]:
+    """[start, end) に開始したrunの終了理由の内訳（outcome・truncation_reason・interrupt_kind ごとの件数）。SELECTのみ。"""
+    return [{"outcome": r.o, "truncation_reason": r.tr or None, "interrupt_kind": r.ik or None, "runs": int(r.n)}
+            for r in conn.execute(_OUTCOME_SQL, {"m": marketplace, "s": start, "e": end})]
+
+
+_RUN_FIRST_SEEN_SQL = text("""
+SELECT count(*) AS total,
+       count(*) FILTER (WHERE NOT EXISTS (
+           SELECT 1 FROM collector_asin b JOIN collector_run r2 ON r2.id = b.collector_run_id
+           WHERE b.marketplace = :m AND b.asin = a.asin AND r2.started_at < r.started_at)) AS new_
+FROM collector_asin a JOIN collector_run r ON r.id = a.collector_run_id
+WHERE a.marketplace = :m AND a.collector_run_id = :rid
+""")
+
+
+def run_first_seen(conn: Connection, marketplace: str, run_id: int) -> tuple[int, int]:
+    """1つのrunの (保存行数, うち初見ASIN数)。初見の定義は他と同じ（そのASINを含む最も古いrunの開始より前に行が無い）。SELECTのみ。"""
+    r = conn.execute(_RUN_FIRST_SEEN_SQL, {"m": marketplace, "rid": run_id}).one()
+    return int(r.total), int(r.new_)
+
+
 # ---------------------------------------------------------------------- 表示・CSV
 
 def _pct(v: float | None) -> str:

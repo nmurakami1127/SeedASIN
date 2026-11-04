@@ -5,6 +5,8 @@
     python -m workflow.cli run    --config config/workflow.json           # 計画に従って実行（人の操作が必要な所で待機/保留）
     python -m workflow.cli status [--id wf-…]                             # 工程別の完了・待機・保留・失敗・結果不明
     python -m workflow.cli resume [--id wf-…] [--allow-duplicate <投入キー>]   # 保存済み状態から再開（完了工程は繰り返さない）
+    python -m workflow.cli outcome --market US|JP|ALL [--since …] [--until …]  # 成果（読み取りのみ。取得・初見ASIN・投入・持ち越し）
+    python -m workflow.cli reconcile [--apply]                             # 未完了workflowの整理。既定はdry-run（何も書かない）
     python -m workflow.cli backup  --out backups/wf.zip                    # workflow状態・投入台帳・マニフェストをまとめて保存
     python -m workflow.cli restore --zip backups/wf.zip [--force]          # 検証して復元
 
@@ -65,7 +67,9 @@ def mode_summary(t) -> str:
             lab = {"REUSED": "再利用(保存済みの取得結果)", "FETCHED": "新規取得", "EMPTY": "新規取得(正常な0件)", "HELD": "保留",
                    "CAPTCHA": "待機(CAPTCHA)", "FAILED": "失敗", "SKIPPED_AT_CLAIM": "スキップ",
                    "SKIPPED_POLICY": "枝をスキップ(除外/保留/期間内)"}.get(r["mode"], r["mode"])
-            if r["mode"] in ("FETCHED", "EMPTY"):
+            if r["mode"] == "HELD" and r.get("pause") == "PAUSED_PAGE_CAP":
+                lab = "正常な途中終了(取得ページの上限・次回に持ち越し)"
+            elif r["mode"] in ("FETCHED", "EMPTY"):
                 lab += PLAN_LABEL.get(r.get("plan"), "")
                 lab += "・一巡完了" if r.get("cycle_complete") else "・上限打切り" if r.get("truncated") else ""  # 打切りと取得完了を区別する
             elif r["mode"] == "HELD" and r.get("daily"):
@@ -104,7 +108,13 @@ def status_lines(st: State) -> list[str]:
     u = usage(st)
     lines.append(f"  この実行で新しく使った量: Amazon新規取得 {u['pages']}ページ(出典{u['source_pages']}+商品ページ{u['product_pages']}) / 新規出典 {u['new_sources']}件 / "
                  f"新規投入 {u['new_submissions']}件（引き継ぎ {u['adopted_submissions']}件）")
-    done_sub = [t for t in st.tasks.values() if t.kind == "submit" and t.status == "DONE"]
+    handed = [t for t in st.tasks.values() if t.kind == "submit" and t.status == "DONE" and t.result.get("handoff")]
+    if handed:
+        lines.append(f"  投入台帳へ引き渡し(HANDED_OFF): {len(handed)}件 ← 登録完了ではありません。未登録のASINは投入台帳で管理されます")
+    carried = [t for t in st.tasks.values() if t.result.get("closed_reason") == "CARRIED_OVER"]
+    for t in carried:
+        lines.append(f"  持ち越し: {t.id} の{len(t.result.get('carried_over', []))}出典を出典単位の再開待ちとして引き継ぎ済み（{t.result.get('handed_off_to')}）")
+    done_sub = [t for t in st.tasks.values() if t.kind == "submit" and t.status == "DONE" and not t.result.get("handoff")]
     if done_sub:
         lines.append("  対応記録済みの投入:")
         for t in done_sub:
@@ -315,6 +325,54 @@ def _cmd_status(a, **_) -> int:
     return rc
 
 
+def _cmd_outcome(a, factory=None, **_) -> int:
+    from workflow.outcome import build_outcome, format_outcome, parse_when
+    from datetime import datetime, timedelta, timezone
+
+    markets = ["US", "JP"] if a.market == "ALL" else [a.market]
+    now = datetime.now(timezone.utc)
+    until = parse_when(a.until, now)
+    since = parse_when(a.since, until - timedelta(hours=24))
+    if not since < until:
+        print("[中止] --since は --until より前にしてください")
+        return 2
+    o = build_outcome(factory or _factory(), markets, since, until, state_dir=a.state_dir, submission_dir=a.submission_dir, top=a.top)
+    print("\n".join(format_outcome(o)))
+    return 0
+
+
+def _cmd_reconcile(a, factory=None, confirm=None, **_) -> int:
+    from tool_submission.ledger import SubmissionLedger
+    from workflow.progress import SourceProgress, resume_snapshot
+    from workflow.reconcile import apply_reconcile, format_scan, scan
+
+    store = WorkflowStore(a.state_dir)
+    ledger = SubmissionLedger(Path(a.submission_dir) / "ledger.jsonl")
+    if not a.apply:
+        print("\n".join(format_scan(scan(store, ledger))))
+        print("（dry-runです。何も書いていません。整理するなら --apply）")
+        return 0
+    if confirm is None:
+        if not sys.stdin.isatty():
+            print("[中止] --apply は対話端末でのy/n確認が必要です")
+            return 2
+        confirm = lambda q: input(q).strip().lower() == "y"  # noqa: E731
+    fac = factory
+    snap = (lambda m, sid: resume_snapshot(fac, m, sid)) if fac is not None else None
+    try:
+        out = apply_reconcile(store, ledger, SourceProgress(Path(a.state_dir) / "source_progress.jsonl"), snapshot=snap, confirm=confirm)
+    except RuntimeError as exc:
+        print(f"[中止] {exc}")
+        return 2
+    print("\n".join(format_scan(out["scan"], apply=True)))
+    if out.get("declined"):
+        print("確認が取れなかったので何も変更していません")
+        return 2
+    for c in out["changed"]:
+        print(f"  整理: {c['workflow']} → {c['overall_after']}（元の状態を退避: {c['backup']}）")
+    return 0
+
+
 def _cmd_backup(a, **_) -> int:
     info = WorkflowStore(a.state_dir).engine_lock_info()
     if info and not a.while_running:
@@ -368,6 +426,17 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--id", default=None)
     sp.add_argument("--state-dir", default="exports/workflow")
     sp.add_argument("--allow-duplicate", action="append", help="重複候補として保留された投入キーを、意図した再投入として許可する")
+    sp = add("outcome", _cmd_outcome, "成果の表示（読み取りのみ）: 取得・初見ASIN・投入・持ち越し・出典別の効率")
+    sp.add_argument("--market", required=True, choices=["US", "JP", "ALL"])
+    sp.add_argument("--since", default=None, help="開始（日付/日時。タイムゾーン無しはJST）。既定は--untilの24時間前")
+    sp.add_argument("--until", default=None, help="終了（含まない）。既定は現在")
+    sp.add_argument("--top", type=int, default=15, help="出典別に表示する件数（ページ数の多い順）")
+    sp.add_argument("--state-dir", default="exports/workflow")
+    sp.add_argument("--submission-dir", default="exports/tool_submission")
+    sp = add("reconcile", _cmd_reconcile, "未完了workflowの整理。既定はdry-run（何も書かない）。--applyはy/n確認が必要")
+    sp.add_argument("--apply", action="store_true")
+    sp.add_argument("--state-dir", default="exports/workflow")
+    sp.add_argument("--submission-dir", default="exports/tool_submission")
     for n, fn, h in (("backup", _cmd_backup, "状態・台帳・マニフェストをまとめて保存"), ("restore", _cmd_restore, "検証して復元")):
         sp = add(n, fn, h)
         sp.add_argument("--state-dir", default="exports/workflow")
@@ -381,10 +450,10 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
-def main(argv: list[str] | None = None, *, factory=None, ports=None) -> int:
+def main(argv: list[str] | None = None, *, factory=None, ports=None, confirm=None) -> int:
     a = build_parser().parse_args(argv)
     try:
-        return a.func(a, factory=factory, ports=ports)
+        return a.func(a, factory=factory, ports=ports, **({"confirm": confirm} if a.func is _cmd_reconcile else {}))
     except (ConfigError, BackupError, StateCorrupt) as exc:
         print(f"[中止] {exc}")
         return 2

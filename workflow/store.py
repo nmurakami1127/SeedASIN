@@ -124,7 +124,7 @@ def usage(st: "State") -> dict:
             "new_submissions": sum(1 for t in subs if t.result.get("send_started")),
             "adopted_submissions": sum(1 for t in subs if t.result.get("adopted")),
             "submit_asins": sum(int(t.result.get("asin_count", 0)) for t in subs if t.status == "DONE" and not t.result.get("adopted")
-                                or t.result.get("send_started"))}
+                                and not t.result.get("handoff") or t.result.get("send_started"))}
 
 
 class WorkflowStore:

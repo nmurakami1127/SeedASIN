@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import uuid
 import time
 from datetime import datetime, timedelta, timezone
@@ -42,6 +43,9 @@ from workflow.daily_usage import DailyUsage, jst_day, next_jst_midnight
 from workflow.selection import PendingChecker, reusable_run
 from workflow.dedupe import SUBMITTED_STATES, find_duplicates, set_hash  # noqa: F401
 from workflow.ports import PortBlocked, Ports
+from workflow.progress import (
+    CARRY_IN_MAX, PAUSED_PAGE_CAP, SourceProgress, assess_restart, note_low_yield, restart_gate, resume_snapshot,
+)
 from workflow.store import DONE_STATES, State, Task, WorkflowStore, dep_blocks, now_iso, usage
 
 SUCCESS = tuple(USABLE_FETCH_OUTCOMES)
@@ -93,6 +97,7 @@ class Engine:
         self.runs = AcquisitionRunService(factory, actor=actor)
         self.ledger = SubmissionLedger(Path(cfg.submission_dir) / "ledger.jsonl")
         self.usage = DailyUsage(Path(cfg.state_dir) / "daily_usage.jsonl", now=self.now)  # watch全体で共有する日次使用量（JST）
+        self.progress = SourceProgress(Path(cfg.state_dir) / "source_progress.jsonl", now=self.now)  # 出典単位の進行台帳（docs/DEVIATIONS.md #97）
         self.should_stop: Callable[[], bool] | None = None  # watchの停止要求（工程の間で確認する）
         self.deferred_origins: set[str] = set()  # watchが別の未完了workflowで管理中の起点
         self.st: State | None = None
@@ -116,6 +121,11 @@ class Engine:
         if retry_after is not None:
             t.retry_after = retry_after
         else:
+            if status == "HELD" and mins:  # 同じ理由の保留を繰り返すとき、3回目以降は再試行の間隔を2倍にする（最大24時間）。無意味な再開を減らす
+                same = t.result.get("_same_hold") or {}
+                n = same.get("n", 0) + 1 if same.get("detail") == detail[:500] else 0
+                t.result["_same_hold"] = {"detail": detail[:500], "n": n}
+                mins = min(mins * (2 ** max(0, n - 1)), 24 * 60)
             t.retry_after = (self.now() + timedelta(minutes=mins)).strftime("%Y-%m-%dT%H:%M:%SZ") if mins else ""
         if result:
             t.result.update(result)
@@ -485,8 +495,20 @@ class Engine:
         saved = t.result.get("existing_sources")
         if saved is None:
             saved, seen = [], set()
+            slow = self.progress.deprioritized(market)  # 低効率で後退中の出典（除外ではない。再評価時刻まで後回し）
             for sec in ("EXPORT", "IMPORT"):
-                for e in select_targets(plan, sec, MAX_SOURCES_HARD_CAP, include_zero_units=True):
+                picks = select_targets(plan, sec, MAX_SOURCES_HARD_CAP, include_zero_units=True)
+                if slow & {e.facts.source_id for e in picks}:
+                    # 後回しにした分は、同じ順位・同じ条件(select_targetsと同じ)で次の候補から補う（1方向あたりの上限は変えない）
+                    picks, taken = [], set()
+                    for e in plan.sections.get(sec, []):
+                        if e.rep is None or e.facts.source_id in slow or e.facts.source_id in taken:
+                            continue
+                        taken.add(e.facts.source_id)
+                        picks.append(e)
+                        if len(picks) >= MAX_SOURCES_HARD_CAP:
+                            break
+                for e in picks:
                     if e.facts.source_id not in seen:
                         seen.add(e.facts.source_id)
                         saved.append({"source_id": e.facts.source_id, "market": market, "source_type": e.facts.source_type,
@@ -508,6 +530,8 @@ class Engine:
         if include_existing:  # 発見で登録された出典 + 既存の取得可能な出典（重複なし）。発見の成否に左右されない
             have = {s_["source_id"] for s_ in sources}
             sources = list(sources) + [x for x in self._existing_sources(t, plan, market) if x["source_id"] not in have]
+            have |= {x["source_id"] for x in sources}
+            sources += [x for x in self._carried_in(t, market, set(entries) | set(blocked)) if x["source_id"] not in have]  # 再試行時刻に達した持ち越し
         for s_ in sources:  # 完了(取得/再利用/正常な0件)以外の記録は、毎回DBの状態から評価し直す（除外・保留が解除されていれば取得できる）
             if recs.get(str(s_["source_id"]), {}).get("mode") not in DONE_BRANCH_MODES:
                 recs.pop(str(s_["source_id"]), None)
@@ -528,6 +552,7 @@ class Engine:
                 recs[str(sid)] = {"mode": "HELD", "reason": f"claimできませんでした: {it.reason}"}
             else:
                 self._record_fetch(recs, sid, it.report, 0)
+                self._note_fetch(market, sid, t, it.report, 0, None, None)
             self._save_task(t)
         if fetch_ids:
             with self._fetcher(market, True) as fetcher:
@@ -536,8 +561,29 @@ class Engine:
                     overlap = d.overlap_pages
                     remaining = self.cfg.totals.max_total_pages - self._pages_used()
                     if remaining - overlap <= 0:
-                        recs[str(sid)] = {"mode": "HELD", "reason": f"取得ページの上限（{self.cfg.totals.max_total_pages}）に達しています"}
+                        # 正常な途中終了（失敗・異常ではない）。再開位置はDBの取得履歴にあり、出典単位の持ち越しとして次のworkflowに引き継ぐ
+                        recs[str(sid)] = {"mode": "HELD", "pause": PAUSED_PAGE_CAP,
+                                          "reason": f"取得ページの上限（{self.cfg.totals.max_total_pages}）に達しています"}
                         continue
+                    cyc = d.cycle
+                    resume_no = cyc.resume_page_no if cyc else None
+                    banded = self.cfg.price_band_for(market) is not None
+                    busy = self.progress.guard(market, sid, plan=d.plan, resume_page_no=resume_no, banded=banded)
+                    if busy:  # 進行中の二重取得の防止のみ。正常な続き取得(CONTINUE)や取り直しは止めない
+                        recs[str(sid)] = {"mode": "HELD", "pause": busy["kind"], "reason": busy["reason"], "retry_at": busy["retry_at"]}
+                        continue
+                    assessment = None
+                    if d.plan == "RESTART_BROKEN":  # 無条件に先頭から取り直さない: 直前の一巡が十分に進んでいたら、再取得を避けて待つ
+                        try:
+                            assessment = assess_restart(self.factory, market, sid, cyc.cycle_id if cyc else None)
+                        except Exception:  # noqa: BLE001
+                            assessment = None
+                        gate = restart_gate(self.progress, market, sid, assessment)
+                        if gate:
+                            recs[str(sid)] = {"mode": "HELD", "pause": gate["kind"], "reason": gate["reason"], "retry_at": gate["retry_at"], "restart": assessment}
+                            continue
+                    ov = self.progress.range_overlap(market, sid, plan=d.plan, resume_page_no=resume_no, banded=banded)  # 計測のみ
+                    start_page = None if banded else (int(resume_no or 1) if d.plan == "CONTINUE" else 1)
                     rid = f"{self.st.workflow_id}:{t.id}:src{sid}:a{t.attempts}"
                     # 続きでは、前回の最後のページの取り直し(overlap)も日次のページ使用量に含める
                     granted = self._grant_pages(rid, min(lim.pages_per_source, remaining - overlap) + overlap, t)
@@ -551,15 +597,23 @@ class Engine:
                                        close_on_repeated_page=self.cfg.close_on_repeated_page,
                                        price_band=self.cfg.price_band_for(market))
                     bf = self._budget(fetcher, rid, granted, t)
-                    items = run_batch(self.runs, self.factory, bf, market, [sid], limits=limits, sleep=self.sleep)
+                    self.progress.append(market, sid, "ACQUIRING", wf=self.st.workflow_id, task=t.id, pid=os.getpid(), plan=d.plan,
+                                         start_page=start_page, overlap_with_recent=ov, restart=assessment)
+                    try:
+                        items = run_batch(self.runs, self.factory, bf, market, [sid], limits=limits, sleep=self.sleep)
+                    except BaseException:
+                        self.progress.append(market, sid, "ABORTED", wf=self.st.workflow_id, task=t.id, reason="exception")
+                        raise
                     it = items[0]
                     if it.result == "SKIPPED":  # claimの時点で取得できなかった（他の実行中・状態の変化）→ 一時的な保留として扱う
+                        self.progress.append(market, sid, "ABORTED", wf=self.st.workflow_id, task=t.id, reason=f"claim: {it.reason}"[:200])
                         self.usage.release(rid)
                         recs[str(sid)] = {"mode": "HELD", "reason": f"claimできませんでした: {it.reason}"}
                         continue
                     rp = it.report
                     self.usage.commit(rid, {"pages": min(bf.calls, granted)})
                     self._record_fetch(recs, sid, rp, bf.calls)
+                    self._note_fetch(market, sid, t, rp, bf.calls, start_page, recs[str(sid)])
                     self._save_task(t)
                     if rp.outcome == "DAILY_LIMIT":  # 日次枠が尽きた: 残りの出典も今日は開かない（失敗には数えない）
                         for rest in fetch_ids[fetch_ids.index(sid) + 1:]:
@@ -591,6 +645,9 @@ class Engine:
                 until = max((b.until for b in (d.blockers if d else []) if b.until), default=None)  # 冷却などが明ける時刻（DB時刻）
                 recs[str(sid)] = {"mode": "HELD", "reason": why + "（利用できる保存済みの結果もありません）",
                                   "retry_at": (until + timedelta(seconds=60)).astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ") if until else None}
+        for sid_, r_ in recs.items():  # 持ち越しだった出典が、再利用・正常な0件・方針によるスキップで解決していれば、持ち越しを解消する
+            if r_["mode"] in ("REUSED", "EMPTY", "SKIPPED_POLICY"):
+                self.progress.resolve(market, int(sid_), wf=self.st.workflow_id, reason=r_["mode"])
         self._save_task(t)
         usable = sum(1 for r in recs.values() if r["mode"] in ("FETCHED", "REUSED", "PARTIAL_SAVED"))
         t.result["usable"] = usable
@@ -631,6 +688,35 @@ class Engine:
             retry = None
         return self._set(t, "HELD", summary + ("。JST 0:00以降に再開します" if daily else f"。再実行可能: {retry}" if retry else ""), retry_after=retry,
                          **({"daily_hold": "pages"} if daily else {}))
+
+    def _carried_in(self, t: Task, market: str, known: set) -> list[dict]:
+        """再試行時刻に達した持ち越しの出典（この入口の取得計画に載っているものだけ）。最初に選んだ一覧を工程に保存し、再開しても広がらない。"""
+        saved = t.result.get("carried_in")
+        if saved is None:
+            saved = [{"source_id": sid, "market": market, "source_type": None, "key": None}
+                     for sid in self.progress.due_carried(market, limit=CARRY_IN_MAX, lane=t.lane) if sid in known]
+            t.result["carried_in"] = saved
+        return saved
+
+    def _note_fetch(self, market: str, sid: int, t: Task, rp, accesses: int, start_page: int | None, rec: dict | None) -> None:
+        """出典単位の進行台帳に取得の結果を残す。ページ上限などで一巡が続きを残して終わったときは、再開位置の控えを記録に付ける。
+        ページ数が十分ある実行は初見率を測り、低効率なら優先度を下げる（除外ではない）。台帳の失敗は取得結果に影響させない。"""
+        try:
+            ok = rp.outcome in SUCCESS or rp.outcome == "SUCCESS_EMPTY"
+            self.progress.append(market, sid, "ACQUIRED" if ok else "ATTEMPTED", wf=self.st.workflow_id, task=t.id, run_id=rp.run_id,
+                                 cycle_id=rp.cycle_id, outcome=rp.outcome, pages=rp.pages, asins=rp.asins, start_page=start_page,
+                                 drift=rp.drift, truncation=rp.truncation_reason, error_code=rp.error_code, accesses=accesses)
+            if ok and rp.outcome == "SUCCESS_TRUNCATED" and rec is not None:
+                rec["resume"] = resume_snapshot(self.factory, market, sid)
+            if ok and rp.pages >= 1:
+                from seller_performance.source_yield import run_first_seen
+                with self.factory.get_session(market) as conn, conn.begin():
+                    total, new = run_first_seen(conn, market, rp.run_id)
+                if rec is not None:
+                    rec["first_seen"] = {"total": total, "new": new}
+                note_low_yield(self.progress, market, sid, wf=self.st.workflow_id, run_id=rp.run_id, pages=rp.pages, total=total, new=new)
+        except Exception as exc:  # noqa: BLE001
+            self._event(t.id, f"progress note failed: {type(exc).__name__}")
 
     def _record_fetch(self, recs: dict, sid: int, rp, accesses: int) -> None:
         """1出典の取得結果を、枝の記録に変換する。正常な0件(SUCCESS_EMPTY)は一巡完了（投入するASINは無い）、日次枠での中断は
@@ -788,7 +874,12 @@ class Engine:
                         "also_from": len(i.also_from)})
                 made.append(i.key)
         buffering = f"（同一出典で{self.cfg.batch_target_asins:,} ASIN単位への蓄積を継続）" if self.cfg.batch_target_asins and not made else ""
-        self._set(t, "DONE", f"投入計画{len(made)}件" + buffering + (f"（見送り{len(skipped)}件）" if skipped else ""), keys=made, skipped=skipped)
+        extra = {}
+        if buffering:  # 仕様どおりの繰り越し（計画0件）を成果として見えるようにする。蓄積中の取得run（次回以降の投入計画に入る）
+            extra["carried_forward"] = {"reason": "BATCH_TARGET_BUFFERING", "batch_target_asins": self.cfg.batch_target_asins,
+                                        "run_ids": [rec["run_id"] for rec in acq.result.get("sources", {}).values()
+                                                    if rec["mode"] in ("FETCHED", "REUSED", "PARTIAL_SAVED") and rec.get("run_id")]}
+        self._set(t, "DONE", f"投入計画{len(made)}件" + buffering + (f"（見送り{len(skipped)}件）" if skipped else ""), keys=made, skipped=skipped, **extra)
 
     # ------------------------------------------------------------------ 投入・メモ保存・対応記録
 
