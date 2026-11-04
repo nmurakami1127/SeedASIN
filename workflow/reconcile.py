@@ -60,26 +60,49 @@ def classify_task(t, ledger_states: dict, allow=()) -> tuple[str, str, tuple | N
     return "E", t.status, ("task", t.id)
 
 
-def read_asins(path) -> set[str] | None:
+def resolve_input(path, bases: tuple = ()) -> Path | None:
+    """台帳のinput_file（Windows形式 `exports\\tool_submission\\x.txt` を含む）を読めるパスにする。`\\`を`/`に正規化し、そのまま・基準ディレクトリからの相対・
+    `tool_submission/`以降を投入ディレクトリ直下に置いた形、の順に試す。見つからなければNone（INPUT_FILE_MISSING）。"""
+    if not path or not isinstance(path, str):
+        return None
+    norm = path.replace("\\", "/")
+    cands = [Path(norm)]
+    for b in bases:
+        cands.append(Path(b) / norm)
+        if "tool_submission/" in norm:
+            cands.append(Path(b) / norm.split("tool_submission/", 1)[1])
+    for c in cands:
+        try:
+            if c.is_file():
+                return c
+        except OSError:
+            continue
+    return None
+
+
+def read_asins(path, bases: tuple = ()) -> set[str] | None:
+    f = resolve_input(path, bases)
+    if f is None:
+        return None
     try:
-        return {x.strip().upper() for x in Path(path).read_text(encoding="utf-8").splitlines() if x.strip()}
-    except (OSError, TypeError):
+        return {x.strip().upper() for x in f.read_text(encoding="utf-8-sig").splitlines() if x.strip()}
+    except OSError:
         return None
 
 
-def explain_repeat(key: str, states: dict) -> dict:
+def explain_repeat(key: str, states: dict, bases: tuple = ()) -> dict:
     """REPEAT_OF_EARLIER_CYCLE の1キーの説明（読み取りのみ）: 台帳の状態、同じ業務方向で**登録済み**（SUBMITTED_STATES）の別の投入キーとのASIN集合の重なり、
     まだどの登録済みの集合にも無いASIN（=未登録のまま残る分）。入力ファイルが読めなければ件数はNone。"""
     st = states.get(key)
     m = (st.manifest if st else None) or {}
-    mine = read_asins(m.get("input_file"))
+    mine = read_asins(m.get("input_file"), bases)
     reg = []
     union: set[str] = set()
     for k, o in states.items():
         om = o.manifest or {}
         if k == key or o.state not in SUBMITTED_STATES or om.get("direction") != m.get("direction") or om.get("business_market") != m.get("business_market"):
             continue
-        theirs = read_asins(om.get("input_file"))
+        theirs = read_asins(om.get("input_file"), bases)
         if theirs is None or mine is None:
             continue
         ov = mine & theirs
@@ -105,9 +128,12 @@ def explain_repeat(key: str, states: dict) -> dict:
     return out
 
 
-def scan(store: WorkflowStore, ledger: SubmissionLedger, *, explain: bool = False) -> dict:
+def scan(store: WorkflowStore, ledger: SubmissionLedger, *, explain: bool = False, bases: tuple | None = None) -> dict:
     """読み取りのみ。未完了workflowごとの区分と、重複を除いた集計を返す。D（人手が必要）は理由別に、キー数とworkflow数を分けて数える。"""
     states = ledger.all_states()
+    if bases is None:   # 相対パスの基準: 投入ディレクトリ(ledgerのある所)・その親・その親の親（カレントは常に最初に試す）
+        sub = Path(ledger.path).parent
+        bases = (sub, sub.parent, sub.parent.parent)
     rows, dedup = [], {}
     d_wf: dict[str, set] = {}
     occurrences = 0
@@ -157,7 +183,7 @@ def scan(store: WorkflowStore, ledger: SubmissionLedger, *, explain: bool = Fals
         d_break.setdefault(why, {"unique_keys": 0, "workflows": 0, "quarantinable": why in QUARANTINABLE})["workflows"] = len(wfs)
     explained = []
     if explain:
-        explained = [explain_repeat(k[1], states) for k, (cls, why) in sorted(dedup.items(), key=lambda kv: str(kv[0]))
+        explained = [explain_repeat(k[1], states, bases) for k, (cls, why) in sorted(dedup.items(), key=lambda kv: str(kv[0]))
                      if cls == "D" and why == "REPEAT_OF_EARLIER_CYCLE" and k[0] == "submit"]
     return {"workflows": rows, "incomplete": len(rows), "d_breakdown": dict(sorted(d_break.items())), "explain_repeat": explained, "by_workflow_class": by_wf, "unique_keys": len(dedup), "occurrences": occurrences,
             "duplicate_occurrences": occurrences - len(dedup), "by_key_class": by_key, "by_reason": dict(sorted(by_reason.items()))}
@@ -213,7 +239,8 @@ def apply_reconcile(store: WorkflowStore, ledger: SubmissionLedger, progress: So
             st = store.load(wid)
             ch = handoff_submit_tasks(st, states, now) + close_carried(st, progress, now, snapshot=snapshot)
             if q_reasons:
-                ch += quarantine_submit_tasks(st, states, now, needs)
+                sub = Path(ledger.path).parent
+                ch += quarantine_submit_tasks(st, states, now, needs, bases=(sub, sub.parent, sub.parent.parent))
             if not ch:
                 continue
             src = store.dir(wid) / "state.json"
@@ -225,7 +252,7 @@ def apply_reconcile(store: WorkflowStore, ledger: SubmissionLedger, progress: So
     return {"changed": changed, "scan": rep}
 
 
-def quarantine_submit_tasks(st, ledger_states: dict, now: datetime, needs: NeedsHuman, *, record: bool = True) -> list[dict]:
+def quarantine_submit_tasks(st, ledger_states: dict, now: datetime, needs: NeedsHuman, *, record: bool = True, bases: tuple = ()) -> list[dict]:
     """Dの投入工程のうち、取り分けてよい理由のものを needs_human.jsonl に記録して閉じる。工程は`closed_reason=NEEDS_HUMAN`で完了扱いになるが、
     登録済みではない（台帳・ASINは変更しない）。needs-human一覧・outcome・watchの期限切れ通知で見え続ける。"""
     out = []
@@ -239,7 +266,7 @@ def quarantine_submit_tasks(st, ledger_states: dict, now: datetime, needs: Needs
             continue
         info = {"summary": ""}
         if why == "REPEAT_OF_EARLIER_CYCLE":
-            x = explain_repeat(key, ledger_states)
+            x = explain_repeat(key, ledger_states, bases)
             info = {"summary": x["verdict"].split("（")[0], "overlap": x["overlap_with_registered"], "remaining": x["unregistered_remaining"], "asin_count": x["asin_count"]}
         out.append({"task": t.id, "workflow": st.workflow_id, "reason": why, "key": key})
         if not record:

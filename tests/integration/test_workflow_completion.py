@@ -273,7 +273,10 @@ def test_plan_compare_cli_and_outcome_with_config_are_read_only_and_show_selecta
     assert wcli.main(["plan-compare", "--config", str(cfg_path), "--market", "US"], factory=app_role_factory) == 0
     out = capsys.readouterr().out
     assert "選択可能な出典: 1件（後退中1件 / 必要数1件）" in out and f"後ろへ回した: [{slow_sid}]" in out
-    assert f"新  : #{good_sid} #{slow_sid}*" in out
+    assert f"新  : #{good_sid} #{slow_sid}*" in out and "補充: 不要" in out
+    assert wcli.main(["plan-compare", "--config", str(cfg_path), "--market", "US", "--simulate-shortage", "5"], factory=app_role_factory) == 0
+    sim = capsys.readouterr().out
+    assert "補充: 選択可能1件 < 必要5件 → 後退中の出典1件を再評価日を待たずに戻した" in sim and f"#{slow_sid}(再評価日 {until})" in sim and "模擬" in sim
     assert wcli.main(["outcome", "--market", "US", "--config", str(cfg_path), "--state-dir", w.cfg.state_dir, "--submission-dir", w.cfg.submission_dir],
                      factory=app_role_factory) == 0
     o = capsys.readouterr().out

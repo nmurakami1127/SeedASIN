@@ -401,8 +401,9 @@ def _cmd_plan_compare(a, factory=None, **_) -> int:
             print(f"[{lane}] 計画を作れません: {exc}")
             continue
         slow = prog.slow_map(pm)
-        cmp = compare(plan, slow, prog.evaluated(pm), needed=cfg.needed_sources(), reserve=cfg.completion.reserve_unevaluated)
-        print("\n".join(format_compare(pm, cmp, slow)))
+        sim = getattr(a, "simulate_shortage", None)
+        cmp = compare(plan, slow, prog.evaluated(pm), needed=sim if sim else cfg.needed_sources(), reserve=cfg.completion.reserve_unevaluated)
+        print("\n".join(format_compare(pm, cmp, slow, simulated_needed=sim or None)))
     return 0
 
 
@@ -532,6 +533,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp = add("plan-compare", _cmd_plan_compare, "（読み取りのみ）従来の取得対象と新しい取得対象の比較・選択可能な出典数")
     sp.add_argument("--config", default="config/workflow.json")
     sp.add_argument("--market", default="ALL", choices=["US", "JP", "ALL"])
+    sp.add_argument("--simulate-shortage", type=int, default=None, metavar="N", help="（読み取りのみ）必要数をNとして判定し、選択可能数がNを下回るときの補充結果（戻す後退中の出典）を表示する")
     sp = add("needs-human", _cmd_needs_human, "人の判断待ちの一覧（既定）/ --resolve で解決を記録 / --reopen で取り分けを戻す")
     sp.add_argument("--state-dir", default="exports/workflow")
     sp.add_argument("--resolve", default=None, metavar="ID")

@@ -429,3 +429,86 @@ def test_format_outcome_shows_elapsed_seconds_and_the_restart_simulation():
     text = "\n".join(format_outcome(o))
     assert "集計時間 2.5秒" in text and "（集計 1.25秒）" in text and "選択可能な出典（後退中でない）: 12件" in text
     assert "取り直し24h見送りの影響" in text and "120頁を他の候補へ再配分" in text and "LINKED=2" in text and "人の判断待ち(needs-human) 4件（期限切れ1件）" in text
+
+
+# ---------------------------------------------------------------- 第4報: 期限は通知だけ・照合は方向/市場別・Windowsパス・不足時の補充表示
+
+def test_overdue_needs_human_is_only_a_notification_and_nothing_resolves_or_reopens_automatically(tmp_path):
+    from workflow.watch import Watcher
+
+    led = put_ledger(tmp_path)
+    store = repeat_workflows(tmp_path)
+    clock = Clock(NOW)
+    nh = NeedsHuman(tmp_path / "workflow" / FILE_NAME, now=clock)
+    pg = P.SourceProgress(tmp_path / "workflow" / "source_progress.jsonl", now=clock)
+    apply_reconcile(store, led, pg, now=NOW, confirm=lambda q: True, include_d=True, needs=nh)
+    clock.t = NOW + timedelta(days=400)                                                 # 期限を大きく過ぎる
+    fake = SimpleNamespace(cfg=SimpleNamespace(state_dir=str(tmp_path / "workflow")), now=clock, _notify_stall=lambda *a: None)
+    before = tree(tmp_path)
+    Watcher._check_needs_human(fake, SimpleNamespace())                                 # 通知
+    format_items(nh.open_items(), clock.t)                                              # 表示
+    scan(store, led, explain=True)                                                      # dry-run
+    assert tree(tmp_path) == before                                                     # 何も書かない・変えない
+    assert len(nh.overdue()) == len(nh.open_items()) == 5 and all(i.resolved is None for i in nh.items().values())
+    kinds = [e["event"] for e in nh.events()]
+    assert kinds.count("RESOLVED") == 0 and kinds.count("REOPENED") == 0
+    again = apply_reconcile(store, led, pg, now=clock.t, confirm=lambda q: True, include_d=True, needs=nh)   # 整理を再実行しても閉じたまま・解除されない
+    assert again["changed"] == [] and all(store.load(w["workflow"]).tasks[w["task"]].result.get("closed_reason") == "NEEDS_HUMAN"
+                                          for i in nh.open_items() for w in i.workflows)
+    assert not hasattr(NeedsHuman, "expire") and not hasattr(NeedsHuman, "auto_resolve")      # 期限切れで自動に何かをする入口が無い
+
+
+def _ledger_with_paths(tmp_path, in_file_fmt):
+    sub = tmp_path / "exports" / "tool_submission"
+    sub.mkdir(parents=True)
+    (sub / "reg.txt").write_text("B0A0000001\nB0A0000002\r\nB0A0000003\n", encoding="utf-8")
+    (sub / "rep.txt").write_text("\ufeffB0A0000002\nB0A0000003\nB0A0000009\n", encoding="utf-8")
+    led = SubmissionLedger(sub / "ledger.jsonl")
+    man = lambda f, direction="EXPORT", market="US", repeat=False: {"asin_count": 3, "direction": direction, "business_market": market,  # noqa: E731
+                                                                     "repeat_of_earlier_cycle": repeat, "source_id": 1, "collector_run_id": 1, "input_file": f}
+    led.append("reg", "PLANNED", manifest=man(in_file_fmt.format("reg.txt")))
+    for ev, kw in (("SUBMIT_STARTED", {"before_run_ids": []}), ("RUN_IDENTIFIED", {"tool_run_id": "9"}), ("MEMO_SAVED", {}), ("LINKED", {})):
+        led.append("reg", ev, **kw)
+    led.append("rep", "PLANNED", manifest=man(in_file_fmt.format("rep.txt"), repeat=True))
+    return led, man, sub
+
+
+@pytest.mark.parametrize("fmt", ["exports\\tool_submission\\{}", "tool_submission\\{}", "exports/tool_submission/{}", "C:\\Users\\x\\SeedASIN\\exports\\tool_submission\\{}"])
+def test_explain_resolves_windows_style_input_paths_on_linux(tmp_path, fmt, monkeypatch):
+    led, _man, sub = _ledger_with_paths(tmp_path, fmt)
+    monkeypatch.chdir(tmp_path / "exports")                                           # カレントが何であっても、投入ディレクトリ基準で解決できる
+    x = explain_repeat("rep", led.all_states(), (sub, sub.parent, sub.parent.parent))
+    assert x["input_file_readable"] and (x["in_file"], x["overlap_with_registered"], x["unregistered_remaining"]) == (3, 2, 1) and x["verdict"].startswith("PARTIAL")
+
+
+def test_explain_reports_input_file_missing_when_the_path_cannot_be_resolved(tmp_path):
+    led, _man, sub = _ledger_with_paths(tmp_path, "exports\\tool_submission\\{}")
+    led.append("rep2", "PLANNED", manifest={"asin_count": 1, "direction": "EXPORT", "business_market": "US", "repeat_of_earlier_cycle": True, "source_id": 1,
+                                            "input_file": "D:\\other\\nowhere\\gone.txt"})
+    x = explain_repeat("rep2", led.all_states(), (sub, sub.parent, sub.parent.parent))
+    assert x["verdict"].startswith("INPUT_FILE_MISSING") and x["in_file"] is None and x["unregistered_remaining"] is None
+
+
+def test_explain_matches_only_registered_runs_of_the_same_direction_and_market(tmp_path):
+    led, man, sub = _ledger_with_paths(tmp_path, "exports/tool_submission/{}")
+    for k, direction, market in (("other_dir", "IMPORT", "US"), ("other_mkt", "EXPORT", "JP")):    # 同じASINを含むが方向/市場が違う登録済みの投入
+        led.append(k, "PLANNED", manifest=man("exports/tool_submission/reg.txt", direction=direction, market=market))
+        for ev, kw in (("SUBMIT_STARTED", {"before_run_ids": []}), ("RUN_IDENTIFIED", {"tool_run_id": k}), ("MEMO_SAVED", {}), ("LINKED", {})):
+            led.append(k, ev, **kw)
+    led.append("rep_imp", "PLANNED", manifest=man("exports/tool_submission/rep.txt", direction="IMPORT", market="JP", repeat=True))
+    bases = (sub, sub.parent, sub.parent.parent)
+    x = explain_repeat("rep", led.all_states(), bases)
+    assert [r["tool_run_id"] for r in x["registered_runs"]] == ["9"] and x["overlap_with_registered"] == 2          # 方向/市場が違う登録済みは数えない
+    y = explain_repeat("rep_imp", led.all_states(), bases)
+    assert y["overlap_with_registered"] == 0 and y["verdict"].startswith("NONE_REGISTERED") and y["registered_runs"] == []   # IMPORT/JPには登録済みが無い
+    assert y["direction"] == "IMPORT" and y["business_market"] == "JP"
+
+
+def test_plan_compare_text_names_the_slow_sources_it_brought_back_and_the_simulated_need():
+    plan = plan_of([1, 2, 3, 4, 5])
+    slow = {2: "2026-11-20T00:00:00Z", 3: "2026-11-09T00:00:00Z"}
+    ok = "\n".join(format_compare("US", compare(plan, slow, set(), needed=3), slow))
+    assert "補充: 不要（選択可能3件 >= 必要3件" in ok
+    sim = "\n".join(format_compare("US", compare(plan, slow, set(), needed=5), slow, simulated_needed=5))
+    assert "補充: 選択可能3件 < 必要5件 → 後退中の出典2件を再評価日を待たずに戻した" in sim and "#2(再評価日 2026-11-20T00:00:00Z)" in sim
+    assert "#3(再評価日 2026-11-09T00:00:00Z)" in sim and "--simulate-shortage 5 による模擬" in sim

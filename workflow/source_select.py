@@ -112,13 +112,19 @@ def compare(plan, slow, evaluated, *, needed: int = 0, reserve: int = 0) -> dict
             "released": [s for s in after if s in set(slow) and sel.scarce]}
 
 
-def format_compare(market: str, cmp: dict, slow) -> list[str]:
+def format_compare(market: str, cmp: dict, slow, simulated_needed: int | None = None) -> list[str]:
     sel: Selection = cmp["selection"]
     out = [f"== {market} 取得対象の比較（従来 → 新） ==",
            f"選択可能な出典: {sel.selectable}件（後退中{sel.deprioritized}件 / 必要数{sel.needed}件{' → 不足のため後退中を戻す' if sel.scarce else ''}）"]
     for sec, d in sel.per_section.items():
         out.append(f"  {sec}: 候補{d['candidates']} 選択可能{d['selectable']} 後退中{d['deprioritized']} 未評価{d['unevaluated']} → 取得対象{d['picked']}"
                    f"（未評価枠で追加{d['reserved_in']} / 戻した{d['released']}）")
+    tag = f"（--simulate-shortage {simulated_needed} による模擬。必要数を{simulated_needed}件として判定）" if simulated_needed is not None else ""
+    if sel.scarce:
+        back = [f"#{sid}(再評価日 {slow[sid] if isinstance(slow, dict) else '-'})" for sid in cmp["released"]]
+        out.append(f"補充: 選択可能{sel.selectable}件 < 必要{sel.needed}件 → 後退中の出典{len(back)}件を再評価日を待たずに戻した{tag}: " + (" ".join(back) or "なし（後退中の出典が無い）"))
+    else:
+        out.append(f"補充: 不要（選択可能{sel.selectable}件 >= 必要{sel.needed}件。後退中の出典は戻していない）{tag}")
     out.append(f"従来 {len(cmp['before'])}件 → 新 {len(cmp['after'])}件（件数{'同じ' if cmp['same_count'] else '違う'}）")
     out.append(f"  後ろへ回した: {cmp['moved_down'] or 'なし'}")
     out.append(f"  対象から外れた: {cmp['dropped'] or 'なし'}  対象に加わった: {cmp['added'] or 'なし'}")
