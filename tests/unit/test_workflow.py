@@ -154,3 +154,26 @@ def test_example_configs_load_and_old_configs_adopt_the_new_defaults():
         config_from_dict({"lanes": {"US": {"origin_import": 1, "selection_mode": "everything"}}})
     cfg = config_from_dict({"lanes": {"US": {"origin_import": 1}, "JP": {"origin_import": 2}}})
     assert list(cfg.for_lane("JP").lanes) == ["JP"] and list(cfg.lanes) == ["US", "JP"]
+
+
+def test_acquire_waits_for_a_pending_discover_only_and_expand_cross_keep_the_usable_rule():
+    from workflow.store import dep_blocks
+    disc = Task("discover:US", "discover", "US")
+    acq = Task("acquire:US", "acquire", "US", deps=["discover:US"])
+    for status, blocks in (("PENDING", True), ("DONE", False), ("SKIPPED", False), ("FAILED", False), ("HELD", False),
+                           ("WAITING", False), ("UNKNOWN", False)):
+        disc.status = status
+        assert dep_blocks(acq, disc) is blocks, status
+    exp = Task("expand:US", "expand", "US", deps=["acquire:US"])
+    cross = Task("cross:US", "cross", "US", deps=["acquire:US"])
+    for t in (exp, cross):
+        acq.status, acq.result = "HELD", {}
+        assert dep_blocks(t, acq)  # 取得が保留で使える結果が無ければ待つ（従来どおり）
+        acq.status = "FAILED"
+        assert dep_blocks(t, acq)
+        acq.result = {"usable": 1}
+        assert not dep_blocks(t, acq)  # 使える結果があれば先へ進める（従来どおり）
+        acq.status, acq.result = "DONE", {}
+        assert not dep_blocks(t, acq)
+    disc.status = "FAILED"
+    assert dep_blocks(cross, disc)  # discover失敗の免除は acquire だけ（他の工程には広げない）

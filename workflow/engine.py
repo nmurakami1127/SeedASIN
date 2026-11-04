@@ -29,7 +29,7 @@ from acquisition.discovery import (
 from acquisition.lease import AcquisitionRunService
 from acquisition.plan import PlanError, build_plan, validate_origin_imports
 from asin_collector.discovery_runner import run_cross_discovery, run_origin_discovery
-from asin_collector.source_runner import RunLimits, run_batch
+from asin_collector.source_runner import MAX_SOURCES_HARD_CAP, RunLimits, run_batch, select_targets
 from db.session import SessionFactory
 from origin_selection.report_import import ReportImportService
 from tool_submission.evidence import ingest_one_row, link_status
@@ -42,7 +42,7 @@ from workflow.daily_usage import DailyUsage, jst_day, next_jst_midnight
 from workflow.selection import PendingChecker, reusable_run
 from workflow.dedupe import SUBMITTED_STATES, find_duplicates, set_hash  # noqa: F401
 from workflow.ports import PortBlocked, Ports
-from workflow.store import DONE_STATES, State, Task, WorkflowStore, now_iso, usage
+from workflow.store import DONE_STATES, State, Task, WorkflowStore, dep_blocks, now_iso, usage
 
 SUCCESS = tuple(USABLE_FETCH_OUTCOMES)
 POLICY_CODES = ("EXCLUDED", "ON_HOLD", "TOO_RECENT", "REVIEW_LEGACY", "CYCLE_RESTART_LIMIT")  # 方針による枝のスキップ（自動で再試行しない）
@@ -207,12 +207,29 @@ class Engine:
             dt = self.st.tasks.get(d)
             if dt is None:
                 continue
-            if dt.status in DONE_STATES:
-                continue
-            if dt.kind in ("acquire", "acquire_x") and dt.result.get("usable"):
-                continue  # 一部の出典が待機/保留でも、使える取得結果があれば先へ進める（独立した出典を止めない）
-            return False, f"{d} が{dt.status}のため待機"
+            if dep_blocks(t, dt):
+                return False, f"{d} が{dt.status}のため待機"
         return True, ""
+
+    def _reopen_acquire(self) -> None:
+        """発見が（失敗・保留の後の再試行などで）新しい出典を登録したのに、取得が先に終わっていた場合は、取得をやり直す
+        （取得済みの出典は記録のまま再取得しない）。取得は発見の終了を待たずに進むため、後から登録された出典を取りこぼさないための処理。
+        人が「失敗をスキップ」した工程は戻さない。"""
+        for t in self.st.tasks.values():
+            if t.kind != "acquire" or t.status not in DONE_STATES or t.result.get("skipped_failure"):
+                continue
+            d = self.st.tasks.get(f"discover:{t.lane}")
+            if d is None or d.status != "DONE":
+                continue
+            recs = t.result.get("sources", {})
+            if not any(str(s["source_id"]) not in recs for s in d.result.get("sources", [])):
+                continue
+            t.status, t.detail = "PENDING", "発見で新しく登録された出典を取得するため再開"
+            self._event(t.id, "REOPENED 発見で新しい出典が登録された")
+            for x in self.st.tasks.values():  # 投入計画は取得結果から作り直す（冪等。投入キーが同じなら増えない）
+                if x.kind == "expand" and x.deps == [t.id] and x.status in DONE_STATES:
+                    x.status, x.detail = "PENDING", ""
+            self._save()
 
     def drive(self) -> State:
         """PENDINGの工程を、依存が満たされたものから順に1回ずつ実行する（待機・保留・失敗は次のresumeまで再試行しない）。"""
@@ -221,6 +238,7 @@ class Engine:
             progressed = True
             while progressed:
                 progressed = False
+                self._reopen_acquire()
                 for t in list(self.st.tasks.values()):
                     if t.kind == "submit" and not self.cfg.submission_enabled:
                         continue  # 入力と投入台帳を残し、別プロセスの登録へ渡す
@@ -459,7 +477,24 @@ class Engine:
         """利用可能な保存済みの取得結果（成功/上限打切り・鮮度内）。上限打切りかどうかも持つ。"""
         return reusable_run(self.factory, market, source_id, self.cfg.result_max_age_days)
 
-    def _acquire_sources(self, t: Task, market: str, import_id: int, sources: list[dict]) -> None:
+    def _existing_sources(self, t: Task, plan, market: str) -> list[dict]:
+        """発見に関係なく取得できる、この市場・この起点レポート(入口)の既存の出典。選び方は既存の取得計画(build_plan)の順位と
+        `select_targets`（起点のある出典・注文点数0点の起点のみは対象外・1方向あたりの上限）をそのまま使う。
+        除外・保留・期間内・実行中の出典はplanの実行可能な一覧に入らないので選ばれない（上限・保留を迂回しない）。
+        最初に選んだ一覧を工程に保存し、再開しても同じ一覧を使う（resumeのたびに対象が広がらない）。"""
+        saved = t.result.get("existing_sources")
+        if saved is None:
+            saved, seen = [], set()
+            for sec in ("EXPORT", "IMPORT"):
+                for e in select_targets(plan, sec, MAX_SOURCES_HARD_CAP):
+                    if e.facts.source_id not in seen:
+                        seen.add(e.facts.source_id)
+                        saved.append({"source_id": e.facts.source_id, "market": market, "source_type": e.facts.source_type,
+                                      "key": e.facts.key_primary})
+            t.result["existing_sources"] = saved
+        return saved
+
+    def _acquire_sources(self, t: Task, market: str, import_id: int, sources: list[dict], *, include_existing: bool = False) -> None:
         """出典ごとの枝を処理する。枝の状態（取得・再利用・除外/保留/期間内でスキップ・一時的な保留/失敗）と、他の候補を処理できることを分ける:
         除外・保留・期間内の枝はSKIPPED_POLICY（自動で再試行しない。状態が変われば次の候補選択で再評価される）。完了済みに書き換えない。"""
         recs: dict = t.result.setdefault("sources", {})
@@ -470,6 +505,9 @@ class Engine:
             return self._set(t, "HELD", str(exc))
         entries = {e.facts.source_id: e for es in plan.sections.values() for e in es}
         blocked = {f.source_id: d for f, d in plan.blocked}
+        if include_existing:  # 発見で登録された出典 + 既存の取得可能な出典（重複なし）。発見の成否に左右されない
+            have = {s_["source_id"] for s_ in sources}
+            sources = list(sources) + [x for x in self._existing_sources(t, plan, market) if x["source_id"] not in have]
         for s_ in sources:  # 完了(取得/再利用/正常な0件)以外の記録は、毎回DBの状態から評価し直す（除外・保留が解除されていれば取得できる）
             if recs.get(str(s_["source_id"]), {}).get("mode") not in DONE_BRANCH_MODES:
                 recs.pop(str(s_["source_id"]), None)
@@ -623,8 +661,9 @@ class Engine:
     def _run_acquire(self, t: Task) -> None:
         lane = t.lane
         ln, _ = self._lane_info(lane)
-        src = self.st.tasks[f"discover:{lane}"].result.get("sources", [])
-        self._acquire_sources(t, self.cfg.page_market(lane), ln.origin_import, src)
+        d = self.st.tasks.get(f"discover:{lane}")
+        src = d.result.get("sources", []) if d else []
+        self._acquire_sources(t, self.cfg.page_market(lane), ln.origin_import, src, include_existing=True)
 
     def _run_acquire_x(self, t: Task) -> None:
         lane = t.lane

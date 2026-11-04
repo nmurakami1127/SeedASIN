@@ -298,7 +298,9 @@ def test_one_market_waiting_does_not_stop_the_independent_other_market(world):
     eng = world.run()
     s = statuses(eng)
     assert s["discover:JP"] == "WAITING" and "CAPTCHA" in eng.st.tasks["discover:JP"].detail
-    assert s["acquire:JP"] == "PENDING" and s["discover:US"] == s["acquire:US"] == "DONE"
+    # 取得は発見の待機と独立（#96）: 既存の出典が無いJPは「取得する出典がありません」で完了し、発見が成功した後の再開で新しい出典を取得する
+    assert s["acquire:JP"] == "DONE" and eng.st.tasks["acquire:JP"].detail == "取得する出典がありません"
+    assert s["discover:US"] == s["acquire:US"] == "DONE"
     us_sub = [t for t in submit_tasks(eng) if t.lane == "US"]
     assert us_sub and all(t.status == "DONE" for t in us_sub)
     assert wcli.overall(eng.st) == "NEEDS_ACTION"
