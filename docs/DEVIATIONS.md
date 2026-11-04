@@ -1582,3 +1582,12 @@ Amazonのナビゲーションはdomcontentloadedで待機し、第三者リソ�
 - **選択関数の一本化**: `Engine._existing_sources`・`plan-compare`・`outcome --config`は、同じ関数`workflow.source_select.engine_selection`を使う（候補の条件は従来の`select_targets`と同じ: 起点の経路を持つ出典・注文点数0を含む(include_zero_units)・1方向最大20）。注文点数0の出典だけでも候補に出ること、エンジンの選択と`plan-compare`の「従来」が一致することをテストで固定。
 - **候補0の理由**: 候補は`build_plan`の`plan.sections`（**その時点で取得できる**出典）から選ぶ。取得間隔内・実行中・保留・除外の出典は`plan.blocked`に入り、候補に入らない。実データでUSが候補0だったのは、直前に走った取得で11出典が取得間隔内になっていたため、と考えられる（Workerは実データを見ていない・推測）。`plan-compare`は方向ごとの出典数（起点経路なし・注文点数0の数）と、`plan.blocked`の理由別の数を表示するようにした。JPの「候補29・実行9」は、候補数と、1回のworkflowのページ上限(200)で実際に取得できる出典数の違いで、選び方の乖離ではない。
 - **取り直し見送りの解除の見直し**: `alternatives`は、その工程で**いま取得できる**他の候補（取り直し以外・後退中でない・未取得）の数で、取得間隔内/実行中でブロックされた出典や取得済みの出典は数えない（空いたページを受け取れないため）。したがって「エンジンには候補があるのに0と数える」ことは起きない（エンジン自身の`fetch_ids`から数える）。ただし取得できる他の候補が無いとき見送りを解除するため、取り直し(重なり約100%)だけが走ることはある。望まない場合は`completion.restart_release_when_scarce=false`で解除を無効にできる。
+
+## 100. ログ画面(logs.php)読み込みのタイムアウトを30秒から90秒へ延長（2026-11-05）
+
+5,000 ASIN投入直後にログ画面が30秒を超えて読めず、結果不明(UNKNOWN)になる事象への対策（ユーザー承認は30→90秒の延長のみ）。
+
+- `tool_submission/import_tool_page.py`の`read_log`で、`page.goto`（Playwright既定も30秒のため明示）と一覧の`wait_for`の両方に`LOG_LOAD_TIMEOUT_MS = 90_000`を渡す（定数1箇所）。
+- 再試行は追加していない。タイムアウト時は従来どおり`LogUnreadable`（呼び出し側は再送せず照合に回す）。送信・再送ロジックは変更なし。
+- テスト: `tests/unit/test_log_load_timeout.py`（fake pageでgoto/wait_forに90000が渡ること、タイムアウト例外が`LogUnreadable`になること）。
+- 未確認（パソコンで）: 実画面で5,000件投入直後に90秒以内に読めるか。
