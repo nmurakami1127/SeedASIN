@@ -22,6 +22,21 @@ DONE_STATES = ("DONE", "SKIPPED")
 STATUSES = ("PENDING", "DONE", "SKIPPED", "WAITING", "HELD", "FAILED", "UNKNOWN")
 
 
+def dep_blocks(task: "Task", dep: "Task") -> bool:
+    """`task` が依存先 `dep` を待つべきか（True=まだ進めない）。実行時に評価する（保存済みの古い依存にも同じ規則が効く）。
+    - 依存先が完了/スキップなら待たない。
+    - 取得(acquire/acquire_x)に使える結果があれば、依存する工程(expand/cross)は先へ進める（独立した出典を止めない）。
+    - 取得(acquire)の発見(discover)への依存は「発見を先に走らせる順序」だけを表す: 発見が実行前(PENDING)の間だけ待ち、
+      実行後に失敗・保留・待機・人手待ちで終わっていても待たない（新規セラーの発見と、既存の出典の取得を独立させる）。"""
+    if dep.status in DONE_STATES:
+        return False
+    if dep.kind in ("acquire", "acquire_x") and dep.result.get("usable"):
+        return False
+    if task.kind == "acquire" and dep.kind == "discover" and dep.status != "PENDING":
+        return False
+    return True
+
+
 class WorkflowBusy(Exception):
     pass
 

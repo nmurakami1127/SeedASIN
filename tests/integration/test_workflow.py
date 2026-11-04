@@ -178,7 +178,8 @@ class FakePorts:
 class World:
     """US・JPの架空データ一式（起点ASIN・販売元・出典のASIN）と、設定。"""
 
-    def __init__(self, app_role_factory, tmp_path, *, cfg_extra: dict | None = None, single: bool = False) -> None:
+    def __init__(self, app_role_factory, tmp_path, *, cfg_extra: dict | None = None, single: bool = False,
+                 us_extra: list | None = None, jp_extra: list | None = None) -> None:
         self.f, self.tmp = app_role_factory, tmp_path
         t = uuid.uuid4().hex[:6].upper()
         self.us_top, self.us_low = f"B0{t}U1", f"B0{t}U2"
@@ -187,9 +188,9 @@ class World:
         self.us_asins = [f"B0{t}A{i}" for i in range(3)]
         self.jp_asins = [f"B0{t}B{i}" for i in range(3)]
         self.cross_jp_seller, self.cross_us_seller = uid("AXJ"), uid("AXU")
-        us_rows = [(self.us_top, 80, 3.0, 9)] + ([] if single else [(self.us_low, 10, 1.0, 2)])
+        us_rows = [(self.us_top, 80, 3.0, 9)] + ([] if single else [(self.us_low, 10, 1.0, 2)]) + list(us_extra or [])
         self.us_import = make_active_report(app_role_factory, tmp_path, "US", us_rows, name="us.csv")
-        self.jp_import = make_active_report(app_role_factory, tmp_path, "JP", [(self.jp_top, 60, 2.0, 7)], name="jp.csv")
+        self.jp_import = make_active_report(app_role_factory, tmp_path, "JP", [(self.jp_top, 60, 2.0, 7)] + list(jp_extra or []), name="jp.csv")
         self.us = Routing({self.us_top: self.us_seller, self.us_low: "A9SECOND0001", self.us_asins[0]: self.cross_us_seller,
                            self.jp_asins[0]: self.cross_us_seller}, {self.us_seller: self.us_asins})
         self.jp = Routing({self.jp_top: self.jp_seller, self.us_asins[0]: self.cross_jp_seller}, {self.jp_seller: self.jp_asins})
@@ -298,7 +299,9 @@ def test_one_market_waiting_does_not_stop_the_independent_other_market(world):
     eng = world.run()
     s = statuses(eng)
     assert s["discover:JP"] == "WAITING" and "CAPTCHA" in eng.st.tasks["discover:JP"].detail
-    assert s["acquire:JP"] == "PENDING" and s["discover:US"] == s["acquire:US"] == "DONE"
+    # 取得は発見の待機と独立（#96）: 既存の出典が無いJPは「取得する出典がありません」で完了し、発見が成功した後の再開で新しい出典を取得する
+    assert s["acquire:JP"] == "DONE" and eng.st.tasks["acquire:JP"].detail == "取得する出典がありません"
+    assert s["discover:US"] == s["acquire:US"] == "DONE"
     us_sub = [t for t in submit_tasks(eng) if t.lane == "US"]
     assert us_sub and all(t.status == "DONE" for t in us_sub)
     assert wcli.overall(eng.st) == "NEEDS_ACTION"

@@ -25,7 +25,7 @@ from workflow.config import OPPOSITE, WorkflowConfig, config_from_dict
 from workflow.daily_usage import JST, DailyUsage, jst_day, next_jst_midnight
 from workflow.engine import Engine
 from workflow.stall import check_all
-from workflow.store import DONE_STATES, State, WorkflowStore, pid_alive
+from workflow.store import DONE_STATES, State, WorkflowStore, dep_blocks, pid_alive
 from workflow.watch_events import append_event
 
 AUTO_HOLD_AFTER = 3
@@ -133,9 +133,7 @@ class Watcher:
                 continue
             if t.status == "PENDING" or not t.retry_after or t.retry_after <= now or self._daily_room(t.result.get("daily_hold")):
                 if t.status == "PENDING" and t.detail.endswith("のため待機") and any(
-                        st.tasks[d].status not in DONE_STATES and not
-                        (st.tasks[d].kind in ("acquire", "acquire_x") and st.tasks[d].result.get("usable"))
-                        for d in t.deps if d in st.tasks):
+                        dep_blocks(t, st.tasks[d]) for d in t.deps if d in st.tasks):
                     continue  # 依存の工程が終わっていない（自分では進められない）
                 return True
         return False
