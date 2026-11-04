@@ -11,7 +11,8 @@ DBのスキーマは変えない暫定の置き場（DBに置く案は docs/DEVI
 - RUN_IDENTIFIED   **実行ID確定・メモ未保存**。ASINは再投入せず、この実行IDのメモ保存から再開する
 - MEMO_SAVED       実行IDの行にメモが保存され、再読込で確認できた
 - LINKED           **対応記録済み**: 既存の取込（ingest-log）が`tool_execution_link`へ記録したことを確認できた
-- NOT_SUBMITTED    ログ画面を読めたうえで、クリック前の失敗で送信されていないと確認できた（再試行は合計2回まで）
+- NOT_SUBMITTED    ログ画面を読めたうえで、クリック前の失敗で送信されていないと確認できた（再試行は合計2回まで。
+                   人が`RETRY_GRANTED`を追記した分だけ上限が増える。docs/DEVIATIONS.md #95）
 """
 from __future__ import annotations
 
@@ -31,6 +32,7 @@ class LedgerState:
     key: str
     state: str = "NONE"
     attempts: int = 0
+    grants: int = 0  # RETRY_GRANTEDで有効になった追加の試行数
     memo_attempts: int = 0
     tool_run_id: str | None = None
     before_run_ids: list[int] = field(default_factory=list)
@@ -43,6 +45,11 @@ class LedgerState:
 
 def _now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def max_attempts(st: "LedgerState") -> int:
+    """この投入に許される送信の試行の上限（既定＋人が付与した分）。"""
+    return MAX_ATTEMPTS + st.grants
 
 
 class SubmissionLedger:
@@ -71,6 +78,24 @@ class SubmissionLedger:
             if self.state(key).state not in ("UNKNOWN", "AMBIGUOUS"):
                 raise ValueError("UNKNOWN/AMBIGUOUSの投入だけを取り下げられます")
             self.append(key, "TRACKING_ABANDONED", reason=reason)
+
+    def grant_retry(self, key: str, *, reason: str, reopen_abandoned: bool = False, evidence: dict | None = None) -> LedgerState:
+        """未送信と確認できた投入に、再試行を1回分だけ追加する（追記のみ）。上限が尽きた分の補充に限る。"""
+        if not reason.strip():
+            raise ValueError("付与の理由が必要です")
+        with self.key_lock(key):
+            st = self.state(key)
+            if st.state == "NOT_SUBMITTED":
+                if not any(e["event"] == "NOT_SUBMITTED_VERIFIED" for e in st.events):
+                    raise ValueError("未送信の確認（NOT_SUBMITTED_VERIFIED）が台帳にありません")
+            elif st.state == "ABANDONED" and reopen_abandoned:
+                pass
+            else:
+                raise ValueError(f"状態が{st.state}です。NOT_SUBMITTED（または--reopen-abandonedを付けたABANDONED）だけに付与できます")
+            if st.state == "NOT_SUBMITTED" and st.grants + 1 > st.attempts - MAX_ATTEMPTS + 1:
+                raise ValueError(f"過剰な付与です（試行{st.attempts}回・付与済み{st.grants}回。上限{max_attempts(st)}回に達してから1回ずつ付与できます）")
+            self.append(key, "RETRY_GRANTED", reason=reason, reopen_abandoned=bool(reopen_abandoned), evidence=evidence)
+            return self.state(key)
 
     def state(self, key: str) -> LedgerState:
         return self._fold(key, self.events())
@@ -116,6 +141,13 @@ class SubmissionLedger:
                 st.state = "LINKED"
             elif ev == "NOT_SUBMITTED_VERIFIED":
                 st.state = "NOT_SUBMITTED"
+            elif ev == "RETRY_GRANTED":  # 人の付与。未送信、または明示再開の取り下げ済みだけで有効。他の状態では無視する
+                if st.state == "NOT_SUBMITTED":
+                    st.grants += 1
+                elif st.state == "ABANDONED" and e.get("reopen_abandoned") is True:
+                    if st.attempts >= max_attempts(st):  # 上限に達しているときだけ追加の1回。未満なら再開だけ（上限は増やさない）
+                        st.grants += 1
+                    st.state = "NOT_SUBMITTED"
         return st
 
     def all_states(self) -> dict[str, LedgerState]:

@@ -6,7 +6,7 @@ from workflow.engine import Engine
 from workflow.store import State, Task, WorkflowStore, now_iso
 
 
-def register_saved(cfg, factory, ports):
+def register_saved(cfg, factory, ports, allow_keys=()):
     """一回の実行。ログイン監視・再試行ループ・Amazonアクセスは行わない。"""
     import copy
     cfg = copy.deepcopy(cfg)
@@ -22,14 +22,16 @@ def register_saved(cfg, factory, ports):
             m = entry.manifest or {}
             if entry.state not in ('PLANNED', 'NOT_SUBMITTED', 'RUN_IDENTIFIED', 'MEMO_SAVED'):
                 continue  # 結果不明は自動で再送しない
-            if m.get('repeat_of_earlier_cycle'):
-                continue
+            if m.get('repeat_of_earlier_cycle') and key not in allow_keys:
+                continue  # 明示許可（allow_keys）が無い再投入は対象にしない
             lane = m.get('business_market')
             if lane not in cfg.lanes:
                 continue
             tid = f'submit:{key}'
             st.tasks[tid] = Task(tid, 'submit', lane, result={
                 'key': key, 'direction': m['direction'], 'asin_count': m['asin_count']})
+            if key in allow_keys and key not in st.allow_duplicates:  # `resume --allow-duplicate`と同じ形式
+                st.allow_duplicates.append(key)
         store.save(st)
         eng = Engine(factory, ports, cfg, store)
         eng.should_stop = (Path(cfg.state_dir) / 'stop.request').exists

@@ -47,6 +47,7 @@ class Selectors:
     input_url: str | None = "https://import-tools.jp/asin/main.php"
     asin_textarea: str | None = "textarea#asin_list"  # 「3.ASINリストから情報取得」のテキスト欄
     asin_save_button: str | None = "button#add_asin_list"  # 同じセクションのSAVE
+    fill_timeout_ms: int = 180000  # 5,000件の貼り付けは30秒を超え得る（SAVE前なので未送信。DEVIATIONS #95）
     option_toggles: dict[str, str] = field(default_factory=lambda: dict(VERIFIED_OPTION_TOGGLES))  # 設定値の表示名 → チェックボックス（バリエーションは必須）
 
 
@@ -108,7 +109,7 @@ class ImportToolPage:
         try:
             self._p.goto(s.input_url, wait_until="domcontentloaded")
             box = self._p.locator(s.asin_textarea)
-            box.fill(text_)
+            box.fill(text_, timeout=s.fill_timeout_ms)
             if box.input_value().strip() != text_:  # 入力が反映されていなければ、押さない
                 raise SubmitFailed("BEFORE_CLICK", "テキスト欄に入力した内容を確認できません")
         except SubmitFailed:

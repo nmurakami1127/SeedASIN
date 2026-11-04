@@ -67,3 +67,29 @@ def test_registration_uses_separate_state_and_never_collects(tmp_path, monkeypat
     st = registration.register_saved(cfg, None, object())
     assert st.tasks['submit:new'].result['asin_count'] == 12
     assert not list(tmp_path.glob('wf-*'))
+
+
+def test_registration_allow_keys_include_repeat_plans_and_default_is_unchanged(tmp_path, monkeypatch):
+    from workflow import registration
+    cfg = config(tmp_path)
+    manifest = {'business_market': 'US', 'direction': 'EXPORT', 'asin_count': 12}
+    entries = {
+        'new': SimpleNamespace(state='PLANNED', manifest=manifest),
+        'repeat': SimpleNamespace(state='PLANNED', manifest={**manifest, 'repeat_of_earlier_cycle': True}),
+        'repeat2': SimpleNamespace(state='PLANNED', manifest={**manifest, 'repeat_of_earlier_cycle': True}),
+        'unknown_repeat': SimpleNamespace(state='UNKNOWN', manifest={**manifest, 'repeat_of_earlier_cycle': True}),
+    }
+    monkeypatch.setattr(registration, 'SubmissionLedger', lambda p: SimpleNamespace(all_states=lambda: entries))
+    seen = {}
+    class FakeEngine:
+        def __init__(self, factory, ports, cfg_, store):
+            pass
+        def drive(self):
+            seen['tasks'], seen['allow'] = set(self.st.tasks), list(self.st.allow_duplicates)
+            return self.st
+    monkeypatch.setattr(registration, 'Engine', FakeEngine)
+    registration.register_saved(cfg, None, object())
+    assert seen == {'tasks': {'submit:new'}, 'allow': []}
+    registration.register_saved(cfg, None, object(), allow_keys=('repeat', 'unknown_repeat', 'new'))
+    assert seen['tasks'] == {'submit:new', 'submit:repeat'}  # 状態の条件（UNKNOWNは対象外）は変わらない
+    assert seen['allow'] == ['repeat', 'new'] or set(seen['allow']) == {'repeat', 'new'}
