@@ -23,7 +23,7 @@ from pathlib import Path
 
 from db.session import SessionFactory
 from tool_intake.csv_utils import open_text_auto
-from tool_submission.ledger import SubmissionLedger
+from tool_submission.ledger import SubmissionLedger, max_attempts
 from tool_submission.model import SubmissionError
 from tool_submission.planner import build_items, write_plan
 from tool_submission.reconcile import corroborate, identify_new_entry, load_log_entries, single_row_html, verify_output
@@ -503,6 +503,17 @@ def _cmd_abandon(a: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_grant_retry(a: argparse.Namespace) -> int:
+    ledger = _ledger(a)
+    try:
+        st = ledger.grant_retry(a.key, reason=a.reason, reopen_abandoned=a.reopen_abandoned)
+    except ValueError as exc:
+        print(f"[中止] {exc}")
+        return 1
+    print(f"再試行を1回付与しました: {a.key} 状態={st.state} 試行={st.attempts}/{max_attempts(st)}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="python -m tool_submission.cli")
     sub = p.add_subparsers(dest="command", required=True)
@@ -516,6 +527,11 @@ def build_parser() -> argparse.ArgumentParser:
     sp = add("abandon", _cmd_abandon, "結果不明の投入の追跡を取り下げる（外部ジョブの取消ではない）")
     sp.add_argument("--key", required=True)
     sp.add_argument("--reason", required=True)
+
+    sp = add("grant-retry", _cmd_grant_retry, "未送信と確認済みの投入に再試行を1回分追加する（台帳へ追記のみ）")
+    sp.add_argument("--key", required=True)
+    sp.add_argument("--reason", required=True)
+    sp.add_argument("--reopen-abandoned", action="store_true", help="取り下げ済み(ABANDONED)を未送信に戻して付与する")
 
     sp = add("plan", _cmd_plan, "取得runから入力ファイルと投入計画を作る（DB読み取りのみ）")
     sp.add_argument("--fetch-market", required=True, choices=["US", "JP"], help="ASINを取得したAmazonの市場（collector_runの市場）")

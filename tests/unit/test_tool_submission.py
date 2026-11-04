@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 
 from tool_submission.import_tool_page import ImportToolPage, Selectors
-from tool_submission.ledger import MAX_ATTEMPTS, MEMO_MAX_ATTEMPTS, LedgerBusy, SubmissionLedger
+from tool_submission.ledger import MAX_ATTEMPTS, MEMO_MAX_ATTEMPTS, LedgerBusy, SubmissionLedger, max_attempts
 from tool_submission.model import (
     SubmissionError, SubmissionItem, asin_file_bytes, build_memo, item_from_manifest, option_blockers, split_asins, submission_key,
 )
@@ -482,7 +482,8 @@ class El:
     def locator(self, sel):
         return El(self.page, f"{self.key}>>{sel}")
 
-    def fill(self, v):
+    def fill(self, v, timeout=None):
+        self.page.fill_timeouts.append(timeout)
         if self.page.fail_fill:
             raise RuntimeError("fill failed")
         self.page.values[self.key] = v
@@ -511,6 +512,7 @@ class PwPage:
     def __init__(self, html="", header="検索URL CSV名 メモ DL 取得日時"):
         self.html, self.header, self.values, self.calls, self.toggles = html, header, {}, [], {}
         self.fail_fill = self.fail_click = self.fail_wait = self.wrong_value = False
+        self.fill_timeouts: list = []
 
     def goto(self, url, **kw):
         self.calls.append(("goto", url))
@@ -884,3 +886,138 @@ def test_log_time_is_parsed_from_the_row():
     html = ('<table><tr data-seq="7"><td class="log-csv">7_a.csv</td><td class="log-status">取得完了</td>'
             '<td class="log-memo"><textarea class="memo">輸入_X</textarea></td><td class="log-time">2026-10-17 20:00</td></tr></table>')
     assert parse_log_entries(html)[0].time == "2026-10-17 20:00"
+
+
+# ---------------------------------------------------------------- 再試行の付与（DEVIATIONS #95）
+
+def _two_not_submitted(ledger):
+    page = FakePage(mode="before_click_fail")
+    assert run(ledger, page).kind == "NOT_SUBMITTED" and run(ledger, page).kind == "NOT_SUBMITTED"
+    return page
+
+
+def _lines(ledger):
+    return ledger.path.read_text(encoding="utf-8").splitlines()
+
+
+def test_grant_retry_raises_the_limit_to_three_and_appends_only(ledger):
+    page = _two_not_submitted(ledger)
+    assert run(ledger, page).kind == "REFUSED"  # grantなしは従来どおり拒否
+    before = _lines(ledger)
+    st = ledger.grant_retry("k1", reason="fill timeout 30s")
+    after = _lines(ledger)
+    assert after[:len(before)] == before and len(after) == len(before) + 1  # 追記のみ
+    assert (st.state, st.grants, max_attempts(st), st.attempts) == ("NOT_SUBMITTED", 1, 3, 2)
+    r = run(ledger, page)
+    assert (r.kind, ledger.state("k1").attempts) == ("NOT_SUBMITTED", 3)
+    assert run(ledger, page).kind == "REFUSED"  # 付与分も使い切れば再び拒否
+
+
+def test_granted_retry_can_submit_via_pseudo_page(ledger):
+    _two_not_submitted(ledger)
+    ledger.grant_retry("k1", reason="r")
+    ok = FakePage(mode="ok")
+    r = run(ledger, ok)
+    assert (r.kind, ok.clicks, ledger.state("k1").attempts) == ("MEMO_SAVED", 1, 3)
+
+
+def test_grant_never_enables_resend_after_an_unknown_outcome(ledger):
+    page = FakePage(mode="timeout_no_row")
+    assert run(ledger, page).kind == "UNKNOWN"
+    with pytest.raises(ValueError):
+        ledger.grant_retry("k1", reason="r")
+    ledger.append("k1", "RETRY_GRANTED", reason="forged")  # 台帳へ直接書かれても無視される
+    st = ledger.state("k1")
+    assert (st.state, st.grants) == ("UNKNOWN", 0)
+    assert run(ledger, page).kind == "UNKNOWN" and page.clicks == 1
+
+
+@pytest.mark.parametrize("events,expected", [
+    ([], "PLANNED"),
+    ([("SUBMIT_STARTED", {})], "SUBMITTING"),
+    ([("SUBMIT_STARTED", {}), ("AMBIGUOUS", {})], "AMBIGUOUS"),
+    ([("SUBMIT_STARTED", {}), ("RUN_IDENTIFIED", {"tool_run_id": 5})], "RUN_IDENTIFIED"),
+    ([("SUBMIT_STARTED", {}), ("RUN_IDENTIFIED", {"tool_run_id": 5}), ("MEMO_SAVED", {})], "MEMO_SAVED"),
+    ([("SUBMIT_STARTED", {}), ("RUN_IDENTIFIED", {"tool_run_id": 5}), ("MEMO_SAVED", {}), ("LINKED", {})], "LINKED"),
+])
+def test_grant_is_refused_and_ignored_in_other_states(ledger, events, expected):
+    for ev, data in events:
+        ledger.append("k1", ev, **data)
+    with pytest.raises(ValueError):
+        ledger.grant_retry("k1", reason="r")
+    ledger.append("k1", "RETRY_GRANTED", reason="forged", reopen_abandoned=True)
+    st = ledger.state("k1")
+    assert (st.state, st.grants) == (expected, 0)
+
+
+def test_abandoned_needs_explicit_reopen(ledger):
+    ledger.append("k1", "SUBMIT_STARTED")
+    ledger.append("k1", "OUTCOME_UNKNOWN")
+    ledger.append("k1", "SUBMIT_STARTED")  # 2回目の試行も結果不明（attempts=2）
+    ledger.append("k1", "OUTCOME_UNKNOWN")
+    ledger.abandon_unknown("k1", reason="取り下げ")
+    with pytest.raises(ValueError):
+        ledger.grant_retry("k1", reason="r")
+    assert ledger.state("k1").state == "ABANDONED"
+    ledger.append("k1", "RETRY_GRANTED", reason="forged")  # reopenなしは無視
+    assert (ledger.state("k1").state, ledger.state("k1").grants) == ("ABANDONED", 0)
+    st = ledger.grant_retry("k1", reason="再開", reopen_abandoned=True)
+    assert (st.state, st.grants, max_attempts(st)) == ("NOT_SUBMITTED", 1, 3)
+
+
+def test_over_grant_and_blank_reason_are_refused(ledger):
+    _two_not_submitted(ledger)
+    with pytest.raises(ValueError):
+        ledger.grant_retry("k1", reason=" ")
+    ledger.grant_retry("k1", reason="r")
+    with pytest.raises(ValueError, match="過剰"):
+        ledger.grant_retry("k1", reason="r2")  # 試行が増えていないのに2回目
+    assert ledger.state("k1").grants == 1
+
+
+def test_grant_before_the_limit_is_reached_is_refused(ledger):
+    assert run(ledger, FakePage(mode="before_click_fail")).kind == "NOT_SUBMITTED"  # attempts=1
+    with pytest.raises(ValueError, match="過剰"):
+        ledger.grant_retry("k1", reason="r")
+
+
+def test_grant_requires_the_verified_event_in_the_history(ledger):
+    ledger.append("k1", "SUBMIT_STARTED")
+    ledger.append("k1", "SUBMIT_STARTED")
+    ledger.append("k1", "OUTCOME_UNKNOWN")
+    assert ledger.state("k1").state == "UNKNOWN"  # NOT_SUBMITTED_VERIFIEDが無い状態では付与できない
+    with pytest.raises(ValueError):
+        ledger.grant_retry("k1", reason="r")
+
+
+def test_cli_grant_retry(ledger, capsys):
+    from tool_submission import cli
+    _two_not_submitted(ledger)
+    assert cli.main(["grant-retry", "--ledger", str(ledger.path), "--key", "k1", "--reason", "fill timeout"]) == 0
+    assert "再試行を1回付与" in capsys.readouterr().out and ledger.state("k1").grants == 1
+    assert cli.main(["grant-retry", "--ledger", str(ledger.path), "--key", "k1", "--reason", "again"]) == 1
+    assert cli.main(["grant-retry", "--ledger", str(ledger.path), "--key", "nokey", "--reason", "x"]) == 1
+
+
+def test_claim_submission_uses_the_granted_limit(ledger, tmp_path):
+    from tool_submission.runner import claim_submission
+    it, f = _plan_item(tmp_path, ledger, key="kg")
+    ledger.append("kg", "SUBMIT_STARTED")
+    ledger.append("kg", "NOT_SUBMITTED_VERIFIED")
+    ledger.append("kg", "SUBMIT_STARTED")
+    ledger.append("kg", "NOT_SUBMITTED_VERIFIED")
+    ok, msg = claim_submission(ledger, it, f, [], OPTS_OK, log_entries=[])
+    assert not ok and "2回" in msg
+    ledger.grant_retry("kg", reason="r")
+    ok, msg = claim_submission(ledger, it, f, [], OPTS_OK, log_entries=[])
+    assert ok and ledger.state("kg").attempts == 3
+
+
+def test_adapter_passes_the_long_fill_timeout(tmp_path):
+    f = tmp_path / "x.csv"
+    f.write_text("B000000001\nB000000002\nB000000003\n", encoding="utf-8")
+    sel = Selectors(input_url="https://example.invalid/in", asin_textarea="#t", asin_save_button="#s", option_toggles={"バリエーション": "#v"})
+    assert Selectors().fill_timeout_ms == 180000
+    pg = PwPage()
+    ImportToolPage(pg, sel).submit(item(n=3), f)
+    assert pg.fill_timeouts == [180000]

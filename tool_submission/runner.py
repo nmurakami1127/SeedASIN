@@ -26,7 +26,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Protocol
 
-from tool_submission.ledger import MAX_ATTEMPTS, MEMO_MAX_ATTEMPTS, LedgerBusy, SubmissionLedger
+from tool_submission.ledger import MEMO_MAX_ATTEMPTS, LedgerBusy, SubmissionLedger, max_attempts
 from tool_submission.model import SubmissionItem, option_blockers
 from tool_submission.reconcile import LogEntry, LogUnreadable, identify_new_entry
 from tool_submission.retention import blockers_of, check_retention, record_retention
@@ -120,8 +120,8 @@ def claim_submission(ledger: SubmissionLedger, item: SubmissionItem, input_path:
                     return False, "投入計画が台帳にありません"
                 if st.state not in ("PLANNED", "NOT_SUBMITTED"):
                     return False, f"状態が{st.state}です（送信済み・結果不明・対応済みのため再送しません。照合から再開してください）"
-                if st.attempts >= MAX_ATTEMPTS:
-                    return False, f"送信の試行が上限（{MAX_ATTEMPTS}回）に達しています"
+                if st.attempts >= max_attempts(st):
+                    return False, f"送信の試行が上限（{max_attempts(st)}回）に達しています"
                 others = pending_others(ledger, item.key)
                 if others:
                     return False, f"別の投入が未完了です: {others}（完了するまで次の投入に進みません）"
@@ -253,8 +253,8 @@ def _locked(ledger, page, item, input_path, log_retries, sleep, require_evidence
         if st.state == "SUBMITTING":
             ledger.append(item.key, "OUTCOME_UNKNOWN", reason="前回の送信が完了の記録なしで終了")
         return SubmitResult("UNKNOWN", detail="結果が不明のままです（該当する新規行がありません）。再送しません")
-    if st.attempts >= MAX_ATTEMPTS:
-        return SubmitResult("REFUSED", detail=f"送信の試行が上限（{MAX_ATTEMPTS}回）に達しています")
+    if st.attempts >= max_attempts(st):
+        return SubmitResult("REFUSED", detail=f"送信の試行が上限（{max_attempts(st)}回）に達しています")
     others = pending_others(ledger, item.key)
     if others:
         return SubmitResult("REFUSED", detail=f"別の投入が未完了です: {others}（完了するまで次の投入に進みません）")

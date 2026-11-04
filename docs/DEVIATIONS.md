@@ -1501,3 +1501,14 @@ Amazonのナビゲーションはdomcontentloadedで待機し、第三者リソ�
 - ページ数/ASIN数の上限（`max_pages`）はこれまで通り1回の実行あたり。帯が多いセラーは複数回の実行（日をまたぐ）で完走する。
 - 実PostgreSQLの結合テストは使い捨てDB（リポジトリ外）で実行した。
 
+
+## 95. 統合ツール投入の再試行付与 `RETRY_GRANTED` と入力欄の入力タイムアウト延長（2026-11-04）
+
+- **背景**: 5,000件の一括登録で`Locator.fill`が30秒で3件タイムアウト（SAVE前＝未送信）し、`MAX_ATTEMPTS=2`に達して再送が拒否された。台帳は追記専用で、削除・初期化はしない。DBスキーマは変えない。
+- **`ImportToolPage`**: `Selectors.fill_timeout_ms`（既定180000）を追加し、`box.fill(text, timeout=...)`へ渡す。`input_value()`の確認は維持。SAVEは1回、クリック後の失敗はUNKNOWNのまま（変更なし）。
+- **台帳**: 追記専用イベント`RETRY_GRANTED`（`reason`必須・`reopen_abandoned`・`evidence`）。`LedgerState.grants`を追加し、有効な上限は`max_attempts(st) = MAX_ATTEMPTS + grants`。畳み込みでは、`NOT_SUBMITTED`なら grants+1（状態不変）、`ABANDONED`かつ`reopen_abandoned=True`なら grants+1して`NOT_SUBMITTED`へ。それ以外の状態（PLANNED・SUBMITTING・UNKNOWN・AMBIGUOUS・RUN_IDENTIFIED・MEMO_SAVED・LINKED等）では無視する（台帳へ直接書かれても結果不明の再送は起きない）。
+- **`SubmissionLedger.grant_retry`**: key_lockの下で、`NOT_SUBMITTED`（履歴に`NOT_SUBMITTED_VERIFIED`があること）または`reopen_abandoned`付きの`ABANDONED`だけに付与。付与後の grants が `attempts - MAX_ATTEMPTS + 1` を超える場合は過剰として拒否（上限に達するごとに1回ずつ）。この過剰判定は`ABANDONED`の再開にも同じく適用するため、試行が1回の取り下げ済みは再開できない（上限未達で付与が不要なため）。
+- **runner**: `claim_submission`と`_locked`の上限判定を`max_attempts(st)`へ。入力ハッシュ・他の未完了・保全ゲート・バリエーション確認・SAVE前のSUBMIT_STARTED記録・SAVE1回は変更なし。
+- **CLI**: `python -m tool_submission.cli grant-retry --key K --reason TEXT [--reopen-abandoned]`。y/n確認なし。1行表示、失敗は終了コード1。
+- **`workflow.registration.register_saved(cfg, factory, ports, allow_keys=())`**: `allow_keys`のキーは`repeat_of_earlier_cycle`の計画でも対象にし、`State.allow_duplicates`へ追加する（`resume --allow-duplicate`と同じ「キーのリスト、重複なし」）。状態の条件（PLANNED/NOT_SUBMITTED/RUN_IDENTIFIED/MEMO_SAVED）は変えない。既定（空）は従来どおり。CLIからの`allow_keys`の渡し方はこの変更に含めていない。
+- **未確認**: 実画面（5,000件の貼り付けが180秒で収まるか）はパソコンで未確認。
