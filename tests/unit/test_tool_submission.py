@@ -962,7 +962,7 @@ def test_abandoned_needs_explicit_reopen(ledger):
     ledger.append("k1", "RETRY_GRANTED", reason="forged")  # reopenなしは無視
     assert (ledger.state("k1").state, ledger.state("k1").grants) == ("ABANDONED", 0)
     st = ledger.grant_retry("k1", reason="再開", reopen_abandoned=True)
-    assert (st.state, st.grants, max_attempts(st)) == ("NOT_SUBMITTED", 1, 3)
+    assert (st.state, st.grants, max_attempts(st), st.attempts) == ("NOT_SUBMITTED", 1, 3, 2)  # 上限到達済みなので追加の1回
 
 
 def test_over_grant_and_blank_reason_are_refused(ledger):
@@ -1021,3 +1021,18 @@ def test_adapter_passes_the_long_fill_timeout(tmp_path):
     pg = PwPage()
     ImportToolPage(pg, sel).submit(item(n=3), f)
     assert pg.fill_timeouts == [180000]
+
+
+def test_reopen_abandoned_below_the_limit_only_reopens_and_can_resend(ledger):
+    ledger.append("k1", "SUBMIT_STARTED")
+    ledger.append("k1", "OUTCOME_UNKNOWN")
+    ledger.abandon_unknown("k1", reason="取り下げ")
+    st = ledger.state("k1")
+    assert (st.state, st.attempts) == ("ABANDONED", 1)
+    with pytest.raises(ValueError):
+        ledger.grant_retry("k1", reason="r")  # reopenなしは拒否
+    st = ledger.grant_retry("k1", reason="再開", reopen_abandoned=True)
+    assert (st.state, st.grants, max_attempts(st), st.attempts) == ("NOT_SUBMITTED", 0, 2, 1)
+    page = FakePage(mode="ok")
+    assert run(ledger, page).kind == "MEMO_SAVED" and page.clicks == 1
+    assert ledger.state("k1").attempts == 2

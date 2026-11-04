@@ -92,7 +92,7 @@ class SubmissionLedger:
                 pass
             else:
                 raise ValueError(f"状態が{st.state}です。NOT_SUBMITTED（または--reopen-abandonedを付けたABANDONED）だけに付与できます")
-            if st.grants + 1 > st.attempts - MAX_ATTEMPTS + 1:
+            if st.state == "NOT_SUBMITTED" and st.grants + 1 > st.attempts - MAX_ATTEMPTS + 1:
                 raise ValueError(f"過剰な付与です（試行{st.attempts}回・付与済み{st.grants}回。上限{max_attempts(st)}回に達してから1回ずつ付与できます）")
             self.append(key, "RETRY_GRANTED", reason=reason, reopen_abandoned=bool(reopen_abandoned), evidence=evidence)
             return self.state(key)
@@ -145,7 +145,8 @@ class SubmissionLedger:
                 if st.state == "NOT_SUBMITTED":
                     st.grants += 1
                 elif st.state == "ABANDONED" and e.get("reopen_abandoned") is True:
-                    st.grants += 1
+                    if st.attempts >= max_attempts(st):  # 上限に達しているときだけ追加の1回。未満なら再開だけ（上限は増やさない）
+                        st.grants += 1
                     st.state = "NOT_SUBMITTED"
         return st
 
