@@ -504,6 +504,32 @@ def test_explain_matches_only_registered_runs_of_the_same_direction_and_market(t
     assert y["direction"] == "IMPORT" and y["business_market"] == "JP"
 
 
+def test_engine_selection_is_the_same_function_for_zero_unit_sources_and_matches_the_old_selection():
+    from workflow.source_select import diagnose, engine_selection, format_diagnose
+
+    cfg = config_from_dict({"lanes": {"US": {"origin_import": 1}}})
+    fake_prog = SimpleNamespace(slow_map=lambda m: {}, evaluated=lambda m: set())
+    zero_only = SimpleNamespace(sections={"EXPORT": [entry(s, units=0) for s in (595, 417, 456)], "IMPORT": [entry(569, units=0)]},
+                                blocked=[], needs_reaping=[])
+    sel = engine_selection(zero_only, fake_prog, "US", cfg)                               # 注文点数0の出典だけでも候補に出る（includes zero units）
+    assert [e.facts.source_id for e in sel.picks] == [595, 417, 456, 569] and sel.selectable == 4 and sel.per_section["EXPORT"]["candidates"] == 3
+    assert [e.facts.source_id for e in sel.picks] == [e.facts.source_id for e in baseline(zero_only)]       # エンジンの従来の選び方(select_targets)と一致
+    assert compare(zero_only, {}, set(), needed=1)["before"] == [e.facts.source_id for e in sel.picks]       # plan-compareの「従来」とも一致
+    mixed = SimpleNamespace(sections={"EXPORT": [entry(1, units=0), entry(2, units=None), entry(3)], "IMPORT": [entry(3), entry(4, units=0)]}, blocked=[], needs_reaping=[])
+    assert [e.facts.source_id for e in engine_selection(mixed, fake_prog, "US", cfg).picks] == [e.facts.source_id for e in baseline(mixed)] == [1, 3, 4]   # 経路なしは対象外・重複は1件
+
+
+def test_plan_compare_explains_zero_candidates_by_blocked_reasons():
+    from workflow.source_select import diagnose, format_diagnose
+
+    blk = lambda *codes: (SimpleNamespace(source_id=1), SimpleNamespace(blockers=[SimpleNamespace(code=c) for c in codes]))  # noqa: E731
+    plan = SimpleNamespace(sections={"EXPORT": [], "IMPORT": []}, blocked=[blk("INTERVAL"), blk("INTERVAL"), blk("RUNNING"), blk()], needs_reaping=[1])
+    d = diagnose(plan)
+    assert d["blocked_total"] == 4 and d["blocked_by_code"] == {"(理由なし)": 1, "INTERVAL": 2, "RUNNING": 1} and d["needs_reaping"] == 1
+    text = "\n".join(format_diagnose("US", d))
+    assert "EXPORT 0件" in text and "取得できない出典(期間内・実行中・保留・除外など。候補に入らない): 4件" in text and "INTERVAL=2" in text
+
+
 def test_plan_compare_text_names_the_slow_sources_it_brought_back_and_the_simulated_need():
     plan = plan_of([1, 2, 3, 4, 5])
     slow = {2: "2026-11-20T00:00:00Z", 3: "2026-11-09T00:00:00Z"}

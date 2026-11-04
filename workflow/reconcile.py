@@ -47,7 +47,7 @@ def classify_task(t, ledger_states: dict, allow=()) -> tuple[str, str, tuple | N
     if t.kind == "submit":
         key = t.result.get("key", "")
         cls, why = classify_submit(t, ledger_states.get(key), allow)
-        return {"LINKED": "A", "HANDOFF": "B", "HUMAN": "D"}[cls], why, ("submit", key)
+        return {"LINKED": "A", "DUPLICATE": "A", "HANDOFF": "B", "HUMAN": "D"}[cls], why, ("submit", key)
     if t.kind in ("acquire", "acquire_x") and t.status in ("HELD", "FAILED"):
         items = unresolved(t)
         if any(k == CAPTCHA for _s, _r, k in items):

@@ -239,6 +239,9 @@ def write_plan(items: list[SubmissionItem], files: list[bytes], ledger: Submissi
         manifest["status"] = item.status
         mpath = path.parent / f"manifest_{item.key}.json"
         st = ledger.state(item.key)
+        if st.duplicate_withdrawn:  # 重複のため取り下げ済み: 再計画で復活させない（台帳にも追記しない）
+            results.append((item, "重複のため取り下げ済み（計画は変更しません）"))
+            continue
         if st.state in ("NONE", "PLANNED", "WITHDRAWN"):
             mpath.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
         if st.state in ("NONE", "PLANNED", "WITHDRAWN") and (st.state == "WITHDRAWN" or st.manifest != manifest):

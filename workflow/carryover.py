@@ -106,6 +106,8 @@ def classify_submit(task: Task, entry, allow_duplicates=()) -> tuple[str, str]:
         return "HUMAN", "NO_LEDGER_KEY"
     if entry.state == "LINKED":
         return "LINKED", "LINKED"
+    if getattr(entry, "duplicate_withdrawn", None):  # 重複のため取り下げ済み（未送信）: 人の判断は済んでいる。閉じてよい
+        return "DUPLICATE", "DUPLICATE_WITHDRAWN"
     if entry.state in HUMAN_STATES:
         return "HUMAN", f"LEDGER_{entry.state}"
     m = entry.manifest or {}
@@ -127,6 +129,16 @@ def handoff_submit_tasks(st: State, ledger_states: dict, now: datetime, *, recor
         if cls == "HUMAN":
             continue
         entry = ledger_states[key]
+        if cls == "DUPLICATE":
+            changes.append({"task": t.id, "workflow": st.workflow_id, "class": cls, "ledger_state": entry.state})
+            if record:
+                t.result["closed_from"] = {"status": t.status, "detail": t.detail, "retry_after": t.retry_after, "at": iso(now)}
+                t.result.update(closed_reason="DUPLICATE_WITHDRAWN", handed_off_to="tool_submission/ledger.jsonl",
+                                duplicate_withdrawn={"evidence_run_id": entry.duplicate_withdrawn.get("evidence_run_id")})
+                t.detail = f"重複のため取り下げ済み（未送信）。統合ツール実行 {entry.duplicate_withdrawn.get('evidence_run_id')} に同じASINが含まれます。再送しません"
+                t.status, t.retry_after, t.updated_at = "SKIPPED", "", iso(now)
+                st.events.append({"ts": iso(now), "task": t.id, "msg": "DUPLICATE_WITHDRAWN ledger=WITHDRAWN"})
+            continue
         changes.append({"task": t.id, "workflow": st.workflow_id, "class": cls, "ledger_state": entry.state})
         if not record:
             continue

@@ -148,7 +148,7 @@ class PendingChecker:
                 st = self.e.ledger.state(it.key).state
                 if it.repeat_of_earlier_cycle and it.key not in self.e.allowed_repeat_keys():
                     continue  # 過去の一巡で投入済みのASINの再投入は、明示許可があるまで続きとして数えない（新しいASINを待たせない）
-                if st in ACTIONABLE_STATES and it.key not in self._held and not find_duplicates(self.e.ledger, it):
+                if st in ACTIONABLE_STATES and not self.e.ledger.state(it.key).duplicate_withdrawn and it.key not in self._held and not find_duplicates(self.e.ledger, it):
                     self.reasons[cand.asin] = f"出典{sid}の取得結果に未投入の計画あり"
                     return True
         return False

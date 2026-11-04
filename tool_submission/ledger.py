@@ -11,6 +11,8 @@ DBのスキーマは変えない暫定の置き場（DBに置く案は docs/DEVI
 - RUN_IDENTIFIED   **実行ID確定・メモ未保存**。ASINは再投入せず、この実行IDのメモ保存から再開する
 - MEMO_SAVED       実行IDの行にメモが保存され、再読込で確認できた
 - LINKED           **対応記録済み**: 既存の取込（ingest-log）が`tool_execution_link`へ記録したことを確認できた
+- WITHDRAWN       未送信の計画を取り下げた。PLAN_WITHDRAWN（小口の再編成。同じ計画が再びPLANNEDになり得る）と、
+                   DUPLICATE_WITHDRAWN（重複のため取り下げ。`duplicate_withdrawn`が付き、**再びPLANNEDには戻らない**。docs/DEVIATIONS.md #99）
 - NOT_SUBMITTED    ログ画面を読めたうえで、クリック前の失敗で送信されていないと確認できた（再試行は合計2回まで。
                    人が`RETRY_GRANTED`を追記した分だけ上限が増える。docs/DEVIATIONS.md #95）
 """
@@ -41,6 +43,7 @@ class LedgerState:
     evidence: dict | None = None
     events: list[dict] = field(default_factory=list)
     manifest: dict | None = None
+    duplicate_withdrawn: dict | None = None  # DUPLICATE_WITHDRAWN（重複のため取り下げ・未送信）の記録。あれば状態はWITHDRAWNで、PLANNEDでは復活しない
 
 
 def _now() -> str:
@@ -79,6 +82,22 @@ class SubmissionLedger:
                 raise ValueError("UNKNOWN/AMBIGUOUSの投入だけを取り下げられます")
             self.append(key, "TRACKING_ABANDONED", reason=reason)
 
+    def withdraw_duplicate(self, key: str, *, evidence_run_id: str, reason: str, memo: str, **extra) -> tuple[LedgerState, bool]:
+        """未送信(PLANNED・試行0)の計画を、重複のため取り下げる（追記のみ。履歴・入力ファイルは消さない）。戻り値は (状態, 今回追記したか)。
+        既に重複のため取り下げ済みなら何も追記しない（冪等）。送信済み・送信中・結果不明・LINKED等は拒否する。"""
+        if not reason.strip():
+            raise ValueError("取り下げ理由が必要です")
+        if not str(evidence_run_id).strip():
+            raise ValueError("根拠の統合ツール実行IDが必要です")
+        with self.key_lock(key):
+            st = self.state(key)
+            if st.duplicate_withdrawn:
+                return st, False
+            if st.state != "PLANNED" or st.attempts != 0:
+                raise ValueError(f"状態が{st.state}（試行{st.attempts}回）です。未送信のPLANNED（試行0回）だけを取り下げられます")
+            self.append(key, "DUPLICATE_WITHDRAWN", evidence_run_id=str(evidence_run_id), reason=reason, memo=memo, **extra)
+            return self.state(key), True
+
     def grant_retry(self, key: str, *, reason: str, reopen_abandoned: bool = False, evidence: dict | None = None) -> LedgerState:
         """未送信と確認できた投入に、再試行を1回分だけ追加する（追記のみ）。上限が尽きた分の補充に限る。"""
         if not reason.strip():
@@ -109,7 +128,7 @@ class SubmissionLedger:
             st.events.append(e)
             ev = e["event"]
             if ev == "PLANNED":
-                if st.state in ("NONE", "PLANNED", "WITHDRAWN"):  # 送信が始まった後は、計画の内容を書き換えない
+                if st.state in ("NONE", "PLANNED", "WITHDRAWN") and not st.duplicate_withdrawn:  # 重複のため取り下げたキーは復活させない  # 送信が始まった後は、計画の内容を書き換えない
                     st.manifest = e.get("manifest")
                     st.state = "PLANNED"
             elif ev == "BASELINE_RECORDED":  # 手動投入の前に控えた、送信前のログID一覧
@@ -128,6 +147,9 @@ class SubmissionLedger:
                 st.state = "ABANDONED"
             elif ev == "PLAN_WITHDRAWN" and st.state == "PLANNED" and st.attempts == 0:
                 st.state = "WITHDRAWN"  # 未送信の小口計画だけを再編成。履歴・入力ファイルは残す
+            elif ev == "DUPLICATE_WITHDRAWN" and st.state == "PLANNED" and st.attempts == 0 and not st.duplicate_withdrawn:
+                st.state = "WITHDRAWN"
+                st.duplicate_withdrawn = {k: v for k, v in e.items() if k not in ("key", "event")}
             elif ev == "AMBIGUOUS":
                 st.state = "AMBIGUOUS"
             elif ev == "RUN_IDENTIFIED":

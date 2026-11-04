@@ -363,7 +363,7 @@ def _selectable(cfg, fac, market: str):
     from acquisition.plan import PlanError, build_plan
     from origin_selection.report_import import ReportImportService
     from workflow.progress import SourceProgress
-    from workflow.source_select import choose
+    from workflow.source_select import engine_selection
 
     reports = ReportImportService(fac, None, actor="workflow-outcome")
     prog = SourceProgress(Path(cfg.state_dir) / "source_progress.jsonl")
@@ -375,7 +375,7 @@ def _selectable(cfg, fac, market: str):
             plan = build_plan(fac, reports, market, [ln.origin_import])
         except PlanError:
             continue
-        n = choose(plan, slow=prog.slow_map(market), evaluated=prog.evaluated(market), needed=cfg.needed_sources()).selectable
+        n = engine_selection(plan, prog, market, cfg).selectable
         best = n if best is None else max(best, n)
     return best
 
@@ -385,7 +385,7 @@ def _cmd_plan_compare(a, factory=None, **_) -> int:
     from acquisition.plan import PlanError, build_plan
     from origin_selection.report_import import ReportImportService
     from workflow.progress import SourceProgress
-    from workflow.source_select import compare, format_compare
+    from workflow.source_select import compare, diagnose, format_compare, format_diagnose
 
     cfg = load_config(a.config)
     fac = factory or _readonly_factory()
@@ -404,6 +404,7 @@ def _cmd_plan_compare(a, factory=None, **_) -> int:
         sim = getattr(a, "simulate_shortage", None)
         cmp = compare(plan, slow, prog.evaluated(pm), needed=sim if sim else cfg.needed_sources(), reserve=cfg.completion.reserve_unevaluated)
         print("\n".join(format_compare(pm, cmp, slow, simulated_needed=sim or None)))
+        print("\n".join(format_diagnose(pm, diagnose(plan))))
     return 0
 
 

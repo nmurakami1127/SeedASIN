@@ -93,6 +93,38 @@ def choose(plan, *, slow: dict[int, str] | set[int] = frozenset(), evaluated: se
     return sel
 
 
+def engine_selection(plan, progress, market: str, cfg) -> Selection:
+    """エンジンが取得対象の既存の出典を選ぶ関数。`Engine._existing_sources`・`plan-compare`・`outcome --config`が**この同じ関数**を使う
+    （候補の集合が食い違わないように）。候補は`select_targets`と同じ条件: 起点の経路を持つ出典（注文点数0の起点だけの出典も含む=include_zero_units）、
+    1方向あたり最大20件。plan.sections（その時点で取得できる出典）に入らない出典（期間内・実行中・保留・除外）は候補にならない。"""
+    return choose(plan, slow=progress.slow_map(market), evaluated=progress.evaluated(market), reserve=cfg.completion.reserve_unevaluated,
+                  needed=cfg.needed_sources())
+
+
+def diagnose(plan) -> dict:
+    """候補が少ない/0のときの理由の説明（読み取りのみ）: 方向ごとの出典数・起点の経路が無い数・注文点数0の数、取得できない出典（plan.blocked）の理由別の数。"""
+    sec = {}
+    for name in SECTIONS + ("NO_ORIGIN",):
+        es = plan.sections.get(name, [])
+        sec[name] = {"entries": len(es), "no_origin_path": len([e for e in es if e.rep is None]),
+                     "zero_units": len([e for e in es if e.rep is not None and e.rep.units <= 0])}
+    blocked: dict[str, int] = {}
+    for _f, d in getattr(plan, "blocked", []) or []:
+        codes = sorted({getattr(b, "code", str(b)) for b in (d.blockers or [])}) or ["(理由なし)"]
+        for c in codes:
+            blocked[c] = blocked.get(c, 0) + 1
+    return {"sections": sec, "blocked_total": len(getattr(plan, "blocked", []) or []), "blocked_by_code": dict(sorted(blocked.items())),
+            "needs_reaping": len(getattr(plan, "needs_reaping", []) or [])}
+
+
+def format_diagnose(market: str, d: dict) -> list[str]:
+    out = [f"  [{market}] 計画の内訳: " + " / ".join(f"{k} {v['entries']}件(起点経路なし{v['no_origin_path']}・注文点数0 {v['zero_units']})" for k, v in d["sections"].items())]
+    out.append(f"  取得できない出典(期間内・実行中・保留・除外など。候補に入らない): {d['blocked_total']}件"
+               + (" 内訳 " + ", ".join(f"{k}={n}" for k, n in d["blocked_by_code"].items()) if d["blocked_by_code"] else "")
+               + (f" / 回収待ち{d['needs_reaping']}件" if d["needs_reaping"] else ""))
+    return out
+
+
 def selectable_counts(plan, slow, evaluated, *, needed: int = 0, reserve: int = 0) -> dict:
     """方向ごと・合計の、選択可能な出典数（outcome・plan-compareの表示用）。"""
     s = choose(plan, slow=slow, evaluated=evaluated, needed=needed, reserve=reserve)

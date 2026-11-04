@@ -43,7 +43,7 @@ from workflow.daily_usage import DailyUsage, jst_day, next_jst_midnight
 from workflow.selection import PendingChecker, reusable_run
 from workflow.dedupe import SUBMITTED_STATES, find_duplicates, set_hash  # noqa: F401
 from workflow.ports import PortBlocked, Ports
-from workflow.source_select import choose
+from workflow.source_select import engine_selection
 from workflow.progress import (
     CARRY_IN_MAX, PAUSED_PAGE_CAP, RESTART_SUBSTANTIAL_PAGES, SourceProgress, assess_restart, note_low_yield, restart_gate, resume_snapshot,
 )
@@ -496,9 +496,7 @@ class Engine:
         saved = t.result.get("existing_sources")
         if saved is None:
             saved, seen = [], set()
-            c = self.cfg.completion
-            sel = choose(plan, slow=self.progress.slow_map(market), evaluated=self.progress.evaluated(market), reserve=c.reserve_unevaluated,
-                         needed=self.cfg.needed_sources())  # 後退中の出典は順位を下げるだけ（除外ではない・枠は減らさない）。候補不足なら戻す
+            sel = engine_selection(plan, self.progress, market, self.cfg)  # plan-compare・outcomeと同じ関数（後退中は順位を下げるだけ。候補不足なら戻す）
             for e in sel.picks:
                 if e.facts.source_id not in seen:
                     seen.add(e.facts.source_id)
@@ -909,6 +907,9 @@ class Engine:
     def _run_submit(self, t: Task) -> None:
         key = t.result["key"]
         st = self.ledger.state(key)
+        if st.duplicate_withdrawn:
+            return self._set(t, "SKIPPED", f"重複のため取り下げ済み（未送信）。統合ツール実行 {st.duplicate_withdrawn.get('evidence_run_id')} に同じASINが含まれます。再送しません",
+                             closed_reason="DUPLICATE_WITHDRAWN")
         if st.state in ("ABANDONED", "WITHDRAWN"):
             return self._set(t, "SKIPPED", "人の指示で結果不明の投入の追跡を取り下げました。再送しません（外部ジョブは取消していません）")
         if st.state == "LINKED":

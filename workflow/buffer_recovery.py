@@ -38,7 +38,7 @@ def stage_stalled_inputs(factory, cfg, store, ledger, *, now=None) -> tuple[int,
             except SubmissionError:
                 continue
             kept = [(it, data) for it, data in zip(items, files)
-                    if not it.repeat_of_earlier_cycle and ledger.state(it.key).state in ('NONE', 'WITHDRAWN')
+                    if not it.repeat_of_earlier_cycle and ledger.state(it.key).state in ('NONE', 'WITHDRAWN') and not ledger.state(it.key).duplicate_withdrawn
                     and any(p.get('direction') == it.direction and
                             p.get('origin_import_id') == cfg.lanes[lane].origin_import for p in it.paths)]
             if not kept:

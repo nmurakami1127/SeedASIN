@@ -1567,3 +1567,18 @@ Amazonのナビゲーションはdomcontentloadedで待機し、第三者リソ�
   - **`plan-compare`の補充表示**: 選択可能数が必要数を下回ったとき、再評価日を待たずに戻した後退中の出典を再評価日つきで列挙する（不足でなければ「補充: 不要」）。`--simulate-shortage N`（読み取りのみ）は必要数をNとして判定する模擬で、実データの選択可能数が十分でも不足時の挙動を確認できる。
 - **`outcome`をPCで環境変数なしに実行**（`workflow/dbconn.py`、`scripts/outcome_readonly.py`）: `SEEDASIN_APP_DATABASE_URL`があればそれ、無ければalembic 0001の`_LOCAL_DEV_PASSWORDS`のapp_role（`localhost:5432/seedasin`。`SEEDASIN_LOCAL_DB_HOST/PORT/NAME`で上書き可）。**app_roleのみ**。以降はこれまでどおり`SessionFactory.get_session`がRLSのmarketplaceを毎回SETし、READ ONLYトランザクションで読む。出力に集計時間（秒）、市場別の新規保存ASIN・run・ページ・重複、投入の結果（新規投入した鍵の現在の状態）、RUNNING別掲、needs-humanの件数を追加。ローカル開発用パスワードは本番では使わない（#22）。
 - **未確認（パソコンで）**: 実データでの`outcome`の実行時間と`plan-compare`の差（実際の選択可能数・後ろへ回る出典）、`completion`の既定値（窓3件/3日・合計20頁・初見率10%・1日開始/14日上限・未評価3枠・必要数）の妥当性、`reconcile --explain`の実データでの内訳（Workerには実データが無く、合成データのみ）、`needs-human`の期限7日の運用。
+
+## 99. 重複のため未送信の計画を取り下げる `withdraw-duplicate`（2026-11-05）
+
+統合ツールの実行に同じASINが既に全件含まれる未送信の鍵を、二重投入せずに閉じるための人の操作。DBスキーマ・既存イベントの意味は変えない（追記のみ）。
+
+- **コマンド**: `python -m tool_submission.cli withdraw-duplicate --key KEY --evidence-run RUN --reason "…" [--verify-csv PATH] [--evidence-file PATH] [--note …]`。対象は state==PLANNED かつ attempts==0（未送信）だけ。SUBMITTING/UNKNOWN/AMBIGUOUS/LINKED/NOT_SUBMITTED等は拒否し、何も追記しない。実行前に対象・根拠・理由・メモを表示してy/n確認する（`--yes`は無い。非対話では実行しない）。
+- **台帳**: 新しい追記イベント `DUPLICATE_WITHDRAWN`（evidence_run_id・reason・memo・evidence_sha・evidence_file・verified・missing_count・overlap_count・warnings・note）。状態はWITHDRAWNに畳み込むが、既存の`PLAN_WITHDRAWN`（小口の再編成。再計画で同じ計画が再びPLANNEDになり得る）とは`LedgerState.duplicate_withdrawn`で区別する。重複のため取り下げたキーは、後からPLANNEDが追記されても復活しない（畳み込みで無視）。`write_plan`は取り下げ済みキーを再計画しても台帳に追記しない。冪等（二重実行しても1行）。既存の行は書き換えない・削除しない。履歴・入力ファイルは残す。
+- **任意の照合 `--verify-csv`**: 統合ツール出力CSV（utf-8-sig/cp932/utf-8を自動判定、ASIN列）に、この鍵の入力ASINが全て含まれる場合のみ許可。不足・出力が空・ASIN列なしは拒否し、不足件数を表示する。方向・市場・出典(source_key)が根拠の実行の鍵と一致するかは**表示のみ**（不一致や、実行IDに対応する台帳の鍵が無い場合は【警告】を出すが、進められる）。
+- **他の仕組みとの関係**: find_duplicates（登録済みの状態のみが相手）・bulk registration（PLANNED/NOT_SUBMITTED/RUN_IDENTIFIED/MEMO_SAVEDのみ）の対象から外れる。workflowの投入工程は`SKIPPED`（closed_reason=DUPLICATE_WITHDRAWN）になり、`reconcile`ではD(人手が必要)ではなくA(閉じてよい)に分類し、`--apply`でも台帳は読むだけ。投入候補の選択(`selection`)・バッファ回復の対象からも外れる。
+- **本番の台帳には実行していない**（テストは一時ディレクトリのみ）。
+
+### #98 追補（実データ検証で判明: plan-compareの候補0）
+- **選択関数の一本化**: `Engine._existing_sources`・`plan-compare`・`outcome --config`は、同じ関数`workflow.source_select.engine_selection`を使う（候補の条件は従来の`select_targets`と同じ: 起点の経路を持つ出典・注文点数0を含む(include_zero_units)・1方向最大20）。注文点数0の出典だけでも候補に出ること、エンジンの選択と`plan-compare`の「従来」が一致することをテストで固定。
+- **候補0の理由**: 候補は`build_plan`の`plan.sections`（**その時点で取得できる**出典）から選ぶ。取得間隔内・実行中・保留・除外の出典は`plan.blocked`に入り、候補に入らない。実データでUSが候補0だったのは、直前に走った取得で11出典が取得間隔内になっていたため、と考えられる（Workerは実データを見ていない・推測）。`plan-compare`は方向ごとの出典数（起点経路なし・注文点数0の数）と、`plan.blocked`の理由別の数を表示するようにした。JPの「候補29・実行9」は、候補数と、1回のworkflowのページ上限(200)で実際に取得できる出典数の違いで、選び方の乖離ではない。
+- **取り直し見送りの解除の見直し**: `alternatives`は、その工程で**いま取得できる**他の候補（取り直し以外・後退中でない・未取得）の数で、取得間隔内/実行中でブロックされた出典や取得済みの出典は数えない（空いたページを受け取れないため）。したがって「エンジンには候補があるのに0と数える」ことは起きない（エンジン自身の`fetch_ids`から数える）。ただし取得できる他の候補が無いとき見送りを解除するため、取り直し(重なり約100%)だけが走ることはある。望まない場合は`completion.restart_release_when_scarce=false`で解除を無効にできる。

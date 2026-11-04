@@ -8,6 +8,7 @@
     python -m tool_submission.cli resolve   --key <投入キー> --run-id <実行ID>        # 新規行が複数のとき、人が選ぶ
     python -m tool_submission.cli link-check --key <投入キー>                        # ingest-log後、対応記録済みを確認（DB読み取りのみ）
     python -m tool_submission.cli verify-output --key <投入キー> --csv <統合ツールの出力CSV>
+    python -m tool_submission.cli withdraw-duplicate --key <投入キー> --evidence-run <統合ツール実行ID> --reason "…" [--verify-csv <出力CSV>]   # 重複のため未送信の計画を取り下げる（追記のみ・y/n確認）
     python -m tool_submission.cli submit --key <投入キー> --selectors <確認済みセレクタのJSON>   # 自動送信（実画面は未検証・初回は1件ずつ）
 
 `plan`はDBを読み取るだけで、入力ファイル（出典ごと・業務方向ごと・5,000件以下ごと）とマニフェストを`exports/tool_submission/`に作り、
@@ -503,6 +504,98 @@ def _cmd_abandon(a: argparse.Namespace) -> int:
     return 0
 
 
+def _default_memo(st, run_id: str, missing: int | None, today: str) -> str:
+    m = st.manifest or {}
+    check = f"照合日{today}・不足{missing}件" if missing is not None else f"照合日{today}・出力CSVとの照合なし"
+    return (f"重複のため取り下げ（未送信）。この鍵の入力ASINは、統合ツール実行 {run_id} の結果に全件含まれる（{check}）。"
+            f"同一ASINの再投入を避けるため送信しない。履歴・入力ファイルは削除しない。"
+            f"（方向={m.get('direction')}・出典={m.get('source_key') or m.get('source_id')}）")
+
+
+def _cmd_withdraw_duplicate(a: argparse.Namespace, confirm=None) -> int:
+    """重複のため、未送信(PLANNED・試行0)の計画を取り下げる。台帳へ追記するだけ（削除・書換えなし）。実行前に内容を表示してy/n確認する。"""
+    import hashlib
+    from datetime import datetime, timezone
+
+    ledger = _ledger(a)
+    st = _need(ledger, a.key)
+    if st is None:
+        return 2
+    if st.duplicate_withdrawn:
+        print(f"既に重複のため取り下げ済みです（実行 {st.duplicate_withdrawn.get('evidence_run_id')}・{st.duplicate_withdrawn.get('ts')}）。何も追記しません")
+        return 0
+    if st.state != "PLANNED" or st.attempts != 0:
+        print(f"[拒否] 状態が{st.state}（送信の試行{st.attempts}回）です。未送信のPLANNED（試行0回）だけを取り下げられます")
+        return 2
+    m = st.manifest or {}
+    path = Path(m.get("input_file", "").replace("\\", "/"))
+    try:
+        asins = [x.strip() for x in path.read_text(encoding="utf-8-sig").splitlines() if x.strip()]
+    except OSError:
+        asins = []
+    missing, ev_file = None, a.evidence_file
+    if a.verify_csv:
+        if not asins:
+            print(f"[拒否] 入力ファイルを読めません: {m.get('input_file')}（照合できないため取り下げません）")
+            return 3
+        r = verify_output(asins, Path(a.verify_csv))
+        if "reason" in r:
+            print(f"[拒否] 出力CSVを照合できません: {r['reason']}")
+            return 3
+        missing = int(r.get("missing_from_output", len(asins)))
+        if missing > 0 or not r.get("output"):
+            print(f"[拒否] この鍵の入力ASIN {r.get('input')}件のうち、出力CSV（{r.get('output')}件）に無いものが{missing}件あります。取り下げません"
+                  f"（例: {', '.join(r.get('missing_asins', [])[:5])}）")
+            return 3
+        ev_file = ev_file or a.verify_csv
+    sha = None
+    if ev_file:
+        try:
+            sha = hashlib.sha256(Path(ev_file).read_bytes()).hexdigest()
+        except OSError:
+            print(f"[拒否] 根拠ファイルを読めません: {ev_file}")
+            return 3
+    # 方向・出典の一致は表示のみ（未確認でも進められるが警告する）
+    warn = []
+    same_run = [(k, s2) for k, s2 in ledger.all_states().items() if s2.tool_run_id == str(a.evidence_run) and k != a.key and s2.manifest]
+    if same_run:
+        om = same_run[0][1].manifest
+        for label, mine, theirs in (("方向", m.get("direction"), om.get("direction")), ("市場", m.get("business_market"), om.get("business_market")),
+                                    ("出典", m.get("source_key") or m.get("source_id"), om.get("source_key") or om.get("source_id"))):
+            if mine != theirs:
+                warn.append(f"{label}が一致しません（この鍵={mine} / 実行{a.evidence_run}の鍵={theirs}）")
+    else:
+        warn.append(f"実行{a.evidence_run}に対応する台帳の鍵が見つからず、方向・出典の一致を確認できません")
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    memo = _default_memo(st, str(a.evidence_run), missing, today) + (f" 備考: {a.note}" if a.note else "")
+    print("== 重複のため取り下げ（台帳に追記するだけ。削除・書換えはしません） ==")
+    print(f"対象: {a.key}  状態={st.state}  方向={m.get('direction')}  出典={m.get('source_key') or m.get('source_id')}  ASIN={m.get('asin_count')}件  run={m.get('collector_run_id')}")
+    print(f"根拠: 統合ツール実行 {a.evidence_run}" + (f"  照合CSV={a.verify_csv}（不足{missing}件）" if a.verify_csv else "  （出力CSVとの照合なし）") + (f"  根拠ファイルsha256={sha[:16]}…" if sha else ""))
+    print(f"理由: {a.reason}")
+    print(f"メモ: {memo}")
+    for w in warn:
+        print(f"【警告】{w}")
+    if confirm is None:
+        import sys
+        if not sys.stdin.isatty():
+            print("[中止] 対話端末でのy/n確認が必要です")
+            return 2
+        confirm = lambda q: input(q).strip().lower() == "y"  # noqa: E731
+    if not confirm("この内容で取り下げます。よろしいですか？ [y/n] "):
+        print("取り下げませんでした（何も追記していません）")
+        return 2
+    try:
+        _st, added = ledger.withdraw_duplicate(a.key, evidence_run_id=str(a.evidence_run), reason=a.reason, memo=memo, evidence_sha=sha,
+                                               evidence_file=str(ev_file) if ev_file else None, verified=bool(a.verify_csv), missing_count=missing,
+                                               overlap_count=(len(set(x.upper() for x in asins)) - missing) if missing is not None else None,
+                                               note=a.note, warnings=warn, direction=m.get("direction"), source_key=m.get("source_key"))
+    except ValueError as exc:
+        print(f"[拒否] {exc}")
+        return 2
+    print("取り下げを台帳に追記しました。" if added else "既に取り下げ済みでした（何も追記していません）。", "この鍵は再送・再計画されません。履歴と入力ファイルは残しています。")
+    return 0
+
+
 def _cmd_grant_retry(a: argparse.Namespace) -> int:
     ledger = _ledger(a)
     try:
@@ -572,6 +665,14 @@ def build_parser() -> argparse.ArgumentParser:
     sp = add("submit", _cmd_submit, "統合ツールへ自動で送信しメモを保存する（入力画面のセレクタを--selectorsで渡すまで実行不可。実画面は未検証）")
     sp.add_argument("--key", required=True)
     sp.add_argument("--selectors", default=None, help="入力画面のセレクタ等のJSON（Selectorsの項目名）。利用者がDOMを確認した値だけを入れる")
+    sp = add("withdraw-duplicate", _cmd_withdraw_duplicate, "重複のため未送信(PLANNED・試行0)の計画を取り下げる（台帳へ追記のみ・y/n確認）")
+    sp.add_argument("--key", required=True)
+    sp.add_argument("--evidence-run", required=True, help="同じASINを含む統合ツールの実行ID")
+    sp.add_argument("--reason", required=True)
+    sp.add_argument("--evidence-file", default=None, help="根拠のファイル（sha256を記録する）")
+    sp.add_argument("--verify-csv", default=None, help="統合ツール出力CSV: 入力ASINが全て含まれる場合のみ許可（不足があれば拒否）")
+    sp.add_argument("--note", default=None)
+
     sp = add("link-check", _cmd_link_check, "ingest-log後に、tool_execution_linkへの記録（対応記録済み）を確認する（DB読み取りのみ）")
     sp.add_argument("--key", required=True)
     sp = add("retention-check", _cmd_retention_check, "新しい送信で削除される最古のログ行の出力が保全されているか確認する（送信はしない）")
@@ -591,8 +692,10 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(argv: list[str] | None = None, *, confirm=None) -> int:
     a = build_parser().parse_args(argv)
+    if a.func is _cmd_withdraw_duplicate:
+        return a.func(a, confirm=confirm)
     return a.func(a)
 
 
