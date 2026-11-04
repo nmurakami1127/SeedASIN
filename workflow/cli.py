@@ -133,6 +133,15 @@ def _factory():
     return SessionFactory.for_app_role()
 
 
+def _readonly_factory():
+    """読み取り専用コマンド用: 環境変数が無ければローカル開発DBのapp_roleに接続する（workflow/dbconn.py）。"""
+    from workflow.dbconn import readonly_factory, resolve_app_url
+
+    url, origin = resolve_app_url()
+    print(f"[接続] app_role（読み取り専用）: {origin}")
+    return readonly_factory()
+
+
 def _engine(cfg, factory, ports):
     from workflow.ports import RealPorts
 
@@ -336,20 +345,77 @@ def _cmd_outcome(a, factory=None, **_) -> int:
     if not since < until:
         print("[中止] --since は --until より前にしてください")
         return 2
-    o = build_outcome(factory or _factory(), markets, since, until, state_dir=a.state_dir, submission_dir=a.submission_dir, top=a.top)
+    fac = factory or _readonly_factory()
+    selectable, needed, pps = None, 4, 60
+    if a.config:   # 設定があれば、選択可能な出典数（後退中でない）を計画から数える（読み取りのみ）
+        selectable, cfg = {}, load_config(a.config)
+        needed, pps = cfg.needed_sources(), cfg.limits.pages_per_source
+        for m in markets:
+            selectable[m] = _selectable(cfg, fac, m)
+    o = build_outcome(fac, markets, since, until, state_dir=a.state_dir, submission_dir=a.submission_dir, top=a.top,
+                      selectable=selectable, needed=needed, pages_per_source=pps)
     print("\n".join(format_outcome(o)))
+    return 0
+
+
+def _selectable(cfg, fac, market: str):
+    """この市場の取得先で、選択可能（後退中でない）な出典数。計画を作れなければNone。"""
+    from acquisition.plan import PlanError, build_plan
+    from origin_selection.report_import import ReportImportService
+    from workflow.progress import SourceProgress
+    from workflow.source_select import choose
+
+    reports = ReportImportService(fac, None, actor="workflow-outcome")
+    prog = SourceProgress(Path(cfg.state_dir) / "source_progress.jsonl")
+    best = None
+    for lane, ln in cfg.lanes.items():
+        if cfg.page_market(lane) != market:
+            continue
+        try:
+            plan = build_plan(fac, reports, market, [ln.origin_import])
+        except PlanError:
+            continue
+        n = choose(plan, slow=prog.slow_map(market), evaluated=prog.evaluated(market), needed=cfg.needed_sources()).selectable
+        best = n if best is None else max(best, n)
+    return best
+
+
+def _cmd_plan_compare(a, factory=None, **_) -> int:
+    """（読み取りのみ）従来の取得対象と、効率による後ろ回し・候補不足の戻し・未評価枠を入れた取得対象を比べる。DB・台帳・状態は書かない。"""
+    from acquisition.plan import PlanError, build_plan
+    from origin_selection.report_import import ReportImportService
+    from workflow.progress import SourceProgress
+    from workflow.source_select import compare, format_compare
+
+    cfg = load_config(a.config)
+    fac = factory or _readonly_factory()
+    reports = ReportImportService(fac, None, actor="workflow-plan-compare")
+    prog = SourceProgress(Path(cfg.state_dir) / "source_progress.jsonl")
+    for lane, ln in cfg.lanes.items():
+        if a.market != "ALL" and lane != a.market:
+            continue
+        pm = cfg.page_market(lane)
+        try:
+            plan = build_plan(fac, reports, pm, [ln.origin_import])
+        except PlanError as exc:
+            print(f"[{lane}] 計画を作れません: {exc}")
+            continue
+        slow = prog.slow_map(pm)
+        cmp = compare(plan, slow, prog.evaluated(pm), needed=cfg.needed_sources(), reserve=cfg.completion.reserve_unevaluated)
+        print("\n".join(format_compare(pm, cmp, slow)))
     return 0
 
 
 def _cmd_reconcile(a, factory=None, confirm=None, **_) -> int:
     from tool_submission.ledger import SubmissionLedger
     from workflow.progress import SourceProgress, resume_snapshot
+    from workflow.quarantine import FILE_NAME, NeedsHuman
     from workflow.reconcile import apply_reconcile, format_scan, scan
 
     store = WorkflowStore(a.state_dir)
     ledger = SubmissionLedger(Path(a.submission_dir) / "ledger.jsonl")
     if not a.apply:
-        print("\n".join(format_scan(scan(store, ledger))))
+        print("\n".join(format_scan(scan(store, ledger, explain=a.explain))))
         print("（dry-runです。何も書いていません。整理するなら --apply）")
         return 0
     if confirm is None:
@@ -360,7 +426,8 @@ def _cmd_reconcile(a, factory=None, confirm=None, **_) -> int:
     fac = factory
     snap = (lambda m, sid: resume_snapshot(fac, m, sid)) if fac is not None else None
     try:
-        out = apply_reconcile(store, ledger, SourceProgress(Path(a.state_dir) / "source_progress.jsonl"), snapshot=snap, confirm=confirm)
+        out = apply_reconcile(store, ledger, SourceProgress(Path(a.state_dir) / "source_progress.jsonl"), snapshot=snap, confirm=confirm,
+                              include_d=a.include_d, needs=NeedsHuman(Path(a.state_dir) / FILE_NAME))
     except RuntimeError as exc:
         print(f"[中止] {exc}")
         return 2
@@ -370,6 +437,34 @@ def _cmd_reconcile(a, factory=None, confirm=None, **_) -> int:
         return 2
     for c in out["changed"]:
         print(f"  整理: {c['workflow']} → {c['overall_after']}（元の状態を退避: {c['backup']}）")
+    return 0
+
+
+def _cmd_needs_human(a, **_) -> int:
+    """人の判断待ち（reconcile --apply --include-d で取り分けたもの）の一覧・解決・戻し。投入台帳・取得履歴は変更しない。"""
+    from datetime import datetime, timezone
+
+    from workflow.quarantine import FILE_NAME, NeedsHuman, format_items
+    from workflow.reconcile import reopen
+
+    needs = NeedsHuman(Path(a.state_dir) / FILE_NAME)
+    if a.resolve:
+        try:
+            needs.resolve(a.resolve, a.decision, a.note or "")
+        except KeyError as exc:
+            print(f"[中止] {exc}")
+            return 2
+        print(f"解決として記録しました: {a.resolve} ({a.decision})")
+        return 0
+    if a.reopen:
+        try:
+            ch = reopen(WorkflowStore(a.state_dir), needs, a.reopen, a.note or "", allow_duplicate=a.allow_duplicate)
+        except (RuntimeError, KeyError) as exc:
+            print(f"[中止] {exc}")
+            return 2
+        print(f"取り分けを戻しました: {a.reopen} → " + (", ".join(f"{c['workflow']}:{c['task']}={c['status']}" for c in ch) or "戻す工程なし"))
+        return 0
+    print("\n".join(format_items(needs.open_items(), datetime.now(timezone.utc))))
     return 0
 
 
@@ -431,10 +526,23 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--since", default=None, help="開始（日付/日時。タイムゾーン無しはJST）。既定は--untilの24時間前")
     sp.add_argument("--until", default=None, help="終了（含まない）。既定は現在")
     sp.add_argument("--top", type=int, default=15, help="出典別に表示する件数（ページ数の多い順）")
+    sp.add_argument("--config", default=None, help="指定すると、選択可能な出典数（後退中でない）と取り直し見送りの影響を実際の候補数で見積もる")
     sp.add_argument("--state-dir", default="exports/workflow")
     sp.add_argument("--submission-dir", default="exports/tool_submission")
+    sp = add("plan-compare", _cmd_plan_compare, "（読み取りのみ）従来の取得対象と新しい取得対象の比較・選択可能な出典数")
+    sp.add_argument("--config", default="config/workflow.json")
+    sp.add_argument("--market", default="ALL", choices=["US", "JP", "ALL"])
+    sp = add("needs-human", _cmd_needs_human, "人の判断待ちの一覧（既定）/ --resolve で解決を記録 / --reopen で取り分けを戻す")
+    sp.add_argument("--state-dir", default="exports/workflow")
+    sp.add_argument("--resolve", default=None, metavar="ID")
+    sp.add_argument("--decision", default="OTHER", choices=["ALLOWED", "ALREADY_REGISTERED", "WITHDRAWN", "OTHER"])
+    sp.add_argument("--reopen", default=None, metavar="ID")
+    sp.add_argument("--allow-duplicate", action="store_true", help="--reopenと一緒に: 意図した再投入として許可も追記する")
+    sp.add_argument("--note", default=None)
     sp = add("reconcile", _cmd_reconcile, "未完了workflowの整理。既定はdry-run（何も書かない）。--applyはy/n確認が必要")
     sp.add_argument("--apply", action="store_true")
+    sp.add_argument("--explain", action="store_true", help="dry-run: REPEAT_OF_EARLIER_CYCLEの各キーについて、台帳の状態・登録済みの実行とのASIN重なり・未登録のまま残る件数を表示")
+    sp.add_argument("--include-d", action="store_true", help="--applyで、Dのうち取り分けてよい理由の投入工程を needs_human.jsonl に記録して閉じる（登録済みとは扱わない）")
     sp.add_argument("--state-dir", default="exports/workflow")
     sp.add_argument("--submission-dir", default="exports/tool_submission")
     for n, fn, h in (("backup", _cmd_backup, "状態・台帳・マニフェストをまとめて保存"), ("restore", _cmd_restore, "検証して復元")):

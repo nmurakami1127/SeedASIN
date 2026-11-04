@@ -112,6 +112,7 @@ class SourceState:
     acquiring: dict | None = None
     last_range: dict | None = None         # 最後にページを保存した取得 {start_page, end_page, at, run_id, cycle_id, outcome}
     last_event: dict | None = None
+    samples: list[dict] = field(default_factory=list)  # 効率の標本（YIELD_SAMPLE。直近のみ保持）
     low_yield: dict | None = None          # 低効率による後退 {level, reevaluate_at, rate, ...}。除外ではなく再評価時刻つきの優先度低下
     carry: dict | None = None              # 未解消の持ち越し {kind, retry_after, count, wf, task, reason, resume, ...}
     history: list[dict] = field(default_factory=list)
@@ -178,8 +179,11 @@ class SourceProgress:
                 prev = st.carry["count"] if st.carry else 0
                 st.carry = {**{k: v for k, v in e.items() if k not in ("event", "market", "source_id")}, "count": prev + 1, "carried_at": e["ts"]}
                 st.status = "RESUME_WAITING"
+            elif ev == "YIELD_SAMPLE":
+                st.samples.append({k: e.get(k) for k in ("ts", "run_id", "pages", "total", "new")})
+                del st.samples[:-SAMPLE_KEEP]
             elif ev == "LOW_YIELD":
-                st.low_yield = {k: e.get(k) for k in ("level", "reevaluate_at", "rate", "pages", "run_id", "ts")}
+                st.low_yield = {k: e.get(k) for k in ("level", "reevaluate_at", "rate", "pages", "run_id", "ts", "window")}
             elif ev == "YIELD_OK":
                 st.low_yield = None
             elif ev == "RESOLVED":
@@ -225,6 +229,16 @@ class SourceProgress:
         now = iso(self.now())
         return {s.source_id for (m, _), s in self.states().items() if m == market and s.low_yield and (s.low_yield.get("reevaluate_at") or "") > now}
 
+    def slow_map(self, market: str) -> dict[int, str]:
+        """後退中の出典 {source_id: 再評価日}。"""
+        now = iso(self.now())
+        return {s.source_id: s.low_yield["reevaluate_at"] for (m, _), s in self.states().items()
+                if m == market and s.low_yield and (s.low_yield.get("reevaluate_at") or "") > now}
+
+    def evaluated(self, market: str) -> set[int]:
+        """効率の標本がある（評価済みの）出典。標本の無い出典は「未評価」として選択の枠を確保する。"""
+        return {s.source_id for (m, _), s in self.states().items() if m == market and (s.samples or s.low_yield)}
+
     def open_carries(self) -> list[SourceState]:
         return [s for s in self.states().values() if s.status == "RESUME_WAITING" and s.carry]
 
@@ -260,12 +274,14 @@ class SourceProgress:
 
 # ---------------------------------------------------------------------- 再開位置の控え（DB読み取り）と低効率の後退
 
-LOW_YIELD_MIN_PAGES = 10          # この実行のページ数以上のときだけ効率を評価する
-LOW_YIELD_NEW_RATE = 0.10         # 初見率がこの割合未満なら「低効率」
+from workflow.config import Completion  # noqa: E402  しきい値の既定値と型（設定は workflow.config.Completion に集約）
+
+_DEFAULT = Completion()
+LOW_YIELD_MIN_PAGES = _DEFAULT.low_yield_min_pages      # 表示用の既定（実際の判定は設定のCompletionを使う）
+LOW_YIELD_NEW_RATE = _DEFAULT.low_yield_new_rate
+SAMPLE_KEEP = 30                  # 出典ごとに保持する効率の標本の最大数
 RESTART_SUBSTANTIAL_PAGES = 20    # 異常終了(BROKEN)した一巡がこのページ数以上保存済みなら、先頭からの取り直しは大きな再取得になる
 RESTART_DEFER_HOURS = 24          # その場合、同じ出典の先頭からの取り直しをこの時間（取り直しのたびに2倍）空ける
-LOW_YIELD_BACKOFF_DAYS = 7        # 後退の基準日数（低効率が続くたびに2倍、最大60日）
-LOW_YIELD_BACKOFF_MAX_DAYS = 60
 
 
 def resume_snapshot(factory, market: str, source_id: int) -> dict | None:
@@ -284,20 +300,48 @@ def resume_snapshot(factory, market: str, source_id: int) -> dict | None:
             "has_pages": c.has_pages if c else False}
 
 
-def note_low_yield(progress: "SourceProgress", market: str, source_id: int, *, wf: str, run_id: int, pages: int, total: int, new: int) -> dict | None:
-    """出典の効率を評価し、低効率なら**優先度を下げる**（除外ではない。再評価時刻まで次の候補選びで後回しにするだけ）。
-    後退の期間は、低効率が続くたびに2倍（最大60日）。効率が戻れば（初見率がしきい値以上）後退の記録を解除する。"""
-    if pages < LOW_YIELD_MIN_PAGES or total <= 0:
+def window_samples(samples: list[dict], now: datetime, cfg: Completion) -> list[dict]:
+    """判定に使う標本: 直近 cfg.low_yield_window_days 日以内の、新しい方から cfg.low_yield_window_runs 件。"""
+    lo = iso(now - timedelta(days=cfg.low_yield_window_days))
+    return [x for x in samples if (x.get("ts") or "") >= lo][-cfg.low_yield_window_runs:]
+
+
+def window_judgment(samples: list[dict], now: datetime, cfg: Completion) -> dict | None:
+    """直近の複数runの合算で初見率を見る（1回の不調で後退させない）。窓の合計ページが少なければ判定しない(None)。"""
+    w = window_samples(samples, now, cfg)
+    pages, total, new = sum(int(x.get("pages") or 0) for x in w), sum(int(x.get("total") or 0) for x in w), sum(int(x.get("new") or 0) for x in w)
+    if pages < cfg.low_yield_window_min_pages or total <= 0:
         return None
     rate = new / total
-    cur = progress.state(market, source_id).low_yield
-    if rate >= LOW_YIELD_NEW_RATE:
-        return progress.append(market, source_id, "YIELD_OK", wf=wf, run_id=run_id, pages=pages, total=total, new=new, rate=round(rate, 4)) if cur else None
-    level = (cur["level"] + 1) if cur else 0
-    days = min(LOW_YIELD_BACKOFF_DAYS * (2 ** level), LOW_YIELD_BACKOFF_MAX_DAYS)
-    until = iso(progress.now() + timedelta(days=days))
-    return progress.append(market, source_id, "LOW_YIELD", wf=wf, run_id=run_id, pages=pages, total=total, new=new, rate=round(rate, 4),
-                           level=level, reevaluate_at=until)
+    return {"runs": len(w), "pages": pages, "total": total, "new": new, "rate": round(rate, 4), "low": rate < cfg.low_yield_new_rate}
+
+
+def backoff_days(level: int, cfg: Completion) -> int:
+    """後退の期間。短く始め（既定1日）、低効率が連続するたびに2倍、上限（既定14日）で頭打ち。"""
+    return min(cfg.backoff_start_days * (2 ** max(0, level)), cfg.backoff_max_days)
+
+
+def note_low_yield(progress: "SourceProgress", market: str, source_id: int, *, wf: str, run_id: int, pages: int, total: int, new: int,
+                   cfg: Completion | None = None) -> dict | None:
+    """出典の効率を評価し、低効率なら**優先度を下げる**（除外ではない。再評価時刻まで次の候補選びで後ろに回すだけ）。
+    - 標本(YIELD_SAMPLE)を1run=1件で残し、直近の複数run（期間・件数は設定）の合算の初見率で判定する。
+    - 後退の期間は短く始め、低効率が連続したときだけ延ばす（上限あり）。
+    - 回復は即時: 今回のrun自身の初見率がしきい値以上なら、窓の合算に関係なく後退を解除する（YIELD_OK）。"""
+    cfg = cfg or _DEFAULT
+    if pages < cfg.low_yield_min_pages or total <= 0:
+        return None
+    rate = new / total
+    progress.append(market, source_id, "YIELD_SAMPLE", wf=wf, run_id=run_id, pages=pages, total=total, new=new, rate=round(rate, 4))
+    st = progress.state(market, source_id)
+    if rate >= cfg.low_yield_new_rate:
+        return progress.append(market, source_id, "YIELD_OK", wf=wf, run_id=run_id, pages=pages, total=total, new=new, rate=round(rate, 4)) if st.low_yield else None
+    j = window_judgment(st.samples, progress.now(), cfg)
+    if j is None or not j["low"]:
+        return None
+    level = (st.low_yield["level"] + 1) if st.low_yield else 0
+    until = iso(progress.now() + timedelta(days=backoff_days(level, cfg)))
+    return progress.append(market, source_id, "LOW_YIELD", wf=wf, run_id=run_id, pages=pages, total=total, new=new, rate=j["rate"],
+                           level=level, reevaluate_at=until, window=j)
 
 
 def assess_restart(factory, market: str, source_id: int, cycle_id: int | None) -> dict | None:
@@ -316,23 +360,32 @@ def assess_restart(factory, market: str, source_id: int, cycle_id: int | None) -
             "last_next_page_no": last.next_page_no if last else None}
 
 
-def restart_gate(progress: "SourceProgress", market: str, source_id: int, assessment: dict | None) -> dict | None:
-    """BROKENな一巡からの先頭の取り直しを、無条件には行わない（docs/DEVIATIONS.md #97）。
+def gate_wait(prior_restarts: int) -> timedelta:
+    """先頭からの取り直しの見送り時間。取り直し済みの回数nに対して RESTART_DEFER_HOURS x 2^(n-1)（最大16倍）。"""
+    return timedelta(hours=RESTART_DEFER_HOURS * (2 ** min(max(prior_restarts, 1) - 1, 4)))
+
+
+def restart_gate(progress: "SourceProgress", market: str, source_id: int, assessment: dict | None, *, alternatives: int | None = None,
+                 needed: int = 0, release_when_scarce: bool = True) -> dict | None:
+    """BROKENな一巡からの先頭の取り直しを、無条件には行わない（docs/DEVIATIONS.md #97, #98）。
     直前の一巡が十分に進んでいた(prior_pages >= RESTART_SUBSTANTIAL_PAGES)のに、同じ出典を直近（RESTART_DEFER_HOURS x 2^取り直し回数）に
     先頭から取り直し済みなら、取り直しを見送って再評価時刻まで待つ（WAIT_RESTART_REVIEW）。それ以外は従来どおり取り直す。
+    **候補不足の解除**: 位置が信頼できない(=ここに来るのはRESTART_BROKENだけ)うえで、ほかに取得できる有効な候補(alternatives)が
+    needed に満たないときは、見送らずに取り直す（取得できるものが無くなるよりは、重なりのある取り直しを許す）。解除したことは戻り値でなくNoneで表す。
     取り直しの連続回数の上限(max_cycle_restarts)はDB側の既存の判定で、ここでは緩めない。
-    **未実装**: 位置が信頼できるときに、overlap検証つきで一巡を続行する経路。BROKENの一巡は、DBの取得判定(acquisition/eligibility・lease)が
-    必ず先頭からの新しい一巡にするため、acquisition側の変更（RESUME_VERIFIED計画）が必要。"""
+    **未実装**: 位置が信頼できるときに、overlap検証つきで一巡を続行する経路（acquisition側のRESUME_VERIFIED計画が必要）。"""
     if not assessment or assessment["prior_pages"] < RESTART_SUBSTANTIAL_PAGES:
         return None
     now = progress.now()
     prev = [e for e in progress.events() if e["market"] == market and e["source_id"] == int(source_id) and e["event"] == "ACQUIRING" and e.get("plan") == "RESTART_BROKEN"]
     if not prev:
         return None
-    wait = timedelta(hours=RESTART_DEFER_HOURS * (2 ** min(len(prev) - 1, 4)))
+    wait = gate_wait(len(prev))
     last_at = parse_iso(prev[-1]["ts"])
     if now - last_at >= wait:
         return None
+    if release_when_scarce and alternatives is not None and alternatives < needed:
+        return None  # 候補不足のため解除（呼び出し側が alternatives/needed を記録に残す）
     return {"kind": WAIT_RESTART_REVIEW, "retry_at": iso(last_at + wait),
             "reason": f"直前の一巡は{assessment['prior_pages']}ページ保存済み（最後のエラー: {assessment['last_error']}）で、{prev[-1]['ts']}に先頭から取り直し済みです。"
                       f"{wait}の間は再び先頭から取り直しません（既取得ページの再取得を避ける。再評価時刻まで待機）"}

@@ -105,6 +105,22 @@ class Partition:
 
 
 @dataclass
+class Completion:
+    """出典の効率による優先度の調整と取り直しの見送り（docs/DEVIATIONS.md #98）。しきい値はここに集約する。
+    **除外ではない**: 優先度を下げるだけで、再評価日が来る前でも候補が足りなければ戻す。ページ上限(totals)・日次上限・CAPTCHA対応は緩めない。"""
+    low_yield_window_runs: int = 3          # 判定に使う直近の評価run数（初見率はこの窓の合算で見る）
+    low_yield_window_days: int = 3          # 窓に入れる期間（日）
+    low_yield_min_pages: int = 10           # 1回の取得がこのページ数以上のときだけ標本にする
+    low_yield_window_min_pages: int = 20    # 窓の合計がこのページ数以上のときだけ判定する
+    low_yield_new_rate: float = 0.10        # 窓の初見率がこの割合未満なら低効率
+    backoff_start_days: int = 1             # 後退の期間の最初（日）。低効率が連続するたびに2倍
+    backoff_max_days: int = 14              # 後退の最長（日）
+    reserve_unevaluated: int = 3            # 1方向あたり、未評価（標本の無い）出典に確保する枠
+    min_selectable: int = 0                 # 選択可能な出典がこの数を下回ると、後退中の出典を戻す。0=自動(ceil(max_total_pages/pages_per_source))
+    restart_release_when_scarce: bool = True  # 取り直し見送り中でも、他に取得できる候補が足りなければ見送りを解除する
+
+
+@dataclass
 class WorkflowConfig:
     lanes: dict[str, Lane]
     limits: Limits = field(default_factory=Limits)
@@ -128,6 +144,7 @@ class WorkflowConfig:
     close_on_repeated_page: bool = False  # true=保存済みのページの直後に同じ内容が返ったら、1回取り直して確認し、同じなら検索結果の深さの限界として
     #                                      SUCCESS_TRUNCATED(DEPTH_LIMIT)・再開位置なしで閉じる。false=従来どおり（REPEATED_PAGEで一巡をBROKENにする）。docs/DEVIATIONS.md #80
     partition: Partition = field(default_factory=Partition)  # 価格帯分割（既定は無効）。docs/DEVIATIONS.md #83
+    completion: Completion = field(default_factory=Completion)  # 出典の効率による優先度・取り直し見送り。docs/DEVIATIONS.md #98
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -145,6 +162,13 @@ class WorkflowConfig:
 
     def page_market(self, lane: str) -> str:
         return self.lanes[lane].page_market or lane
+
+    def needed_sources(self) -> int:
+        """1回のworkflowが取得に回せる出典数の目安（ページ上限 / 出典あたりページ）。これを下回るなら候補不足として後退中の出典を戻す。"""
+        c = self.completion
+        if c.min_selectable > 0:
+            return c.min_selectable
+        return max(1, -(-self.totals.max_total_pages // max(1, self.limits.pages_per_source)))
 
     def price_band_for(self, market: str) -> PartitionConfig | None:
         """取得先市場 market の出典の取得に使う価格帯の設定。無効（その市場が markets に無い）なら None。"""
@@ -176,6 +200,18 @@ class WorkflowConfig:
             if not isinstance(getattr(self, name), bool):
                 raise ConfigError(f"{name} はtrue/falseで指定してください")
         self._validate_partition()
+        c = self.completion
+        for name in ("low_yield_window_runs", "low_yield_window_days", "low_yield_min_pages", "low_yield_window_min_pages", "backoff_start_days",
+                     "backoff_max_days", "reserve_unevaluated", "min_selectable"):
+            v = getattr(c, name)
+            if isinstance(v, bool) or not isinstance(v, int) or v < 0 or v > 10000 or (name != "reserve_unevaluated" and name != "min_selectable" and v < 1):
+                raise ConfigError(f"completion.{name} は{'0' if name in ('reserve_unevaluated', 'min_selectable') else '1'}以上の整数で指定してください（指定: {v!r}）")
+        if not isinstance(c.low_yield_new_rate, (int, float)) or isinstance(c.low_yield_new_rate, bool) or not 0 < c.low_yield_new_rate < 1:
+            raise ConfigError("completion.low_yield_new_rate は0より大きく1より小さい数で指定してください")
+        if c.backoff_max_days < c.backoff_start_days:
+            raise ConfigError("completion.backoff_max_days は backoff_start_days 以上にしてください")
+        if not isinstance(c.restart_release_when_scarce, bool):
+            raise ConfigError("completion.restart_release_when_scarce はtrue/falseで指定してください")
         if not self.lanes:
             raise ConfigError("lanes（市場ごとの起点レポート）が空です")
         for m, ln in self.lanes.items():
@@ -256,6 +292,7 @@ def config_from_dict(d: dict) -> WorkflowConfig:
         cfg = WorkflowConfig(
             lanes=lanes, limits=Limits(**d.get("limits", {})), totals=Totals(**d.get("totals", {})), cross=Cross(**d.get("cross", {})),
             partition=_partition_from_dict(d.get("partition")),
+            completion=Completion(**{k: v for k, v in (d.get("completion") or {}).items() if not k.startswith("_")}),
             daily=Daily(**d.get("daily", {})), watch=Watch(**d.get("watch", {})), stall=Stall(**d.get("stall", {})),
             **{k: d[k] for k in ("brand_enabled", "tool_max_asins", "result_max_age_days", "state_dir", "submission_dir",
                                  "page_revisit_days", "profile", "listing_feedback", "skip_failures", "batch_target_asins",

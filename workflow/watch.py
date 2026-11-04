@@ -248,6 +248,17 @@ class Watcher:
         if snap.get("error"):
             self._notify_stall("stall:*:error", f"止まりの確認に失敗しました（{snap['error']}）", None, res)
 
+    def _check_needs_human(self, res: CycleResult) -> None:
+        """人の判断待ち(needs_human.jsonl)の期限切れを通知する（読み取りのみ。解決・戻しは`needs-human`コマンド）。失敗してもwatchは止めない。"""
+        try:
+            from workflow.quarantine import FILE_NAME, NeedsHuman
+
+            late = NeedsHuman(Path(self.cfg.state_dir) / FILE_NAME, now=self.now).overdue()
+        except Exception:  # noqa: BLE001
+            return
+        if late:
+            self._notify_stall("needs_human:overdue", f"人の判断待ち(needs-human)が期限切れです: {len(late)}件（`python -m workflow.cli needs-human` で確認）", None, res)
+
     def _notify_stall(self, key: str, msg: str, market: str | None, res: CycleResult) -> None:
         res.stall.append(msg)
         last = self._notified.get(key)
@@ -402,6 +413,7 @@ class Watcher:
                 if t.status in ("WAITING", "UNKNOWN"):
                     self._notify(f"{eng.st.workflow_id}:{t.id}:{t.detail}", f"{t.lane} {t.id}: {t.detail}", res, t.lane)
         self._check_stalls(res)
+        self._check_needs_human(res)
         res.state = "running" if res.worked else ("waiting_human" if res.human else "idle")
         if res.worked:
             res.next_check = self.now() + timedelta(seconds=self.min_gap)  # 続きの候補があるかをすぐ確認する（外部に出る前にDBで判定）

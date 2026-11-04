@@ -1541,3 +1541,25 @@ Amazonのナビゲーションはdomcontentloadedで待機し、第三者リソ�
 - **既存未完了の整理**（`python -m workflow.cli reconcile [--apply]`、`workflow/reconcile.py`）: 既定はdry-run（何も書かない）。A 自動整理可(LINKED済み)/B 引き渡し/C 持ち越しへ移管/D 人手が必要(鍵なし・結果不明/取り下げ・重複候補・CAPTCHA・状態を読めない)/E watchが進める(PENDING・再試行時刻待ち)。件数は同じ投入鍵・同じ出典を重複して数えない。`--apply`は、y/n確認・稼働中のwatch/run/resumeが無いこと・`engine_lock`を要し、書き換える状態ファイルは先に`state.json.reconcile-<時刻>.bak`へ退避する。A/B/Cの工程だけを整理し、D/Eは触らない。台帳・取得履歴・ASIN・再開位置は変更しない。**本番データには実行していない**（Workerの環境に実データは無く、テストは一時ディレクトリの合成データ150本のみ）。
 - **変えていないもの**: 取得の上限・CAPTCHA対応・日次枠・取得間隔・CONTINUE/RESTARTの判定(`acquisition/`)・`source_runner`・投入台帳の畳み込み規則とその書き込み・`state.json`の項目・設定ファイル・DBスキーマ。
 - **未確認（パソコンで）**: 実画面・実データでの`outcome`の実行時間（統計情報によってはnestloop無効の効果が違う）、`reconcile`のdry-run結果が実データの150本の内訳と一致するか、`LOW_YIELD`のしきい値（初見率10%・10ページ）の妥当性、持ち越し専用workflowの実際の頻度。
+
+## 98. 出典の効率による優先度の再設計・取り直し見送りの解除・Dの運用設計・読み取り専用の接続（2026-11-05）
+
+#97の第2報へのユーザー承認（概ね）と追加指示への対応。DBスキーマ・設定ファイルの既存項目・`acquisition/`・CONTINUE/RESTARTの判定は変更していない。
+
+- **低効率の後退を「順位を下げるだけ」に再設計**（`workflow/progress.py`、`workflow/source_select.py`、`engine._existing_sources`）:
+  - 旧(#97)は後退中の出典を取得対象から**外して**次の候補で補っていた。候補が少ない市場では、取得できる出典が減るおそれがあった。
+  - 新: 通常の出典 → 後退中の出典（再評価日が近い順）の順に並べる。**枠は減らさない**（通常の出典がlimitに満たなければ後退中の出典が埋める）。起点の経路を持つ出典・注文点数0を含む・1方向あたり20件は`select_targets`と同じ範囲で、効率を見ない従来の選び方(`baseline`)と件数が一致することをテストで固定。
+  - **候補不足の解除**: 選択可能（後退中でない）な出典が必要数(`needed`)に満たなければ、再評価日を待たずに後退中の出典を戻す。必要数は`completion.min_selectable`、0なら`ceil(totals.max_total_pages / limits.pages_per_source)`（既定200/60→4）。
+  - **未評価の出典の枠**: 効率の標本が無い出典のために、1方向あたり`completion.reserve_unevaluated`（既定3）枠を確保する（高順位の既知の出典で埋まらない）。
+  - **判定は直近の複数runの合算**: 1runごとに`YIELD_SAMPLE`を残し、直近`low_yield_window_days`日・`low_yield_window_runs`件（既定3日・3件）の合計ページが`low_yield_window_min_pages`（20）以上のとき、合算の初見率が`low_yield_new_rate`（10%）未満なら低効率。1回の不調では後退しない。
+  - **期間は短く始めて、連続したときだけ延ばす**: 1日→2→4→8→**14日で頭打ち**（旧: 7日→最大60日）。**回復は即時**: そのrun自身の初見率がしきい値以上なら、窓の合算に関係なく解除(`YIELD_OK`)。除外ではない（`acquisition_source.status`は変えない・再評価日つき）。
+  - しきい値はすべて設定の新しい最上位項目`completion`（`workflow/config.py::Completion`）に集約。無い設定・保存済みの古い設定は既定値で読める（`state.json`の最上位項目は増やさない。選択結果は`Task.result["selection"]`に保存）。
+  - 読み取り専用の確認: `python -m workflow.cli plan-compare --config … [--market US|JP|ALL]`（従来の取得対象と新しい取得対象の比較・選択可能な出典数・後ろへ回した/外れた/加わった出典）。`outcome --config …`も選択可能な出典数を表示する。
+- **取り直し(RESTART_BROKEN)の24時間見送りの取得量への影響**（`workflow/restart_sim.py`、`outcome`の出力）: 実測の取り直しrunを時系列で`restart_gate`と同じ規則に当てはめ、見送り対象のページ・実測の再取得ページ・失う初見ASIN(取り直し前に無かったもの)を数え、空いたページが他の有効候補へ再配分される量と使われずに残る量を見積もる。**見積もりであり実測ではない**（再配分で得る初見は市場の1ページあたり平均で換算）。通常のCONTINUEは対象外で、変更も見送りもしていない。
+- **見送りの解除条件**（`restart_gate(alternatives, needed)`）: 位置を信頼できず(RESTART_BROKEN)、かつ他に取得できる有効な候補（取り直し以外・後退中でない）が必要数に満たないときは、見送らず取り直す。`completion.restart_release_when_scarce=false`で無効化できる。解除したことは`ACQUIRING`記録の`restart.gate_released`に残る。`max_cycle_restarts`・ページ上限・CAPTCHA対応は緩めていない。
+- **Dの運用設計**（`workflow/quarantine.py`、`reconcile --explain / --include-d`、`needs-human`）:
+  - dry-runはDを理由別に、**重複を除いたキー数とworkflow数を分けて**表示する。`--explain`は`REPEAT_OF_EARLIER_CYCLE`の各キーについて、台帳の状態・同じ業務方向で登録済み(SUBMITTED_STATES)の別の投入キーとのASIN集合の重なり・どの登録済み集合にも無い（未登録のまま残る）ASIN数と判定（ALL_ALREADY_REGISTERED / NONE_REGISTERED / PARTIAL / INPUT_FILE_MISSING）を出す。入力ファイルは読むだけ。
+  - 取り分け(`--apply --include-d`): Dの投入工程のうち、台帳が追跡していない・人の判断待ちが確定している理由（REPEAT_OF_EARLIER_CYCLE / LEDGER_WITHDRAWN / LEDGER_ABANDONED / NO_LEDGER_KEY）だけを、追記専用の`<state_dir>/needs_human.jsonl`に1キー1件で記録し、工程を`closed_reason=NEEDS_HUMAN`で閉じる（状態の直書きCOMPLETEDではない。**登録済みとは扱わない**）。結果不明・照合中(UNKNOWN/AMBIGUOUS/SUBMITTING)・CAPTCHA・人の操作待ち・状態ファイル破損は取り分けず、未完了のまま見える。台帳・ASIN・取得履歴は変更しない。
+  - 無期限に残さない: 取り分けた日から7日(`REVIEW_DAYS`)を期限とし、期限切れはwatchが`notify_minutes`ごとに通知し、`outcome`にも件数が出る。`needs-human`で一覧・`--resolve ID --decision ALLOWED|ALREADY_REGISTERED|WITHDRAWN|OTHER`で解決を記録・`--reopen ID [--allow-duplicate]`で工程を元の状態に戻す（意図した再投入なら許可も追記）。
+- **`outcome`をPCで環境変数なしに実行**（`workflow/dbconn.py`、`scripts/outcome_readonly.py`）: `SEEDASIN_APP_DATABASE_URL`があればそれ、無ければalembic 0001の`_LOCAL_DEV_PASSWORDS`のapp_role（`localhost:5432/seedasin`。`SEEDASIN_LOCAL_DB_HOST/PORT/NAME`で上書き可）。**app_roleのみ**。以降はこれまでどおり`SessionFactory.get_session`がRLSのmarketplaceを毎回SETし、READ ONLYトランザクションで読む。出力に集計時間（秒）、市場別の新規保存ASIN・run・ページ・重複、投入の結果（新規投入した鍵の現在の状態）、RUNNING別掲、needs-humanの件数を追加。ローカル開発用パスワードは本番では使わない（#22）。
+- **未確認（パソコンで）**: 実データでの`outcome`の実行時間と`plan-compare`の差（実際の選択可能数・後ろへ回る出典）、`completion`の既定値（窓3件/3日・合計20頁・初見率10%・1日開始/14日上限・未評価3枠・必要数）の妥当性、`reconcile --explain`の実データでの内訳（Workerには実データが無く、合成データのみ）、`needs-human`の期限7日の運用。

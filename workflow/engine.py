@@ -43,8 +43,9 @@ from workflow.daily_usage import DailyUsage, jst_day, next_jst_midnight
 from workflow.selection import PendingChecker, reusable_run
 from workflow.dedupe import SUBMITTED_STATES, find_duplicates, set_hash  # noqa: F401
 from workflow.ports import PortBlocked, Ports
+from workflow.source_select import choose
 from workflow.progress import (
-    CARRY_IN_MAX, PAUSED_PAGE_CAP, SourceProgress, assess_restart, note_low_yield, restart_gate, resume_snapshot,
+    CARRY_IN_MAX, PAUSED_PAGE_CAP, RESTART_SUBSTANTIAL_PAGES, SourceProgress, assess_restart, note_low_yield, restart_gate, resume_snapshot,
 )
 from workflow.store import DONE_STATES, State, Task, WorkflowStore, dep_blocks, now_iso, usage
 
@@ -495,24 +496,15 @@ class Engine:
         saved = t.result.get("existing_sources")
         if saved is None:
             saved, seen = [], set()
-            slow = self.progress.deprioritized(market)  # 低効率で後退中の出典（除外ではない。再評価時刻まで後回し）
-            for sec in ("EXPORT", "IMPORT"):
-                picks = select_targets(plan, sec, MAX_SOURCES_HARD_CAP, include_zero_units=True)
-                if slow & {e.facts.source_id for e in picks}:
-                    # 後回しにした分は、同じ順位・同じ条件(select_targetsと同じ)で次の候補から補う（1方向あたりの上限は変えない）
-                    picks, taken = [], set()
-                    for e in plan.sections.get(sec, []):
-                        if e.rep is None or e.facts.source_id in slow or e.facts.source_id in taken:
-                            continue
-                        taken.add(e.facts.source_id)
-                        picks.append(e)
-                        if len(picks) >= MAX_SOURCES_HARD_CAP:
-                            break
-                for e in picks:
-                    if e.facts.source_id not in seen:
-                        seen.add(e.facts.source_id)
-                        saved.append({"source_id": e.facts.source_id, "market": market, "source_type": e.facts.source_type,
-                                      "key": e.facts.key_primary})
+            c = self.cfg.completion
+            sel = choose(plan, slow=self.progress.slow_map(market), evaluated=self.progress.evaluated(market), reserve=c.reserve_unevaluated,
+                         needed=self.cfg.needed_sources())  # 後退中の出典は順位を下げるだけ（除外ではない・枠は減らさない）。候補不足なら戻す
+            for e in sel.picks:
+                if e.facts.source_id not in seen:
+                    seen.add(e.facts.source_id)
+                    saved.append({"source_id": e.facts.source_id, "market": market, "source_type": e.facts.source_type, "key": e.facts.key_primary})
+            t.result["selection"] = {"selectable": sel.selectable, "deprioritized": sel.deprioritized, "needed": sel.needed, "scarce": sel.scarce,
+                                     "sections": sel.per_section}
             t.result["existing_sources"] = saved
         return saved
 
@@ -555,6 +547,9 @@ class Engine:
                 self._note_fetch(market, sid, t, it.report, 0, None, None)
             self._save_task(t)
         if fetch_ids:
+            slow_now = self.progress.slow_map(market)
+            # 先頭からの取り直し以外で、いま取得できる有効な候補の数（取り直しの見送りを解除するかの判断に使う）
+            alternatives = sum(1 for x in fetch_ids if entries[x].decision.plan != "RESTART_BROKEN" and x not in slow_now)
             with self._fetcher(market, True) as fetcher:
                 for sid in fetch_ids:
                     d = entries[sid].decision
@@ -578,7 +573,11 @@ class Engine:
                             assessment = assess_restart(self.factory, market, sid, cyc.cycle_id if cyc else None)
                         except Exception:  # noqa: BLE001
                             assessment = None
-                        gate = restart_gate(self.progress, market, sid, assessment)
+                        cc = self.cfg.completion
+                        gate = restart_gate(self.progress, market, sid, assessment, alternatives=alternatives, needed=self.cfg.needed_sources(),
+                                            release_when_scarce=cc.restart_release_when_scarce)
+                        if gate is None and assessment and assessment["prior_pages"] >= RESTART_SUBSTANTIAL_PAGES and alternatives < self.cfg.needed_sources():
+                            assessment = {**assessment, "gate_released": {"alternatives": alternatives, "needed": self.cfg.needed_sources()}}
                         if gate:
                             recs[str(sid)] = {"mode": "HELD", "pause": gate["kind"], "reason": gate["reason"], "retry_at": gate["retry_at"], "restart": assessment}
                             continue
@@ -714,7 +713,7 @@ class Engine:
                     total, new = run_first_seen(conn, market, rp.run_id)
                 if rec is not None:
                     rec["first_seen"] = {"total": total, "new": new}
-                note_low_yield(self.progress, market, sid, wf=self.st.workflow_id, run_id=rp.run_id, pages=rp.pages, total=total, new=new)
+                note_low_yield(self.progress, market, sid, wf=self.st.workflow_id, run_id=rp.run_id, pages=rp.pages, total=total, new=new, cfg=self.cfg.completion)
         except Exception as exc:  # noqa: BLE001
             self._event(t.id, f"progress note failed: {type(exc).__name__}")
 

@@ -224,8 +224,8 @@ def test_watch_creates_a_carry_only_workflow_when_a_carried_source_is_due_and_do
     assert len(wt.store.list_ids()) == n
 
 
-def test_low_yield_source_is_deprioritized_with_a_reevaluation_date_not_excluded(app_role_factory, tmp_path, own, monkeypatch):
-    w = World(app_role_factory, tmp_path, cfg_extra={"cross": {"enabled": False}})
+def _slow_world(app_role_factory, tmp_path, monkeypatch, cfg_extra):
+    w = World(app_role_factory, tmp_path, cfg_extra={"cross": {"enabled": False}, **cfg_extra})
     slow, good = uid("ASLOW"), uid("AGOOD")
     w.us.seller_asins[slow] = w.us_asins[:1]
     w.us.seller_asins[good] = w.us_asins[1:2]
@@ -235,12 +235,90 @@ def test_low_yield_source_is_deprioritized_with_a_reevaluation_date_not_excluded
     prog = P.SourceProgress(os.path.join(w.cfg.state_dir, "source_progress.jsonl"))
     until = (datetime.now(timezone.utc) + timedelta(days=7)).strftime("%Y-%m-%dT%H:%M:%SZ")
     prog.append("US", slow_sid, "LOW_YIELD", wf="w", run_id=1, pages=60, rate=0.01, level=0, reevaluate_at=until)
+    return w, prog, slow, good, slow_sid, good_sid, until
+
+
+def test_low_yield_source_is_ranked_lower_not_excluded_and_comes_back_when_candidates_are_scarce(app_role_factory, tmp_path, own, monkeypatch):
+    # 選択可能な出典が必要数に満たない（既定の必要数 > 2）ので、後退中の出典は再評価日を待たずに戻る（候補不足の解除）
+    w, prog, slow, good, slow_sid, good_sid, until = _slow_world(app_role_factory, tmp_path, monkeypatch, {})
     eng = w.run()
     recs = eng.st.tasks["acquire:US"].result["sources"]
-    assert str(good_sid) in recs and str(slow_sid) not in recs and not any(slow in u for u in w.us.urls)     # 後回し（取得しない）
+    assert str(good_sid) in recs and str(slow_sid) in recs and any(slow in u for u in w.us.urls)
+    sel = eng.st.tasks["acquire:US"].result["selection"]
+    assert sel["scarce"] is True and sel["selectable"] == 1 and sel["deprioritized"] == 1
     assert prog.state("US", slow_sid).low_yield["reevaluate_at"] == until                                  # 再評価時刻つき。除外フラグではない
     with w.f.get_session("US") as conn, conn.begin():
         assert conn.execute(text("SELECT status FROM acquisition_source WHERE source_id = :s"), {"s": slow_sid}).scalar_one() == "ACTIVE"
-    prog.append("US", slow_sid, "YIELD_OK", wf="w", run_id=2)                                              # 効率が戻る/再評価されれば再び選ばれる
-    eng2 = w.run()
-    assert str(slow_sid) in eng2.st.tasks["acquire:US"].result["sources"]
+
+
+def test_low_yield_source_is_taken_after_the_normal_ones_when_not_scarce(app_role_factory, tmp_path, own, monkeypatch):
+    w, prog, slow, good, slow_sid, good_sid, until = _slow_world(app_role_factory, tmp_path, monkeypatch, {"completion": {"min_selectable": 1}})
+    eng = w.run()
+    sel = eng.st.tasks["acquire:US"].result["selection"]
+    assert sel["scarce"] is False and sel["selectable"] == 1
+    order = [s_["source_id"] for s_ in eng.st.tasks["acquire:US"].result["existing_sources"]]
+    assert order == [good_sid, slow_sid]                                                                   # 順位を下げるだけ（枠は減らさない・除外しない）
+    assert str(good_sid) in eng.st.tasks["acquire:US"].result["sources"]
+
+
+def test_plan_compare_cli_and_outcome_with_config_are_read_only_and_show_selectable_counts(app_role_factory, tmp_path, own, monkeypatch, capsys):
+    import json
+    from pathlib import Path
+
+    w, prog, slow, good, slow_sid, good_sid, until = _slow_world(app_role_factory, tmp_path, monkeypatch, {"completion": {"min_selectable": 1}})
+    cfg_path = tmp_path / "wf.json"
+    cfg_path.write_text(json.dumps(w.cfg.to_dict()), encoding="utf-8")
+    snap = lambda: {p: p.read_bytes() for p in Path(w.cfg.state_dir).rglob("*") if p.is_file()}  # noqa: E731
+    before = snap()
+    assert wcli.main(["plan-compare", "--config", str(cfg_path), "--market", "US"], factory=app_role_factory) == 0
+    out = capsys.readouterr().out
+    assert "選択可能な出典: 1件（後退中1件 / 必要数1件）" in out and f"後ろへ回した: [{slow_sid}]" in out
+    assert f"新  : #{good_sid} #{slow_sid}*" in out
+    assert wcli.main(["outcome", "--market", "US", "--config", str(cfg_path), "--state-dir", w.cfg.state_dir, "--submission-dir", w.cfg.submission_dir],
+                     factory=app_role_factory) == 0
+    o = capsys.readouterr().out
+    assert "集計時間" in o and "選択可能な出典（後退中でない）: 1件" in o and "取り直し24h見送りの影響" in o
+    assert snap() == before                                                                                # 状態ファイル・進行台帳を書かない
+    assert prog.state("US", slow_sid).low_yield["reevaluate_at"] == until
+
+
+def _force_restart_broken(monkeypatch, broken_ids):
+    """計画上の取得方式だけを RESTART_BROKEN に差し替える（実際のclaimと取得はDBの判定のまま）。"""
+    import dataclasses
+
+    real = E.build_plan
+
+    def fake(factory, reports, market, ids):
+        plan = real(factory, reports, market, ids)
+        for es in plan.sections.values():
+            for i, e in enumerate(es):
+                if e.facts.source_id in broken_ids:
+                    es[i] = dataclasses.replace(e, decision=dataclasses.replace(e.decision, plan="RESTART_BROKEN"))
+        return plan
+
+    monkeypatch.setattr(E, "build_plan", fake)
+    monkeypatch.setattr(E, "assess_restart", lambda f, m, sid, cid: {"cycle_id": cid, "prior_pages": 60, "restart_streak": 1, "last_error": "REPEATED_PAGE", "last_next_page_no": 3})
+
+
+def test_engine_defers_a_second_restart_when_other_candidates_exist_and_releases_it_when_they_are_scarce(app_role_factory, tmp_path, own, monkeypatch):
+    # 他に有効な候補がある（必要数1以上）: 24時間以内の2回目の取り直しは見送る（WAIT_RESTART_REVIEW）
+    w, prog, slow, good, slow_sid, good_sid, until = _slow_world(app_role_factory, tmp_path, monkeypatch, {"completion": {"min_selectable": 1}})
+    prog.append("US", slow_sid, "YIELD_OK", wf="w", run_id=9)
+    _force_restart_broken(monkeypatch, {slow_sid})
+    prog.append("US", slow_sid, "ACQUIRING", wf="w0", plan="RESTART_BROKEN", pid=1, start_page=1)        # 直近に先頭から取り直し済み
+    prog.append("US", slow_sid, "ABORTED", wf="w0", reason="test")                                          # （取得中の目印は終了済み）
+    eng = w.run()
+    recs = eng.st.tasks["acquire:US"].result["sources"]
+    assert recs[str(slow_sid)]["mode"] == "HELD" and recs[str(slow_sid)]["pause"] == P.WAIT_RESTART_REVIEW and not any(slow in u for u in w.us.urls)
+    assert recs[str(good_sid)]["mode"] == "FETCHED"                                                       # 空いたページは他の候補に回る
+    # 取得できる他の候補が無い（両方が取り直し・必要数2）: 見送りを解除して取り直す
+    w2, prog2, slow2, good2, slow_sid2, good_sid2, until2 = _slow_world(app_role_factory, tmp_path / "second", monkeypatch, {"completion": {"min_selectable": 2}})
+    prog2.append("US", slow_sid2, "YIELD_OK", wf="w", run_id=9)
+    _force_restart_broken(monkeypatch, {slow_sid2, good_sid2})
+    prog2.append("US", slow_sid2, "ACQUIRING", wf="w0", plan="RESTART_BROKEN", pid=1, start_page=1)
+    prog2.append("US", slow_sid2, "ABORTED", wf="w0", reason="test")
+    eng2 = w2.run()
+    recs2 = eng2.st.tasks["acquire:US"].result["sources"]
+    assert recs2[str(slow_sid2)]["mode"] == "FETCHED" and any(slow2 in u for u in w2.us.urls)
+    ev = [e for e in prog2.events() if e["event"] == "ACQUIRING" and e["source_id"] == slow_sid2 and e.get("restart")]
+    assert ev and ev[-1]["restart"]["gate_released"] == {"alternatives": 0, "needed": 2}                  # 解除した理由を記録に残す
