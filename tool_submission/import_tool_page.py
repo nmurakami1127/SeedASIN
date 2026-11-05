@@ -23,6 +23,7 @@ from tool_submission.reconcile import LogEntry, LogUnreadable, parse_log_entries
 from tool_submission.runner import SubmitFailed, SubmitResponse
 
 LOG_URL = "https://import-tools.jp/asin/logs.php"
+LOG_LOAD_TIMEOUT_MS = 90_000  # ログ画面の読み込み(goto・一覧の表示待ち)。5,000件投入直後は30秒を超え得る（DEVIATIONS #101）
 LOG_HEADER_MARKERS = ("CSV名", "メモ", "DL", "取得日時")  # 既存のautomation.pyが構造変化の検出に使う列名
 
 
@@ -69,8 +70,8 @@ class ImportToolPage:
     # ---- ログ画面
     def read_log(self) -> list[LogEntry]:
         try:
-            self._p.goto(self._s.log_url, wait_until="domcontentloaded")
-            self._p.locator("table tr").first.wait_for(state="visible", timeout=30000)
+            self._p.goto(self._s.log_url, wait_until="domcontentloaded", timeout=LOG_LOAD_TIMEOUT_MS)
+            self._p.locator("table tr").first.wait_for(state="visible", timeout=LOG_LOAD_TIMEOUT_MS)
             header = self._p.locator("table tr").first.inner_text()
             html = self._p.content()
         except Exception as exc:  # noqa: BLE001 - 未ログイン・通信失敗・構造変化は「読めない」として、再送しない判断に使う

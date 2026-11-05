@@ -1598,3 +1598,12 @@ Amazonのナビゲーションはdomcontentloadedで待機し、第三者リソ�
 - **plan-compare**: `python -m workflow.cli plan-compare --config X --extra-origin-imports US=2,JP=1`（読み取りのみ。設定ファイルは書き換えない。`US=`で空に上書き）。extraを使うレーンについて、市場ごとに「導入前候補数/導入後候補数」「取得対象数」「新たに加わる出典のsource_id（先頭30件）」「NO_ORIGINの変化」「EXPORT・IMPORTの両方に現れる出典数」を表示する。不正な指定は該当市場の比較だけ止まる（もう一方は続ける）。
 - **テスト**: `tests/unit/test_workflow_extra_origin.py`（疑似のDB・レポート台帳。既定で挙動不変・ハッシュ不変、US=[2]でNO_ORIGINが候補に、origin由来が先、二重取得防止、方向の整合、不正なextra、plan-compareの上書き）。`tests/integration/test_workflow_extra_origin.py`（実PostgreSQL。**Workerの環境にPostgreSQLが無く実行していない**）。
 - **未確認（パソコンで）**: 実データでの`plan-compare --extra-origin-imports US=2,JP=1`の候補数（約213件がUSで候補になるか）、結合テストの実行、extra導入後の1回のworkflowで取得するページ上限(totals/daily)内の動き。
+
+## 101. ログ画面(logs.php)読み込みのタイムアウトを30秒から90秒へ延長（2026-11-05）
+
+5,000 ASIN投入直後にログ画面が30秒を超えて読めず、結果不明(UNKNOWN)になる事象への対策（ユーザー承認は30→90秒の延長のみ）。
+
+- `tool_submission/import_tool_page.py`の`read_log`で、`page.goto`（Playwright既定も30秒のため明示）と一覧の`wait_for`の両方に`LOG_LOAD_TIMEOUT_MS = 90_000`を渡す（定数1箇所）。
+- 再試行は追加していない。タイムアウト時は従来どおり`LogUnreadable`（呼び出し側は再送せず照合に回す）。送信・再送ロジックは変更なし。
+- テスト: `tests/unit/test_log_load_timeout.py`（fake pageでgoto/wait_forに90000が渡ること、タイムアウト例外が`LogUnreadable`になること）。
+- 未確認（パソコンで）: 実画面で5,000件投入直後に90秒以内に読めるか。
