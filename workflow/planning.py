@@ -9,10 +9,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from acquisition.discovery import DiscoveryError, load_own_account_ids
-from acquisition.plan import PlanError, validate_origin_imports
+from acquisition.plan import PlanError
 from tool_submission.ledger import SubmissionLedger
 from tool_submission.runner import PENDING_STATES
 from workflow.config import OPPOSITE, WorkflowConfig
+from workflow.lane_imports import validate_lane_imports
 from workflow.daily_usage import JST, DailyUsage, jst_day, next_jst_midnight
 
 MODE_JA = {"ordered_only": "注文ありのみ", "ordered_then_zero": "注文あり→注文0点", "zero_only": "注文0点のみ"}
@@ -54,10 +55,12 @@ def build_plan_text(engine) -> tuple[list[str], list[str]]:
         lines.append(f"\n[{lane}] 起点レポート import_id={ln.origin_import}（明示） 選択モード={ln.selection_mode}（{MODE_JA[ln.selection_mode]}） "
                      f"→ 商品ページ・出典取得の市場={pm} 経路={ln.routes}")
         try:
-            info = validate_origin_imports(engine.reports, [ln.origin_import])[0]
-            if info.marketplace != lane:
-                raise PlanError(f"import_id={ln.origin_import} の市場は{info.marketplace}です")
+            infos = validate_lane_imports(engine.reports, lane, ln)
+            info = infos[0]
             lines.append(f"  レポート: ACTIVE・市場{info.marketplace}・方向{info.business_direction}・期間{info.period_start}〜{info.period_end}")
+            for x in infos[1:]:
+                lines.append(f"  extra_origin_imports（既存の出典の取得候補だけに使う。起点の発見・crossには使わない）: import_id={x.import_id}・市場{x.marketplace}・"
+                             f"方向{x.business_direction}・期間{x.period_start}〜{x.period_end}")
         except PlanError as exc:
             blockers.append(f"[{lane}] {exc}")
             lines.append(f"  [実行不可] {exc}")

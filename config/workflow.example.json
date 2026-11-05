@@ -1,9 +1,10 @@
 {
   "profile": "trial",
   "lanes": {
-    "US": {"origin_import": 1, "routes": ["SELLER"], "selection_mode": "ordered_then_zero"},
-    "JP": {"origin_import": 2, "routes": ["SELLER"], "selection_mode": "ordered_then_zero"}
+    "US": {"origin_import": 1, "routes": ["SELLER"], "selection_mode": "ordered_then_zero", "extra_origin_imports": []},
+    "JP": {"origin_import": 2, "routes": ["SELLER"], "selection_mode": "ordered_then_zero", "extra_origin_imports": []}
   },
+  "_comment_extra_origin_imports": "任意。既存の出典の取得候補にだけ、反対側市場のACTIVEレポートのimport_idを加える（例: USレーンに [2]、JPレーンに [1]）。空=従来どおり。起点ASINの発見・crossには使わない。導入前に python -m workflow.cli plan-compare --config X --extra-origin-imports US=2,JP=1 で候補の変化を確認する。docs/DEVIATIONS.md #100",
   "limits": {
     "origin_asins": 1,
     "sources_per_origin": 3,

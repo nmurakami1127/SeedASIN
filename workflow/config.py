@@ -37,6 +37,9 @@ class Lane:
     page_market: str | None = None  # 商品ページ（発見）と出典の取得先の市場。省略時は起点レポートの市場と同じ
     routes: list[str] = field(default_factory=lambda: ["SELLER"])
     selection_mode: str = "ordered_then_zero"  # ordered_only=注文ありのみ / ordered_then_zero=注文あり→注文0点 / zero_only=注文0点のみ
+    # 既存の出典の取得候補にだけ加える、反対側市場のACTIVEレポートのimport_id（既定は空=従来と同じ）。起点ASINの発見（discover）・cross には使わない。
+    # 例: USレーン(origin_import=1)に [2]（JP市場のレポート）を書くと、レポート2由来の経路しか持たないUS市場の出典が取得候補に入る。docs/DEVIATIONS.md #100
+    extra_origin_imports: list[int] = field(default_factory=list)
 
 
 @dataclass
@@ -147,7 +150,11 @@ class WorkflowConfig:
     completion: Completion = field(default_factory=Completion)  # 出典の効率による優先度・取り直し見送り。docs/DEVIATIONS.md #98
 
     def to_dict(self) -> dict:
-        return asdict(self)
+        d = asdict(self)
+        for ln in d["lanes"].values():  # 空のときは項目ごと出さない（従来の設定のsha256・保存済みスナップショットと同一にする）
+            if not ln.get("extra_origin_imports"):
+                ln.pop("extra_origin_imports", None)
+        return d
 
     def sha256(self) -> str:
         return hashlib.sha256(json.dumps(self.to_dict(), sort_keys=True, ensure_ascii=False).encode()).hexdigest()
@@ -219,6 +226,13 @@ class WorkflowConfig:
                 raise ConfigError(f"lanes のキーは {MARKETS} です: {m!r}")
             if not isinstance(ln.origin_import, int) or ln.origin_import < 1:
                 raise ConfigError(f"{m}: origin_import（ACTIVEレポートのimport_id）を明示してください")
+            ex = ln.extra_origin_imports
+            if not isinstance(ex, list) or any(isinstance(x, bool) or not isinstance(x, int) or x < 1 for x in ex):
+                raise ConfigError(f"{m}: extra_origin_imports は1以上の整数（import_id）のリストで指定してください: {ex!r}")
+            if len(set(ex)) != len(ex):
+                raise ConfigError(f"{m}: extra_origin_imports に同じimport_idが重複しています: {ex}")
+            if ln.origin_import in ex:
+                raise ConfigError(f"{m}: extra_origin_imports に origin_import 自身（{ln.origin_import}）は含められません")
             if (ln.page_market or m) not in MARKETS:
                 raise ConfigError(f"{m}: page_market は {MARKETS} です")
             if ln.selection_mode not in SELECTION_MODES:

@@ -362,6 +362,7 @@ def _selectable(cfg, fac, market: str):
     """この市場の取得先で、選択可能（後退中でない）な出典数。計画を作れなければNone。"""
     from acquisition.plan import PlanError, build_plan
     from origin_selection.report_import import ReportImportService
+    from workflow.lane_imports import lane_origin_imports
     from workflow.progress import SourceProgress
     from workflow.source_select import engine_selection
 
@@ -372,10 +373,10 @@ def _selectable(cfg, fac, market: str):
         if cfg.page_market(lane) != market:
             continue
         try:
-            plan = build_plan(fac, reports, market, [ln.origin_import])
+            plan = build_plan(fac, reports, market, lane_origin_imports(ln))
         except PlanError:
             continue
-        n = engine_selection(plan, prog, market, cfg).selectable
+        n = engine_selection(plan, prog, market, cfg, primary_import_ids=[ln.origin_import] if ln.extra_origin_imports else None).selectable
         best = n if best is None else max(best, n)
     return best
 
@@ -384,10 +385,14 @@ def _cmd_plan_compare(a, factory=None, **_) -> int:
     """（読み取りのみ）従来の取得対象と、効率による後ろ回し・候補不足の戻し・未評価枠を入れた取得対象を比べる。DB・台帳・状態は書かない。"""
     from acquisition.plan import PlanError, build_plan
     from origin_selection.report_import import ReportImportService
+    from workflow.lane_imports import lane_origin_imports, parse_extra_arg, validate_lane_imports, with_extra_override
     from workflow.progress import SourceProgress
-    from workflow.source_select import compare, diagnose, format_compare, format_diagnose
+    from workflow.source_select import compare, diagnose, extra_effect, format_compare, format_diagnose, format_extra_effect
 
     cfg = load_config(a.config)
+    override = getattr(a, "extra_origin_imports", None)
+    if override is not None:  # --extra-origin-imports US=2,JP=1: 設定ファイルは変えず、メモリ上だけで上書きする（読み取りのみ）
+        cfg = with_extra_override(cfg, parse_extra_arg(override))
     fac = factory or _readonly_factory()
     reports = ReportImportService(fac, None, actor="workflow-plan-compare")
     prog = SourceProgress(Path(cfg.state_dir) / "source_progress.jsonl")
@@ -395,16 +400,25 @@ def _cmd_plan_compare(a, factory=None, **_) -> int:
         if a.market != "ALL" and lane != a.market:
             continue
         pm = cfg.page_market(lane)
+        imports = lane_origin_imports(ln)
         try:
-            plan = build_plan(fac, reports, pm, [ln.origin_import])
+            if len(imports) > 1:
+                validate_lane_imports(reports, lane, ln)  # 市場の整合。違反はこの市場だけ止まる（もう一方の市場の比較は続ける）
+            plan = build_plan(fac, reports, pm, imports)
+            before = build_plan(fac, reports, pm, [ln.origin_import]) if len(imports) > 1 else plan
         except PlanError as exc:
             print(f"[{lane}] 計画を作れません: {exc}")
             continue
         slow = prog.slow_map(pm)
         sim = getattr(a, "simulate_shortage", None)
-        cmp = compare(plan, slow, prog.evaluated(pm), needed=sim if sim else cfg.needed_sources(), reserve=cfg.completion.reserve_unevaluated)
+        primary = [ln.origin_import] if len(imports) > 1 else None
+        needed = sim if sim else cfg.needed_sources()
+        cmp = compare(plan, slow, prog.evaluated(pm), needed=needed, reserve=cfg.completion.reserve_unevaluated, primary_import_ids=primary)
         print("\n".join(format_compare(pm, cmp, slow, simulated_needed=sim or None)))
         print("\n".join(format_diagnose(pm, diagnose(plan))))
+        if len(imports) > 1:
+            eff = extra_effect(before, plan, slow, prog.evaluated(pm), needed=needed, reserve=cfg.completion.reserve_unevaluated, primary_import_ids=primary)
+            print("\n".join(format_extra_effect(pm, [ln.origin_import], imports, eff)))
     return 0
 
 
@@ -535,6 +549,8 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--config", default="config/workflow.json")
     sp.add_argument("--market", default="ALL", choices=["US", "JP", "ALL"])
     sp.add_argument("--simulate-shortage", type=int, default=None, metavar="N", help="（読み取りのみ）必要数をNとして判定し、選択可能数がNを下回るときの補充結果（戻す後退中の出典）を表示する")
+    sp.add_argument("--extra-origin-imports", default=None, metavar="US=2,JP=1",
+                    help="（読み取りのみ）設定ファイルを変えず、メモリ上でレーンのextra_origin_importsを上書きし、導入前（originのみ）と導入後（origin+extra）の取得候補を比べる")
     sp = add("needs-human", _cmd_needs_human, "人の判断待ちの一覧（既定）/ --resolve で解決を記録 / --reopen で取り分けを戻す")
     sp.add_argument("--state-dir", default="exports/workflow")
     sp.add_argument("--resolve", default=None, metavar="ID")

@@ -6,6 +6,7 @@ from sqlalchemy import text
 
 from tool_submission.model import SubmissionError
 from tool_submission.planner import build_items, write_plan
+from workflow.lane_imports import has_lane_path, lane_origin_imports
 from workflow.store import State, Task, now_iso
 
 
@@ -39,8 +40,7 @@ def stage_stalled_inputs(factory, cfg, store, ledger, *, now=None) -> tuple[int,
                 continue
             kept = [(it, data) for it, data in zip(items, files)
                     if not it.repeat_of_earlier_cycle and ledger.state(it.key).state in ('NONE', 'WITHDRAWN') and not ledger.state(it.key).duplicate_withdrawn
-                    and any(p.get('direction') == it.direction and
-                            p.get('origin_import_id') == cfg.lanes[lane].origin_import for p in it.paths)]
+                    and has_lane_path(it.paths, it.direction, lane_origin_imports(cfg.lanes[lane]))]
             if not kept:
                 continue
             snap = cfg.for_lane(lane)

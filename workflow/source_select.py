@@ -37,10 +37,20 @@ def _candidates(plan, section: str) -> list:
     return out
 
 
-def baseline(plan, limit: int = MAX_SOURCES_HARD_CAP) -> list:
+def section_order(plan, primary_import_ids=None) -> tuple:
+    """方向の処理順。extra_origin_importsを使うレーンだけ、origin_import由来の経路を持つ方向を先にする（従来の候補をextra由来より先に取得する）。
+    primary_import_ids=None（extraなし）は従来どおり EXPORT, IMPORT。"""
+    if not primary_import_ids:
+        return SECTIONS
+    prim = set(primary_import_ids)
+    has = {sec: any(e.rep is not None and e.rep.import_id in prim for e in plan.sections.get(sec, [])) for sec in SECTIONS}
+    return tuple(sorted(SECTIONS, key=lambda s: 0 if has[s] else 1))  # 安定ソート: 同順位は EXPORT, IMPORT
+
+
+def baseline(plan, limit: int = MAX_SOURCES_HARD_CAP, primary_import_ids=None) -> list:
     """従来の選び方（効率を見ない）。比較の基準。"""
     out, seen = [], set()
-    for sec in SECTIONS:
+    for sec in section_order(plan, primary_import_ids):
         for e in select_targets(plan, sec, limit, include_zero_units=True):
             if e.facts.source_id not in seen:
                 seen.add(e.facts.source_id)
@@ -49,8 +59,9 @@ def baseline(plan, limit: int = MAX_SOURCES_HARD_CAP) -> list:
 
 
 def choose(plan, *, slow: dict[int, str] | set[int] = frozenset(), evaluated: set[int] = frozenset(), reserve: int = 0, needed: int = 0,
-           limit: int = MAX_SOURCES_HARD_CAP) -> Selection:
-    """slow = 後退中の出典 {source_id: 再評価日}（setでも可）、evaluated = 効率の標本がある出典。"""
+           limit: int = MAX_SOURCES_HARD_CAP, primary_import_ids=None) -> Selection:
+    """slow = 後退中の出典 {source_id: 再評価日}（setでも可）、evaluated = 効率の標本がある出典。
+    primary_import_ids = extra_origin_importsを使うレーンの origin_import（その由来の方向を先に処理する。None=従来どおり）。"""
     slow_ids = set(slow)
     reeval = dict(slow) if isinstance(slow, dict) else {}
     cands = {sec: _candidates(plan, sec) for sec in SECTIONS}
@@ -60,7 +71,7 @@ def choose(plan, *, slow: dict[int, str] | set[int] = frozenset(), evaluated: se
     released = set(slow_ids) if scarce else set()
     sel = Selection(picks=[], scarce=scarce, selectable=selectable, deprioritized=len(uniq & slow_ids), needed=needed)
     normal_picks, low_picks, seen = [], [], set()
-    for sec in SECTIONS:
+    for sec in section_order(plan, primary_import_ids):
         es = cands[sec]
         normal = [e for e in es if e.facts.source_id not in slow_ids or e.facts.source_id in released]
         low = sorted((e for e in es if e.facts.source_id in slow_ids and e.facts.source_id not in released),
@@ -93,12 +104,12 @@ def choose(plan, *, slow: dict[int, str] | set[int] = frozenset(), evaluated: se
     return sel
 
 
-def engine_selection(plan, progress, market: str, cfg) -> Selection:
+def engine_selection(plan, progress, market: str, cfg, primary_import_ids=None) -> Selection:
     """エンジンが取得対象の既存の出典を選ぶ関数。`Engine._existing_sources`・`plan-compare`・`outcome --config`が**この同じ関数**を使う
     （候補の集合が食い違わないように）。候補は`select_targets`と同じ条件: 起点の経路を持つ出典（注文点数0の起点だけの出典も含む=include_zero_units）、
     1方向あたり最大20件。plan.sections（その時点で取得できる出典）に入らない出典（期間内・実行中・保留・除外）は候補にならない。"""
     return choose(plan, slow=progress.slow_map(market), evaluated=progress.evaluated(market), reserve=cfg.completion.reserve_unevaluated,
-                  needed=cfg.needed_sources())
+                  needed=cfg.needed_sources(), primary_import_ids=primary_import_ids)
 
 
 def diagnose(plan) -> dict:
@@ -131,10 +142,10 @@ def selectable_counts(plan, slow, evaluated, *, needed: int = 0, reserve: int = 
     return {"sections": s.per_section, "selectable": s.selectable, "deprioritized": s.deprioritized, "needed": needed, "scarce": s.scarce}
 
 
-def compare(plan, slow, evaluated, *, needed: int = 0, reserve: int = 0) -> dict:
+def compare(plan, slow, evaluated, *, needed: int = 0, reserve: int = 0, primary_import_ids=None) -> dict:
     """（読み取りのみ）従来の選び方と新しい選び方の取得対象を比べる。"""
-    before = [e.facts.source_id for e in baseline(plan)]
-    sel = choose(plan, slow=slow, evaluated=evaluated, needed=needed, reserve=reserve)
+    before = [e.facts.source_id for e in baseline(plan, primary_import_ids=primary_import_ids)]
+    sel = choose(plan, slow=slow, evaluated=evaluated, needed=needed, reserve=reserve, primary_import_ids=primary_import_ids)
     after = [e.facts.source_id for e in sel.picks]
     pos_b = {sid: i for i, sid in enumerate(before)}
     pos_a = {sid: i for i, sid in enumerate(after)}
@@ -162,4 +173,45 @@ def format_compare(market: str, cmp: dict, slow, simulated_needed: int | None = 
     out.append(f"  対象から外れた: {cmp['dropped'] or 'なし'}  対象に加わった: {cmp['added'] or 'なし'}")
     out.append("  従来: " + " ".join(f"#{s}" for s in cmp["before"]))
     out.append("  新  : " + " ".join(f"#{s}" + ("*" if s in set(slow) else "") for s in cmp["after"]) + "   （*=後退中）")
+    return out
+
+
+def extra_effect(plan_before, plan_after, slow, evaluated, *, needed: int = 0, reserve: int = 0, primary_import_ids=None, list_limit: int = 30) -> dict:
+    """（読み取りのみ）extra_origin_imports の導入前（originのみ）と導入後（origin + extra）の取得候補を比べる。DB・ブラウザには触れない。
+    candidates = 方向をまたいで重複を除いた取得候補の出典数（起点の経路を持つもの。1方向あたり20件の上限の前）。picks = engine_selection が選ぶ取得対象の数。
+    duplicated = 導入後に EXPORT と IMPORT の両方に現れる出典数（取得は出典単位で1回。投入は方向ごと）。"""
+    def ids(plan, sections):
+        out = []
+        for sec in sections:
+            for e in _candidates(plan, sec):
+                if e.facts.source_id not in out:
+                    out.append(e.facts.source_id)
+        return out
+
+    b_ids = ids(plan_before, SECTIONS)
+    a_ids = ids(plan_after, section_order(plan_after, primary_import_ids))
+    b_set = set(b_ids)
+    added = [s for s in a_ids if s not in b_set]
+    per = {sec: {e.facts.source_id for e in _candidates(plan_after, sec)} for sec in SECTIONS}
+    dup = per["EXPORT"] & per["IMPORT"]
+    sel_b = choose(plan_before, slow=slow, evaluated=evaluated, needed=needed, reserve=reserve)
+    sel_a = choose(plan_after, slow=slow, evaluated=evaluated, needed=needed, reserve=reserve, primary_import_ids=primary_import_ids)
+    return {"before_candidates": len(b_ids), "after_candidates": len(a_ids), "added": added, "added_shown": added[:list_limit],
+            "before_picks": len(sel_b.picks), "after_picks": len(sel_a.picks),
+            "added_in_picks": len([e for e in sel_a.picks if e.facts.source_id not in b_set]),
+            "no_origin_before": len(plan_before.sections.get("NO_ORIGIN", [])), "no_origin_after": len(plan_after.sections.get("NO_ORIGIN", [])),
+            "duplicated": len(dup), "dropped": [s for s in b_ids if s not in set(a_ids)]}
+
+
+def format_extra_effect(market: str, imports_before: list[int], imports_after: list[int], d: dict) -> list[str]:
+    shown = " ".join(f"#{s}" for s in d["added_shown"]) or "なし"
+    more = f" …ほか{len(d['added']) - len(d['added_shown'])}件" if len(d["added"]) > len(d["added_shown"]) else ""
+    out = [f"== {market} extra_origin_imports の効果（導入前 import {imports_before} → 導入後 import {imports_after}。読み取りのみ・設定は変更していません） ==",
+           f"  取得候補の出典数: 導入前 {d['before_candidates']}件 → 導入後 {d['after_candidates']}件"
+           f"（取得対象: {d['before_picks']}件 → {d['after_picks']}件、うち新規に加わる{d['added_in_picks']}件）",
+           f"  新たに加わる出典 {len(d['added'])}件（先頭{len(d['added_shown'])}件）: {shown}{more}",
+           f"  NO_ORIGIN（起点の経路が無く候補に入らない出典）: 導入前 {d['no_origin_before']}件 → 導入後 {d['no_origin_after']}件",
+           f"  EXPORT・IMPORTの両方に現れる出典: {d['duplicated']}件（取得は出典単位で1回。投入は方向ごと）"]
+    if d["dropped"]:
+        out.append(f"  [注意] 導入後に候補から外れる出典: {d['dropped'][:30]}")
     return out

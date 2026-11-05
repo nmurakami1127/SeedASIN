@@ -28,7 +28,7 @@ from acquisition.discovery import (
     require_own_accounts,
 )
 from acquisition.lease import AcquisitionRunService
-from acquisition.plan import PlanError, build_plan, validate_origin_imports
+from acquisition.plan import PlanError, build_plan
 from asin_collector.discovery_runner import run_cross_discovery, run_origin_discovery
 from asin_collector.source_runner import MAX_SOURCES_HARD_CAP, RunLimits, run_batch, select_targets
 from db.session import SessionFactory
@@ -39,6 +39,7 @@ from tool_submission.model import SubmissionError, item_from_manifest
 from tool_submission.planner import build_items, write_plan
 from tool_submission.runner import pending_others, submit_item
 from workflow.config import OPPOSITE, WorkflowConfig
+from workflow.lane_imports import has_lane_path, lane_origin_imports, validate_lane_imports
 from workflow.daily_usage import DailyUsage, jst_day, next_jst_midnight
 from workflow.selection import PendingChecker, reusable_run
 from workflow.dedupe import SUBMITTED_STATES, find_duplicates, set_hash  # noqa: F401
@@ -378,9 +379,7 @@ class Engine:
 
     def _lane_info(self, lane: str):
         ln = self.cfg.lanes[lane]
-        info = validate_origin_imports(self.reports, [ln.origin_import])[0]
-        if info.marketplace != lane:
-            raise PlanError(f"{lane}: import_id={ln.origin_import} の市場は{info.marketplace}です（市場ごとに明示したレポートを指定してください）")
+        info = validate_lane_imports(self.reports, lane, ln)[0]  # origin_import + extra_origin_imports（違反はPlanError。そのレーンだけが止まる）
         return ln, info
 
     def _run_discover(self, t: Task) -> None:
@@ -496,7 +495,9 @@ class Engine:
         saved = t.result.get("existing_sources")
         if saved is None:
             saved, seen = [], set()
-            sel = engine_selection(plan, self.progress, market, self.cfg)  # plan-compare・outcomeと同じ関数（後退中は順位を下げるだけ。候補不足なら戻す）
+            ln_ = self.cfg.lanes.get(t.lane)
+            sel = engine_selection(plan, self.progress, market, self.cfg,
+                                   primary_import_ids=[ln_.origin_import] if ln_ is not None and ln_.extra_origin_imports else None)  # plan-compare・outcomeと同じ関数（後退中は順位を下げるだけ。候補不足なら戻す）
             for e in sel.picks:
                 if e.facts.source_id not in seen:
                     seen.add(e.facts.source_id)
@@ -506,13 +507,13 @@ class Engine:
             t.result["existing_sources"] = saved
         return saved
 
-    def _acquire_sources(self, t: Task, market: str, import_id: int, sources: list[dict], *, include_existing: bool = False) -> None:
+    def _acquire_sources(self, t: Task, market: str, import_ids: int | list[int], sources: list[dict], *, include_existing: bool = False) -> None:
         """出典ごとの枝を処理する。枝の状態（取得・再利用・除外/保留/期間内でスキップ・一時的な保留/失敗）と、他の候補を処理できることを分ける:
         除外・保留・期間内の枝はSKIPPED_POLICY（自動で再試行しない。状態が変われば次の候補選択で再評価される）。完了済みに書き換えない。"""
         recs: dict = t.result.setdefault("sources", {})
         t.result["market"] = market
         try:
-            plan = build_plan(self.factory, self.reports, market, [import_id])
+            plan = build_plan(self.factory, self.reports, market, [import_ids] if isinstance(import_ids, int) else list(import_ids))
         except PlanError as exc:
             return self._set(t, "HELD", str(exc))
         entries = {e.facts.source_id: e for es in plan.sections.values() for e in es}
@@ -746,16 +747,23 @@ class Engine:
         ln, _ = self._lane_info(lane)
         d = self.st.tasks.get(f"discover:{lane}")
         src = d.result.get("sources", []) if d else []
-        self._acquire_sources(t, self.cfg.page_market(lane), ln.origin_import, src, include_existing=True)
+        self._acquire_sources(t, self.cfg.page_market(lane), lane_origin_imports(ln), src, include_existing=True)  # 既存の出典の候補だけextraを含む
 
     def _run_acquire_x(self, t: Task) -> None:
         lane = t.lane
         ln, _ = self._lane_info(lane)
         opp = OPPOSITE[self.cfg.page_market(lane)]
         src = self.st.tasks[f"cross:{lane}"].result.get("sources", [])
-        self._acquire_sources(t, opp, ln.origin_import, src)
+        self._acquire_sources(t, opp, [ln.origin_import], src)  # crossで発見した出典の取得: extraは混ぜない
 
     # ------------------------------------------------------------------ 反対側市場への展開
+
+    def _has_origin_path(self, market: str, source_id: int, import_id: int) -> bool:
+        """出典が、指定したimport由来の起点経路（ORIGIN_ASIN）を持つか。select_cross_asinsが要求する条件と同じ。"""
+        with self.factory.get_session(market) as conn, conn.begin():
+            n = conn.execute(text("SELECT count(*) FROM acquisition_path WHERE source_id = :s AND stage = 'ORIGIN_ASIN' AND origin_import_id = :i"),
+                             {"s": source_id, "i": import_id}).scalar_one()
+        return n > 0
 
     def _run_cross(self, t: Task) -> None:
         lane = t.lane
@@ -779,6 +787,10 @@ class Engine:
         if True:
             for sid, rec in usable:
                 if str(sid) in done and done[str(sid)].get("ok"):
+                    continue
+                if ln.extra_origin_imports and not self._has_origin_path(pm, sid, ln.origin_import):
+                    # extra_origin_imports由来の出典（origin_importの起点経路が無い）はcrossの対象外。selectが拒否してレーンが保留のままになるのを避ける
+                    done[str(sid)] = {"ok": True, "investigated": 0, "note": "extra_origin_importsのレポート由来の出典のため、反対側展開の対象外です"}
                     continue
                 remaining_new = self.cfg.totals.max_new_sources - self._new_sources_used()
                 pages_left = self.cfg.totals.max_total_pages - self._pages_used()
@@ -852,8 +864,10 @@ class Engine:
                 skipped.append({"run_id": rec["run_id"], "reason": str(exc)[:200]})
                 continue
             keep = []
+            # extraは「既存の出典の取得」(acquire)の結果にだけ使う。crossで発見した反対側の出典(acquire_x)は従来どおり origin_import だけ
+            lane_imports = lane_origin_imports(ln) if acq.kind == "acquire" else [ln.origin_import]
             for i, f in zip(items, files):
-                if any(p.get("direction") == i.direction and p.get("origin_import_id") == ln.origin_import for p in i.paths):
+                if has_lane_path(i.paths, i.direction, lane_imports):
                     keep.append((i, f))
                 else:
                     skipped.append({"run_id": rec["run_id"], "direction": i.direction,
