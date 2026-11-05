@@ -77,3 +77,61 @@ def test_unknown_is_recovered_by_register_saved_without_resending_and_the_next_i
     rid = led.state(unknown_key).tool_run_id
     assert next(e for e in led.events() if e["key"] == unknown_key and e["event"] == "RUN_IDENTIFIED")["via"] == "auto_recover"
     assert [e["event"] for e in led.events() if e["key"] == unknown_key].count("SUBMIT_STARTED") == 1 and rid
+
+
+AUTO0 = {"auto_registration": {"enabled": True, "post_save_wait_seconds": 0, "log_unreadable_waits_seconds": [0, 0]}}
+
+
+def test_normal_success_goes_straight_to_linked_with_no_retry_waits(app_role_factory, tmp_path, own):
+    w = World(app_role_factory, tmp_path, cfg_extra=AUTO0)
+    eng = w.run()
+    assert all(t.status == "DONE" for t in submit_tasks(eng)) and w.tool.submits == 2
+    for k, s in ledger_of(w).all_states().items():
+        seq = [e["event"] for e in s.events]
+        assert seq == ["PLANNED", "SUBMIT_STARTED", "EVIDENCE", "RUN_IDENTIFIED", "MEMO_SAVE_STARTED", "MEMO_SAVED", "LINKED"], seq
+        assert s.evidence["ok"] is True
+
+
+def test_retention_gate_stops_only_the_registration_when_outputs_are_not_preserved(app_role_factory, tmp_path, own):
+    w = World(app_role_factory, tmp_path, cfg_extra=AUTO0)
+    w.tool = w.ports.tool = FakeToolPage(n_old=300)  # ログが上限(300行)。次の送信で最古の行が消える
+    eng = w.run()
+    subs = submit_tasks(eng)
+    assert subs and all(t.status == "HELD" and "保全" in t.detail for t in subs), [(t.status, t.detail) for t in subs]
+    assert w.tool.submits == 0 and not ledger_of(w).identified_run_ids()  # SAVEを押していない
+    s = statuses(eng)
+    assert s["discover:US"] == s["acquire:US"] == s["expand:US"] == "DONE"  # 探索・取得・計画は止まらない
+    assert (tmp_path / "sub" / "log_retention.jsonl").exists()  # 削除対象の行の記録は残る
+
+
+def test_retention_gate_lets_registration_proceed_when_the_oldest_output_is_preserved(app_role_factory, tmp_path, own):
+    w = World(app_role_factory, tmp_path, cfg_extra=AUTO0)
+    tool = w.tool = w.ports.tool = FakeToolPage(n_old=300)
+    tool.next = max(e.seq for e in tool.rows) + 1  # 新しい行のIDは既存の行より大きい
+    keep = tmp_path / "keep"
+    keep.mkdir()
+    oldest = min(tool.rows, key=lambda e: e.seq)
+    (keep / f"{oldest.seq}_x.csv").write_text("asin\n", encoding="utf-8")
+    tool.retention_dirs = [keep]
+    eng = w.run()
+    subs = submit_tasks(eng)
+    assert any(t.status == "DONE" for t in subs) and tool.submits >= 1, [(t.status, t.detail) for t in subs]
+
+
+def test_unreadable_log_and_unresolvable_unknown_stop_only_registration_the_loop_cycle_does_not_raise(app_role_factory, tmp_path, own):
+    from workflow.registration_loop import run_cycle
+
+    w = World(app_role_factory, tmp_path)  # 探索・取得・計画までは通常どおり
+    tool = w.tool = w.ports.tool = SlowLogTool(fail_n=None)
+    eng = w.run()
+    assert statuses(eng)["acquire:US"] == "DONE" and tool.submits == 1
+    cfg = config_from_dict({**w.cfg_dict, **AUTO0})
+    said = []
+    for _ in range(2):  # 登録ループの周期: 読めない間は何度でも、例外を出さず・再送せず・UNKNOWNのまま
+        res = run_cycle(cfg, app_role_factory, w.ports, say=said.append)
+        assert res["error"] is None
+    assert tool.submits == 1
+    states = [s.state for s in ledger_of(w).all_states().values()]
+    assert states.count("UNKNOWN") == 1 and "LINKED" not in states
+    assert res["states"].get("UNKNOWN", 0) == 1 and any("UNKNOWN" in x for x in said)
+    assert (tmp_path / "wf").exists()  # 探索側の状態（watch/run）には触れない

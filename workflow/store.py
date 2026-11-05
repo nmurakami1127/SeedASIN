@@ -182,6 +182,13 @@ class WorkflowStore:
         with self._lock_file(self.root / "engine.lock", "別の実行(run/resume/watch)", ttl_seconds, who=who):
             yield
 
+    @contextmanager
+    def process_lock(self, name: str, label: str, who: str = "", ttl_seconds: int = 7 * 24 * 3600):
+        """名前付きの排他ロック（PID記録・持ち主が死んでいれば安全に奪う）。常駐プロセスの二重起動防止に使う。"""
+        self.root.mkdir(parents=True, exist_ok=True)
+        with self._lock_file(self.root / f"{name}.lock", label, ttl_seconds, who=who):
+            yield
+
     def engine_lock_info(self) -> dict | None:
         lp = self.root / "engine.lock"
         try:
@@ -202,6 +209,11 @@ class WorkflowStore:
                 except (OSError, ValueError):
                     info = {}
                 stale = not pid_alive(int(info.get("pid", 0))) or (time.time() - float(info.get("t", 0)) > ttl_seconds)
+                if stale and not info:  # 作成直後で、持ち主がまだ書き込む前かもしれない（10秒以内は古いとみなさない）
+                    try:
+                        stale = time.time() - lp.stat().st_mtime > 10
+                    except OSError:
+                        stale = True
                 if not stale:
                     raise WorkflowBusy(f"{label}（pid={info.get('pid')}{'・' + info['who'] if info.get('who') else ''}）が実行中です（同時には動かせません）")
                 try:

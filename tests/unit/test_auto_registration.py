@@ -442,3 +442,88 @@ def test_loop_survives_a_cycle_exception_and_stops_on_request(tmp_path, monkeypa
     assert L.run_loop(cfg, None, object(), max_cycles=3, sleep=sleeps.append, say=said.append) == 3
     assert n["c"] == 3 and sleeps == [600, 600] and len(said) == 3
     assert L.run_loop(cfg, None, object(), stop=lambda: True, sleep=sleeps.append, say=said.append) == 0
+
+
+# ------------------------------------------------------------------ 二重起動防止（ループ全体のロック）と古いロック
+def _dead_pid() -> int:
+    import subprocess
+    p = subprocess.Popen(["true"])
+    p.wait()
+    return p.pid
+
+
+def test_loop_lock_allows_only_one_loop_and_main_exits_with_a_clear_message(tmp_path, capsys):
+    import os
+
+    from workflow import registration_loop as L
+    from workflow.store import WorkflowBusy
+    cfg = auto_cfg(tmp_path)
+    cfgfile = tmp_path / "c.json"
+    cfgfile.write_text(json.dumps(cfg.to_dict()), encoding="utf-8")
+    with L.loop_lock(cfg):
+        lockfile = tmp_path / "inputs" / "registration" / "registration_loop.lock"
+        assert json.loads(lockfile.read_text())["pid"] == os.getpid()  # PIDを記録
+        with pytest.raises(WorkflowBusy):
+            with L.loop_lock(cfg):
+                pass
+        assert L.main(["--config", str(cfgfile)]) == 2
+        out = capsys.readouterr().out
+        assert "二重に起動できません" in out and f"pid={os.getpid()}" in out
+        assert lockfile.exists()  # 先に動いているループのロックは壊さない
+    assert not lockfile.exists()  # 正常終了で解除
+    with L.loop_lock(cfg):  # 解除後は起動できる
+        pass
+
+
+def test_loop_lock_from_a_dead_process_is_taken_over_but_a_live_one_never(tmp_path):
+    import os
+
+    from workflow import registration_loop as L
+    cfg = auto_cfg(tmp_path)
+    lockfile = tmp_path / "inputs" / "registration" / "registration_loop.lock"
+    lockfile.parent.mkdir(parents=True)
+    lockfile.write_text(json.dumps({"pid": _dead_pid(), "t": 0, "who": "registration_loop"}))
+    with L.loop_lock(cfg):  # 異常終了の残り: 持ち主が存在しないので安全に解除
+        assert json.loads(lockfile.read_text())["pid"] == os.getpid()
+    lockfile.write_text(json.dumps({"pid": os.getppid() or 1, "t": 9e12, "who": "x"}))
+    from workflow.store import WorkflowBusy
+    with pytest.raises(WorkflowBusy):  # 生きているプロセスのロックは奪わない
+        with L.loop_lock(cfg):
+            pass
+
+
+def test_a_just_created_empty_lock_is_not_stolen(tmp_path):
+    from workflow import registration_loop as L
+    from workflow.store import WorkflowBusy
+    cfg = auto_cfg(tmp_path)
+    lockfile = tmp_path / "inputs" / "registration" / "registration_loop.lock"
+    lockfile.parent.mkdir(parents=True)
+    lockfile.write_text("")  # 他のプロセスが作成した直後（PIDの書き込み前）
+    with pytest.raises(WorkflowBusy):
+        with L.loop_lock(cfg):
+            pass
+
+
+def test_run_loop_survives_a_busy_registration_lock(tmp_path, monkeypatch):
+    from workflow import registration_loop as L
+    from workflow.store import WorkflowBusy
+    monkeypatch.setattr(L, "run_cycle", lambda *a, **k: (_ for _ in ()).throw(WorkflowBusy("別の実行が実行中です")))
+    said = []
+    assert L.run_loop(auto_cfg(tmp_path), None, object(), max_cycles=2, sleep=NOSLEEP, say=said.append) == 2
+    assert len(said) == 2 and all("次の周期で再試行" in s for s in said)
+
+
+def test_ledger_key_lock_dead_owner_is_released_live_owner_is_not(ledger):
+    import os
+    lock = ledger.path.with_suffix(".GLOBAL-SUBMIT.lock")
+    lock.write_text(str(_dead_pid()))  # 異常終了したプロセスが残したロック
+    with ledger.key_lock("GLOBAL-SUBMIT"):
+        assert lock.read_text() == str(os.getpid())
+    assert not lock.exists()
+    lock.write_text(str(os.getpid()))  # 生きているプロセス
+    from tool_submission.ledger import LedgerBusy
+    with pytest.raises(LedgerBusy):
+        with ledger.key_lock("GLOBAL-SUBMIT"):
+            pass
+    assert lock.exists()
+    lock.unlink()

@@ -17,6 +17,7 @@ from typing import Callable
 from tool_submission.ledger import SubmissionLedger
 from workflow.quarantine import FILE_NAME, NeedsHuman
 from workflow.registration import register_saved
+from workflow.store import WorkflowBusy, WorkflowStore
 
 
 def run_cycle(cfg, factory, ports, *, now: datetime | None = None, say: Callable[[str], None] = print, allow_keys=()) -> dict:
@@ -83,12 +84,23 @@ def run_loop(cfg, factory, ports, *, interval_minutes: int | None = None, max_cy
         n += 1
         try:
             run_cycle(cfg, factory, ports, now=clock() if clock else None, say=say)
+        except WorkflowBusy as exc:  # 既存の登録処理(run_bulk_registration等)が同じ登録用のロックを持っている。壊さず次の周期で再試行する
+            say(f"登録の周期{n}: {exc}（次の周期で再試行します）")
         except Exception as exc:  # noqa: BLE001
             say(f"登録の周期{n}で例外: {type(exc).__name__}: {exc}（次の周期で再試行します）")
         if max_cycles is not None and n >= max_cycles:
             break
         sleep(mins * 60)
     return n
+
+
+LOOP_LOCK = "registration_loop"
+
+
+def loop_lock(cfg):
+    """登録ループはプロセス全体で1つだけ（PID記録・異常終了後の古いロックは持ち主の死亡を確認して解除）。取れなければWorkflowBusy。
+    1周期ごとの`register_saved`の登録用ロック(`engine_lock('registration')`)とは別のロックで、こちらは常駐中ずっと保持する。"""
+    return WorkflowStore(Path(cfg.submission_dir) / "registration").process_lock(LOOP_LOCK, "別の自動登録ループ", who="registration_loop")
 
 
 def main(argv=None) -> int:
@@ -107,6 +119,13 @@ def main(argv=None) -> int:
     if not cfg.auto_registration.enabled:
         print("[中止] 設定の auto_registration.enabled が false です（自動復旧を有効にしてから起動してください）")
         return 2
+    try:
+        lock = loop_lock(cfg)
+        lock.__enter__()
+    except WorkflowBusy as exc:
+        print(f"[中止] 自動登録ループは二重に起動できません: {exc}。起動中のループを止めてから実行してください"
+              "（異常終了の古いロックは、持ち主のプロセスが存在しなければ自動で解除されます）")
+        return 2
     ports = RealPorts()
     ports.keep_tool_open = True  # 人手待ち（ログイン等）でもブラウザを開いたまま、次の周期で自動続行する
     try:
@@ -115,6 +134,7 @@ def main(argv=None) -> int:
         pass
     finally:
         ports.close()
+        lock.__exit__(None, None, None)
     return 0
 
 

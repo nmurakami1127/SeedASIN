@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -235,13 +236,23 @@ class SubmissionLedger:
 
     @contextmanager
     def key_lock(self, key: str):
-        """同じキーの同時実行を拒否する排他ロック（ロックファイルの排他的作成）。"""
+        """同じキーの同時実行を拒否する排他ロック（ロックファイルの排他的作成。PIDを記録する）。
+        持ち主のプロセスが死んでいる古いロック（異常終了の残り）は安全に解除して取り直す（#102。生きているプロセスのロックは解除しない）。"""
         lock = self.path.with_suffix(f".{key}.lock")
         lock.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            fd = os.open(str(lock), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-        except FileExistsError as exc:
-            raise LedgerBusy(f"投入キー{key}は別のプロセスが処理中です（ロック: {lock}）") from exc
+        for _ in range(2):
+            try:
+                fd = os.open(str(lock), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                break
+            except FileExistsError as exc:
+                if not self._stale_lock(lock):
+                    raise LedgerBusy(f"投入キー{key}は別のプロセスが処理中です（ロック: {lock}）") from exc
+                try:
+                    lock.unlink()
+                except FileNotFoundError:
+                    pass
+        else:
+            raise LedgerBusy(f"投入キー{key}のロックを取得できません（ロック: {lock}）")
         try:
             os.write(fd, str(os.getpid()).encode())
             yield
@@ -251,6 +262,22 @@ class SubmissionLedger:
                 lock.unlink()
             except FileNotFoundError:
                 pass
+
+    @staticmethod
+    def _stale_lock(lock: Path) -> bool:
+        """持ち主のPIDが生きていなければ古いロック。PIDを読めない場合は、作成直後（書き込み前）かもしれないので10秒以内は古いとみなさない。"""
+        from workflow.store import pid_alive
+
+        try:
+            pid = int(lock.read_text(encoding="utf-8").strip() or 0)
+        except (OSError, ValueError):
+            pid = 0
+        if pid > 0:
+            return not pid_alive(pid)
+        try:
+            return time.time() - lock.stat().st_mtime > 10
+        except OSError:
+            return False
 
 
 class LedgerBusy(Exception):
