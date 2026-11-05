@@ -447,7 +447,8 @@ def test_loop_survives_a_cycle_exception_and_stops_on_request(tmp_path, monkeypa
 # ------------------------------------------------------------------ 二重起動防止（ループ全体のロック）と古いロック
 def _dead_pid() -> int:
     import subprocess
-    p = subprocess.Popen(["true"])
+    import sys
+    p = subprocess.Popen([sys.executable, "-c", "pass"])
     p.wait()
     return p.pid
 
