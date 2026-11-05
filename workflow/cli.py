@@ -412,12 +412,30 @@ def _cmd_reconcile(a, factory=None, confirm=None, **_) -> int:
     from tool_submission.ledger import SubmissionLedger
     from workflow.progress import SourceProgress, resume_snapshot
     from workflow.quarantine import FILE_NAME, NeedsHuman
-    from workflow.reconcile import apply_reconcile, format_scan, scan
+    from workflow.reconcile import apply_reconcile, build_report, format_scan, parse_iso, plan_reconcile, scan, summarize, write_report
 
     store = WorkflowStore(a.state_dir)
     ledger = SubmissionLedger(Path(a.submission_dir) / "ledger.jsonl")
+    cutoff = parse_iso(a.created_before) if a.created_before else None
+    if a.created_before and cutoff is None:
+        print(f"[中止] --created-before がISO8601として読めません: {a.created_before}")
+        return 2
+    if a.verified_only and not a.include_d:
+        print("[中止] --verified-only は --include-d と一緒に指定してください")
+        return 2
+    excl = tuple(a.exclude_key or ())
+    filtered = bool(cutoff or excl or a.verified_only)
     if not a.apply:
-        print("\n".join(format_scan(scan(store, ledger, explain=a.explain))))
+        rep = scan(store, ledger, explain=a.explain)
+        plan = None
+        if filtered or a.report:
+            sub = Path(a.submission_dir)
+            plan = plan_reconcile(rep, ledger.all_states(), include_d=a.include_d, created_before=cutoff, exclude_keys=excl, verified_only=a.verified_only,
+                                  bases=(sub, sub.parent, sub.parent.parent))
+        print("\n".join(format_scan(rep, plan=plan if filtered else None)))
+        if a.report:
+            write_report(a.report, build_report("dry-run", plan, summarize(rep), None))
+            print(f"（予定を {a.report} に書きました）")
         print("（dry-runです。何も書いていません。整理するなら --apply）")
         return 0
     if confirm is None:
@@ -429,11 +447,14 @@ def _cmd_reconcile(a, factory=None, confirm=None, **_) -> int:
     snap = (lambda m, sid: resume_snapshot(fac, m, sid)) if fac is not None else None
     try:
         out = apply_reconcile(store, ledger, SourceProgress(Path(a.state_dir) / "source_progress.jsonl"), snapshot=snap, confirm=confirm,
-                              include_d=a.include_d, needs=NeedsHuman(Path(a.state_dir) / FILE_NAME))
+                              include_d=a.include_d, needs=NeedsHuman(Path(a.state_dir) / FILE_NAME),
+                              created_before=cutoff, exclude_keys=excl, verified_only=a.verified_only, report=a.report)
     except RuntimeError as exc:
         print(f"[中止] {exc}")
         return 2
-    print("\n".join(format_scan(out["scan"], apply=True)))
+    print("\n".join(format_scan(out["scan"], apply=True, plan=out["plan"] if filtered else None)))
+    if a.report:
+        print(f"（実行前後の件数と整理した鍵を {a.report} に書きました）")
     if out.get("declined"):
         print("確認が取れなかったので何も変更していません")
         return 2
@@ -546,6 +567,10 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--apply", action="store_true")
     sp.add_argument("--explain", action="store_true", help="dry-run: REPEAT_OF_EARLIER_CYCLEの各キーについて、台帳の状態・登録済みの実行とのASIN重なり・未登録のまま残る件数を表示")
     sp.add_argument("--include-d", action="store_true", help="--applyで、Dのうち取り分けてよい理由の投入工程を needs_human.jsonl に記録して閉じる（登録済みとは扱わない）")
+    sp.add_argument("--created-before", default=None, help="ISO8601。workflowの作成時刻(created_at)がこれより前のものだけを整理の対象にする")
+    sp.add_argument("--exclude-key", action="append", default=None, help="この投入キーは整理しない（保留）。複数回指定可")
+    sp.add_argument("--verified-only", action="store_true", help="--include-d の取り分けを、REPEAT_OF_EARLIER_CYCLE で explain_repeat が ALL_ALREADY_REGISTERED の鍵に限る")
+    sp.add_argument("--report", default=None, help="実行前後の件数・整理した鍵・保留した鍵をJSONで書くパス（dry-runでは予定として書く）")
     sp.add_argument("--state-dir", default="exports/workflow")
     sp.add_argument("--submission-dir", default="exports/tool_submission")
     for n, fn, h in (("backup", _cmd_backup, "状態・台帳・マニフェストをまとめて保存"), ("restore", _cmd_restore, "検証して復元")):
