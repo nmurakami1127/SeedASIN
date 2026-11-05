@@ -7,6 +7,7 @@
     python -m workflow.cli resume [--id wf-…] [--allow-duplicate <投入キー>]   # 保存済み状態から再開（完了工程は繰り返さない）
     python -m workflow.cli outcome --market US|JP|ALL [--since …] [--until …]  # 成果（読み取りのみ。取得・初見ASIN・投入・持ち越し）
     python -m workflow.cli reconcile [--apply]                             # 未完了workflowの整理。既定はdry-run（何も書かない）
+    python -m workflow.cli flush-plan [--config X] [--apply]               # 5,000件未満の端数の投入計画の見積もり（読み取りのみ）。--applyは台帳へPLANNEDを追記（送信しない）
     python -m workflow.cli backup  --out backups/wf.zip                    # workflow状態・投入台帳・マニフェストをまとめて保存
     python -m workflow.cli restore --zip backups/wf.zip [--force]          # 検証して復元
 
@@ -456,6 +457,39 @@ def _cmd_reconcile(a, factory=None, confirm=None, **_) -> int:
     return 0
 
 
+def _cmd_flush_plan(a, factory=None, confirm=None, **_) -> int:
+    """端数（batch_target_asins未満）を投入計画に回したときの見積もり。DB・台帳は読むだけ。--applyだけ台帳へPLANNEDを追記する（送信はしない）。"""
+    from workflow.flush_plan import build_report, format_report
+
+    cfg = load_config(a.config)
+    fac = factory or _readonly_factory()  # 計画の作成はSELECTのみ
+    ledger_path = Path(cfg.submission_dir) / "ledger.jsonl"
+    try:
+        rep = build_report(fac, cfg, ledger_path, apply=False)
+    except ValueError as exc:
+        print(f"[中止] {exc}")
+        return 2
+    print("\n".join(format_report(rep)))
+    if not a.apply:
+        print("（見積もりです。何も書いていません。台帳へ追記するなら --apply）")
+        return 0
+    n_inputs = sum(r["inputs"] for r in rep["rows"].values())
+    if n_inputs == 0:
+        print("追記する新しい入力はありません")
+        return 0
+    if confirm is None:
+        if not sys.stdin.isatty():
+            print("[中止] --apply は対話端末でのy/n確認が必要です")
+            return 2
+        confirm = lambda q: input(q).strip().lower() == "y"  # noqa: E731
+    if not confirm(f"台帳へ新しい入力{n_inputs}件をPLANNEDとして追記します（送信はしません）。よろしいですか [y/N] "):
+        print("確認が取れなかったので何も変更していません")
+        return 2
+    done = build_report(fac, cfg, ledger_path, apply=True)
+    print("\n".join(format_report(done)))
+    return 0
+
+
 def _cmd_needs_human(a, **_) -> int:
     """人の判断待ち（reconcile --apply --include-d で取り分けたもの）の一覧・解決・戻し。投入台帳・取得履歴は変更しない。"""
     from datetime import datetime, timezone
@@ -558,6 +592,9 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--reopen", default=None, metavar="ID")
     sp.add_argument("--allow-duplicate", action="store_true", help="--reopenと一緒に: 意図した再投入として許可も追記する")
     sp.add_argument("--note", default=None)
+    sp = add("flush-plan", _cmd_flush_plan, "5,000件未満の端数の投入計画の見積もり（読み取りのみ）。--applyは台帳へPLANNEDを追記（送信しない・y/n確認）")
+    sp.add_argument("--config", default="config/workflow.json")
+    sp.add_argument("--apply", action="store_true")
     sp = add("reconcile", _cmd_reconcile, "未完了workflowの整理。既定はdry-run（何も書かない）。--applyはy/n確認が必要")
     sp.add_argument("--apply", action="store_true")
     sp.add_argument("--explain", action="store_true", help="dry-run: REPEAT_OF_EARLIER_CYCLEの各キーについて、台帳の状態・登録済みの実行とのASIN重なり・未登録のまま残る件数を表示")
@@ -580,7 +617,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None, *, factory=None, ports=None, confirm=None) -> int:
     a = build_parser().parse_args(argv)
     try:
-        return a.func(a, factory=factory, ports=ports, **({"confirm": confirm} if a.func is _cmd_reconcile else {}))
+        return a.func(a, factory=factory, ports=ports, **({"confirm": confirm} if a.func in (_cmd_reconcile, _cmd_flush_plan) else {}))
     except (ConfigError, BackupError, StateCorrupt) as exc:
         print(f"[中止] {exc}")
         return 2

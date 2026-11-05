@@ -124,6 +124,25 @@ class Completion:
 
 
 @dataclass
+class AutoRegistration:
+    """統合ツールへの登録の自動復旧（docs/DEVIATIONS.md #102）。既定は**無効**（従来どおり）。有効にしても、SAVEは1回しか押さず、
+    結果不明（SAVE後）の投入は再送しない。再送してよいのは「SAVE前の失敗を確認できた」場合だけ。"""
+    enabled: bool = False
+    # SAVE直後は、5,000件の保存でlogs.phpが重くなり読めないことがある。最初の読み取りの前に待つ秒数
+    post_save_wait_seconds: int = 15
+    # ログ画面を読めない（LogUnreadable）ときの再試行の待ち（秒。段階的に延ばす。読み取りのたびにページを読み込み直す）。既定の合計は5分
+    log_unreadable_waits_seconds: list[int] = field(default_factory=lambda: [30, 60, 90, 120])
+    # 結果不明(UNKNOWN)が自動照合で解決しないまま、この分数を超え、ログを読めた確認が2回以上ある場合、人の判断待ち(needs-human)に記録する
+    needs_human_after_minutes: int = 180
+    # true=needs-humanに記録した結果不明の投入があっても、他の独立した投入の登録を続ける。false(既定)=従来どおり、解決するまで次の投入に進まない
+    continue_past_needs_human: bool = False
+    # SAVE前の一時的な失敗（goto/fillのタイムアウト）で試行上限に達した投入へ、待ちを置いて自動で再試行権を付与する
+    pre_save_retry_wait_minutes: int = 30
+    pre_save_retry_max_grants: int = 2     # 1投入あたりの自動付与の上限回数。0=自動付与しない
+    loop_interval_minutes: int = 10        # 常駐ループ(workflow/registration_loop.py)の間隔
+
+
+@dataclass
 class WorkflowConfig:
     lanes: dict[str, Lane]
     limits: Limits = field(default_factory=Limits)
@@ -148,12 +167,24 @@ class WorkflowConfig:
     #                                      SUCCESS_TRUNCATED(DEPTH_LIMIT)・再開位置なしで閉じる。false=従来どおり（REPEATED_PAGEで一巡をBROKENにする）。docs/DEVIATIONS.md #80
     partition: Partition = field(default_factory=Partition)  # 価格帯分割（既定は無効）。docs/DEVIATIONS.md #83
     completion: Completion = field(default_factory=Completion)  # 出典の効率による優先度・取り直し見送り。docs/DEVIATIONS.md #98
+    # true=batch_target_asins未満の端数も、同じ一巡の続きを待つ時間(flush_min_age_minutes)が過ぎたら投入計画に回す（5,000件待ちの廃止）。
+    # false(既定)=従来どおり、末尾到達（COMPLETE/DEPTH_LIMIT）までは端数を持ち越す。batch_target_asins>0が前提。docs/DEVIATIONS.md #102
+    flush_unfilled_batches: bool = False
+    flush_min_age_minutes: int = 30  # 同じ一巡の最新の取得runからこの分数が過ぎるまで、端数を計画に回さない（続きのrunをまとめるための待ち）。0〜1440
+    auto_registration: AutoRegistration = field(default_factory=AutoRegistration)  # 登録の自動復旧（既定は無効）。docs/DEVIATIONS.md #102
 
     def to_dict(self) -> dict:
         d = asdict(self)
         for ln in d["lanes"].values():  # 空のときは項目ごと出さない（従来の設定のsha256・保存済みスナップショットと同一にする）
             if not ln.get("extra_origin_imports"):
                 ln.pop("extra_origin_imports", None)
+        # 既定のときは出さない（従来の設定のsha256・保存済みスナップショットと同一にする。lanes.extra_origin_importsと同じ作り）
+        if not d.get("flush_unfilled_batches"):
+            d.pop("flush_unfilled_batches", None)
+        if d.get("flush_min_age_minutes") == 30:
+            d.pop("flush_min_age_minutes", None)
+        if d.get("auto_registration") == asdict(AutoRegistration()):
+            d.pop("auto_registration", None)
         return d
 
     def sha256(self) -> str:
@@ -276,7 +307,28 @@ class WorkflowConfig:
             raise ConfigError("result_max_age_days は1〜365")
         if not isinstance(self.batch_target_asins, int) or not 0 <= self.batch_target_asins <= self.tool_max_asins:
             raise ConfigError("batch_target_asins は0〜tool_max_asinsで指定してください")
+        if not isinstance(self.flush_unfilled_batches, bool):
+            raise ConfigError("flush_unfilled_batches はtrue/falseで指定してください")
+        if isinstance(self.flush_min_age_minutes, bool) or not isinstance(self.flush_min_age_minutes, int) or not 0 <= self.flush_min_age_minutes <= 1440:
+            raise ConfigError(f"flush_min_age_minutes は0〜1440（分）の整数で指定してください（指定: {self.flush_min_age_minutes!r}）")
+        if self.flush_unfilled_batches and not self.batch_target_asins:
+            raise ConfigError("flush_unfilled_batches=true には batch_target_asins>0 が必要です（端数は蓄積方式の中でだけ扱います）")
+        self._validate_auto_registration()
         return self
+
+    def _validate_auto_registration(self) -> None:
+        a = self.auto_registration
+        for name in ("enabled", "continue_past_needs_human"):
+            if not isinstance(getattr(a, name), bool):
+                raise ConfigError(f"auto_registration.{name} はtrue/falseで指定してください")
+        for name, lo, hi in (("post_save_wait_seconds", 0, 600), ("needs_human_after_minutes", 1, 10080), ("pre_save_retry_wait_minutes", 0, 1440),
+                             ("pre_save_retry_max_grants", 0, 10), ("loop_interval_minutes", 1, 1440)):
+            v = getattr(a, name)
+            if isinstance(v, bool) or not isinstance(v, int) or not lo <= v <= hi:
+                raise ConfigError(f"auto_registration.{name} は{lo}〜{hi}の整数で指定してください（指定: {v!r}）")
+        w = a.log_unreadable_waits_seconds
+        if not isinstance(w, list) or len(w) > 10 or any(isinstance(x, bool) or not isinstance(x, int) or not 0 <= x <= 600 for x in w):
+            raise ConfigError("auto_registration.log_unreadable_waits_seconds は0〜600秒の整数のリスト（最大10個）で指定してください")
 
 
 def _partition_from_dict(raw) -> Partition:
@@ -299,6 +351,14 @@ def _partition_from_dict(raw) -> Partition:
         raise ConfigError(f"partition.price_band に未知の項目があります: {exc}") from exc
 
 
+def _auto_registration_from_dict(raw) -> AutoRegistration:
+    if raw is None:
+        return AutoRegistration()
+    if not isinstance(raw, dict):
+        raise ConfigError("auto_registration はオブジェクトで指定してください")
+    return AutoRegistration(**{k: v for k, v in raw.items() if not k.startswith("_")})
+
+
 def config_from_dict(d: dict) -> WorkflowConfig:
     d = {k: v for k, v in d.items() if not k.startswith("_")}  # "_comment" など説明用のキーは無視する
     try:
@@ -308,9 +368,11 @@ def config_from_dict(d: dict) -> WorkflowConfig:
             partition=_partition_from_dict(d.get("partition")),
             completion=Completion(**{k: v for k, v in (d.get("completion") or {}).items() if not k.startswith("_")}),
             daily=Daily(**d.get("daily", {})), watch=Watch(**d.get("watch", {})), stall=Stall(**d.get("stall", {})),
+            auto_registration=_auto_registration_from_dict(d.get("auto_registration")),
             **{k: d[k] for k in ("brand_enabled", "tool_max_asins", "result_max_age_days", "state_dir", "submission_dir",
                                  "page_revisit_days", "profile", "listing_feedback", "skip_failures", "batch_target_asins",
-                                 "submission_enabled", "tool_session_monitor", "close_on_repeated_page") if k in d},
+                                 "submission_enabled", "tool_session_monitor", "close_on_repeated_page", "flush_unfilled_batches",
+                                 "flush_min_age_minutes") if k in d},
         )
     except TypeError as exc:
         raise ConfigError(f"設定に未知の項目があります: {exc}") from exc

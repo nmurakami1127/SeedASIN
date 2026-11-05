@@ -41,6 +41,20 @@
       "treat_end_as_depth_limit_pages": null
     }
   },
+  "_comment_flush": "任意。batch_target_asins>0のとき、満杯(5,000件)になるまで端数を持ち越さず、同じ一巡の最新の取得からflush_min_age_minutes分が過ぎたら端数も投入計画に回す。既定false=従来どおり。導入前に python -m workflow.cli flush-plan --config X で見積もる。docs/DEVIATIONS.md #102",
+  "flush_unfilled_batches": false,
+  "flush_min_age_minutes": 30,
+  "_comment_auto_registration": "任意。登録の自動復旧（既定は無効）。enabled=trueで、SAVE後にログ画面を読めないときの再試行・結果不明(UNKNOWN)の自動照合（再送はしない）・SAVE前のタイムアウトへの再試行権の自動付与を行う。continue_past_needs_human=trueは、自動で解決しない結果不明を人の判断待ちに記録したうえで他の独立した投入を続ける（既定false=解決するまで止まる）。常駐: python -m workflow.registration_loop --config X。docs/DEVIATIONS.md #102",
+  "auto_registration": {
+    "enabled": false,
+    "post_save_wait_seconds": 15,
+    "log_unreadable_waits_seconds": [30, 60, 90, 120],
+    "needs_human_after_minutes": 180,
+    "continue_past_needs_human": false,
+    "pre_save_retry_wait_minutes": 30,
+    "pre_save_retry_max_grants": 2,
+    "loop_interval_minutes": 10
+  },
   "brand_enabled": false,
   "tool_max_asins": 5000,
   "result_max_age_days": 30,

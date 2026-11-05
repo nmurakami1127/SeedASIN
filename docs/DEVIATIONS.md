@@ -1607,3 +1607,42 @@ Amazonのナビゲーションはdomcontentloadedで待機し、第三者リソ�
 - 再試行は追加していない。タイムアウト時は従来どおり`LogUnreadable`（呼び出し側は再送せず照合に回す）。送信・再送ロジックは変更なし。
 - テスト: `tests/unit/test_log_load_timeout.py`（fake pageでgoto/wait_forに90000が渡ること、タイムアウト例外が`LogUnreadable`になること）。
 - 未確認（パソコンで）: 実画面で5,000件投入直後に90秒以内に読めるか。
+
+## 102. 登録の自動化: 5,000件待ちの廃止（設定で有効化）とUNKNOWN（結果不明）の自動復旧（2026-11-06）
+
+背景（コードと台帳で確認）: (a) `batch_target_asins=5000`の間、末尾到達（COMPLETE/DEPTH_LIMIT）前の端数は計画に入らず（#78）、`expand`は計画0件を
+`BATCH_TARGET_BUFFERING`として繰り越すだけになり、人が気づくまで登録されない。(b) 5,000 ASIN保存直後の`logs.php`が読めず（#101で90秒に延長済み）、
+送信は成功しているのに実行IDを特定できないままUNKNOWNになる。UNKNOWNは`register_saved`の対象外で`pending_others`が後続を止めるため、人が復旧するまで全体が止まる。
+**既定の挙動は変えない**（新機能はすべて設定で有効化。既定のsha256・保存済みスナップショットも不変）。DBスキーマ（alembic）は変更していない。
+
+**A. 5,000件待ちの廃止（#78の一部を、設定で有効にしたときだけ置き換える）**
+- 設定: `flush_unfilled_batches`（bool、既定false）、`flush_min_age_minutes`（0〜1440、既定30。同じ一巡の続きのrunをまとめるための待ち）。`to_dict`は既定値のとき出さない
+  （`lanes.extra_origin_imports`と同じ作り）。`flush_unfilled_batches=true`には`batch_target_asins>0`が必要（検証）。
+- `build_items(flush_unfilled, flush_min_age_minutes, now)`: 同じ一巡の最新の取得runの完了から待ち時間が過ぎていれば、末尾到達前でも端数を切り捨てず計画に含める。
+  過ぎていなければ従来どおり持ち越す（取得直後のengine.expandは、COMPLETE/DEPTH_LIMITの一巡を除き持ち越し。`carried_forward`の理由は`FLUSH_WAITING`）。
+  同じ出典・方向・一巡の未計画分（先行runの分を含む）は`carried_runs`により1つの入力にまとまり、`tool_max_asins`で分割する。
+- `buffer_recovery.plan_stalled`/`stage_stalled_inputs`: 待ち時間（flush時は`flush_min_age_minutes`、従来は60分）が過ぎた一巡を、OPENも含めて計画に回す。
+- 変えないもの: 台帳による重複除外（同一出典・同一一巡・同一方向。PLANNED・送信開始済み・結果不明を含む）、`repeat_of_earlier_cycle`は自動登録しない、`also_from`、
+  IMPORT/EXPORTの方向の分離。
+- `python -m workflow.cli flush-plan [--config X] [--apply]`: 既定は読み取りのみ（DB=SELECT、台帳=読み取り。台帳のコピーを一時ディレクトリに作り、その上で計画を積んで重複を判定。
+  実際の台帳・exports/には書かない）。方向別・出典別・一巡別に「未計画ASIN」「計画済み」「台帳との重複で除外」「repeat保留」「作られる入力数」を表示。
+  `--apply`は台帳へPLANNEDを追記するだけ（送信しない・y/n確認・冪等）。
+
+**B. UNKNOWNの自動復旧（再送しない）**
+- 設定`auto_registration`（既定は`enabled=false`）。`enabled=true`でのみ以下が働く。
+- `runner.submit_item(unreadable_waits, post_save_wait, tolerate_needs_human)`: SAVE後の`logs.php`読み取りが`LogUnreadable`のとき、待ちを段階的に延ばして（既定30/60/90/120秒）読み直す
+  （読むたびにページを読み込み直す）。SAVE直後に`post_save_wait_seconds`（既定15秒）待つ。SAVEは1回だけ。最後まで読めなければUNKNOWN（再送しない）。
+- `tool_submission/recovery.py`の`recover_unknown`: UNKNOWNの鍵を、①送信前の基準にない ②asin_list ③メモが空（または期待と同じ） ④他の鍵に割り当て済みでない ⑤IDが基準の最大より大きい
+  新規行がちょうど1件、かつEVIDENCE(ok)と設定値(data-options)の一致（`corroborate`）を満たすときだけ RUN_IDENTIFIED(via=auto_recover)→メモ保存→MEMO_SAVEDにし、
+  既存の`engine._link`がLINKEDにする。候補が複数・根拠なし・行なし・別のメモの行は何も付けずUNKNOWNのまま（`RECOVERY_CHECKED`を追記。状態は変えない）。
+  送信中(SUBMITTING)の鍵や、より後に送信を開始した未解決の鍵があるときは照合しない（取り違え防止。新しい方から順に解決）。
+- `LedgerState`に`unknown_since`/`recovery_checks`/`readable_checks`/`needs_human`/`auto_grants`/`last_click_error`を追加（台帳イベントの畳み込みのみ。新イベント`RECOVERY_CHECKED`・`NEEDS_HUMAN`。
+  既存イベントの意味は不変）。
+- SAVE前のタイムアウト（`NOT_SUBMITTED_VERIFIED`済み・`phase=BEFORE_CLICK`・詳細にtimeout）で試行上限に達した鍵へ、`pre_save_retry_wait_minutes`（既定30）待ってから
+  再試行権を自動付与（`RETRY_GRANTED`、`evidence.auto=true`。1鍵あたり`pre_save_retry_max_grants`=2回まで）。SAVE後の失敗・UNKNOWN・取り下げ済みには付与しない。
+- 解決しないUNKNOWN: `needs_human_after_minutes`（既定180）を超え、ログを読めたうえで解決しなかった確認が2回以上あれば、台帳に`NEEDS_HUMAN`を追記（状態は変えない・自動解決しない）し、
+  `needs_human.jsonl`に`UNKNOWN_UNRESOLVED`として記録して通知する。`continue_past_needs_human=true`のときだけ、それがあっても他の独立した投入を続ける
+  （`pending_others(tolerate_needs_human)`。SUBMITTING・RUN_IDENTIFIED（メモ未保存）は常に止める）。既定false=従来どおり解決するまで止まる。
+- `workflow/registration.py register_saved`: UNKNOWNを最初に自動照合してから新規投入へ。`workflow/registration_loop.py`: 一定間隔で「付与→flush計画の追加→register_saved→needs-human通知」。
+  日次上限・`retention_gate`・GLOBAL_LOCK（同時1件）は維持。exportsは変更していない。起動は利用者（`python -m workflow.registration_loop --config X`。実画面では未確認）。
+- 先行の取り決めとの関係: #78（端数を末尾到達まで放出しない）は、`flush_unfilled_batches=false`（既定）のとき完全に有効。trueにすると、利用者が待ち時間（既定30分）を許容した場合に限り端数も計画する。

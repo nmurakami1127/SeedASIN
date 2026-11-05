@@ -13,6 +13,7 @@ DBのスキーマは変えない暫定の置き場（DBに置く案は docs/DEVI
 - LINKED           **対応記録済み**: 既存の取込（ingest-log）が`tool_execution_link`へ記録したことを確認できた
 - WITHDRAWN       未送信の計画を取り下げた。PLAN_WITHDRAWN（小口の再編成。同じ計画が再びPLANNEDになり得る）と、
                    DUPLICATE_WITHDRAWN（重複のため取り下げ。`duplicate_withdrawn`が付き、**再びPLANNEDには戻らない**。docs/DEVIATIONS.md #99）
+- (UNKNOWN の自動照合 #102) RECOVERY_CHECKED=自動照合の記録 / NEEDS_HUMAN=自動で解決できず人の判断待ちに記録（状態は変えない）
 - NOT_SUBMITTED    ログ画面を読めたうえで、クリック前の失敗で送信されていないと確認できた（再試行は合計2回まで。
                    人が`RETRY_GRANTED`を追記した分だけ上限が増える。docs/DEVIATIONS.md #95）
 """
@@ -22,7 +23,7 @@ import json
 import os
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 MAX_ATTEMPTS = 2  # 初回＋「送信されていないと確認できた」後の再試行1回
@@ -43,6 +44,14 @@ class LedgerState:
     evidence: dict | None = None
     events: list[dict] = field(default_factory=list)
     manifest: dict | None = None
+    # --- 自動復旧（docs/DEVIATIONS.md #102）。すべて追記専用の台帳イベントから畳み込む
+    unknown_since: str | None = None  # 現在のUNKNOWNになった時刻(ts)
+    recovery_checks: int = 0  # RECOVERY_CHECKED（結果不明の自動照合の記録）の回数
+    readable_checks: int = 0  # うち、ログ画面を読めたうえで解決しなかった回数
+    last_recovery: dict | None = None
+    needs_human: dict | None = None  # NEEDS_HUMAN（自動で解決できず、人の判断待ちに記録した）。状態は変えない
+    last_click_error: dict | None = None  # 直近の試行のCLICK_ERROR（SAVE前の失敗の種類の判定に使う）
+    auto_grants: int = 0  # RETRY_GRANTEDのうち、自動付与（evidence.auto=true）の回数
     duplicate_withdrawn: dict | None = None  # DUPLICATE_WITHDRAWN（重複のため取り下げ・未送信）の記録。あれば状態はWITHDRAWNで、PLANNEDでは復活しない
 
 
@@ -116,6 +125,29 @@ class SubmissionLedger:
             self.append(key, "RETRY_GRANTED", reason=reason, reopen_abandoned=bool(reopen_abandoned), evidence=evidence)
             return self.state(key)
 
+    def auto_grant_pre_save_retry(self, key: str, *, wait_minutes: int, max_auto_grants: int, now: datetime | None = None) -> bool:
+        """SAVE前の一時的な失敗（goto/fillのタイムアウト。NOT_SUBMITTED_VERIFIED済み）で試行上限に達した投入へ、待ちを置いて再試行権を1回分だけ
+        自動で付与する（追記のみ。`grant_retry`と同じRETRY_GRANTED。evidence.auto=trueで人の付与と区別する）。付与したらTrue。
+        付与しない場合: 未送信の確認が無い・上限に達していない・待ちの途中・自動付与の上限・SAVE前の失敗の種類がタイムアウトでない。
+        **SAVE後の失敗・結果不明(UNKNOWN)・取り下げ済みには付与しない**（再送の根拠は「SAVE前の失敗を確認できた」ことだけ）。"""
+        if max_auto_grants <= 0:
+            return False
+        now = now or datetime.now(timezone.utc)
+        with self.key_lock(key):
+            st = self.state(key)
+            if st.state != "NOT_SUBMITTED" or st.auto_grants >= max_auto_grants or st.attempts < max_attempts(st):
+                return False
+            verified = [e for e in st.events if e["event"] == "NOT_SUBMITTED_VERIFIED"]
+            err = st.last_click_error or {}
+            if not verified or err.get("phase") != "BEFORE_CLICK" or "timeout" not in str(err.get("detail", "")).lower():
+                return False
+            last = datetime.strptime(verified[-1]["ts"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+            if now - last < timedelta(minutes=wait_minutes):
+                return False
+            self.append(key, "RETRY_GRANTED", reason=f"自動付与: SAVE前の一時的なタイムアウト（{wait_minutes}分待機後・{st.auto_grants + 1}/{max_auto_grants}回目）",
+                        reopen_abandoned=False, evidence={"auto": True, "click_error": str(err.get("detail", ""))[:200]})
+            return True
+
     def state(self, key: str) -> LedgerState:
         return self._fold(key, self.events())
 
@@ -137,12 +169,25 @@ class SubmissionLedger:
             elif ev == "SUBMIT_STARTED":
                 st.state, st.attempts = "SUBMITTING", st.attempts + 1
                 st.evidence = None  # 試行ごとに根拠を取り直す
+                st.last_click_error = None
                 st.before_run_ids = list(e.get("before_run_ids", []))
                 st.options = e.get("options", st.options)
             elif ev == "EVIDENCE":
                 st.evidence = e.get("evidence")
+            elif ev == "CLICK_ERROR":
+                st.last_click_error = e
             elif ev == "OUTCOME_UNKNOWN":
+                if st.state != "UNKNOWN":
+                    st.unknown_since, st.recovery_checks, st.readable_checks, st.needs_human = e["ts"], 0, 0, None
                 st.state = "UNKNOWN"
+            elif ev == "RECOVERY_CHECKED":  # 自動照合の記録（状態は変えない）
+                st.recovery_checks += 1
+                st.last_recovery = {k: v for k, v in e.items() if k not in ("key", "event")}
+                if e.get("log_read"):
+                    st.readable_checks += 1
+            elif ev == "NEEDS_HUMAN":  # 人の判断待ちの記録（状態は変えない。解決・再送の許可ではない）
+                if st.state in ("UNKNOWN", "AMBIGUOUS") and st.needs_human is None:
+                    st.needs_human = {k: v for k, v in e.items() if k not in ("key", "event")}
             elif ev == "TRACKING_ABANDONED":
                 st.state = "ABANDONED"
             elif ev == "PLAN_WITHDRAWN" and st.state == "PLANNED" and st.attempts == 0:
@@ -151,6 +196,8 @@ class SubmissionLedger:
                 st.state = "WITHDRAWN"
                 st.duplicate_withdrawn = {k: v for k, v in e.items() if k not in ("key", "event")}
             elif ev == "AMBIGUOUS":
+                if st.state != "AMBIGUOUS":
+                    st.needs_human = None
                 st.state = "AMBIGUOUS"
             elif ev == "RUN_IDENTIFIED":
                 st.state, st.tool_run_id = "RUN_IDENTIFIED", str(e["tool_run_id"])
@@ -166,6 +213,8 @@ class SubmissionLedger:
             elif ev == "RETRY_GRANTED":  # 人の付与。未送信、または明示再開の取り下げ済みだけで有効。他の状態では無視する
                 if st.state == "NOT_SUBMITTED":
                     st.grants += 1
+                    if isinstance(e.get("evidence"), dict) and e["evidence"].get("auto") is True:
+                        st.auto_grants += 1
                 elif st.state == "ABANDONED" and e.get("reopen_abandoned") is True:
                     if st.attempts >= max_attempts(st):  # 上限に達しているときだけ追加の1回。未満なら再開だけ（上限は増やさない）
                         st.grants += 1

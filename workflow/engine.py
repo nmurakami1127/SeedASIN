@@ -37,6 +37,7 @@ from tool_submission.evidence import ingest_one_row, link_status
 from tool_submission.ledger import SubmissionLedger
 from tool_submission.model import SubmissionError, item_from_manifest
 from tool_submission.planner import build_items, write_plan
+from tool_submission.recovery import escalate_if_stale, recover_unknown
 from tool_submission.runner import pending_others, submit_item
 from workflow.config import OPPOSITE, WorkflowConfig
 from workflow.lane_imports import has_lane_path, lane_origin_imports, validate_lane_imports
@@ -859,7 +860,8 @@ class Engine:
             try:
                 items, files = build_items(self.factory, market, rec["run_id"], out_dir=Path(self.cfg.submission_dir),
                                            max_per_input=self.cfg.tool_max_asins, ledger=self.ledger, batch_target=self.cfg.batch_target_asins,
-                                           allow_saved_partial=self.cfg.skip_failures)
+                                           allow_saved_partial=self.cfg.skip_failures, flush_unfilled=self.cfg.flush_unfilled_batches,
+                                           flush_min_age_minutes=self.cfg.flush_min_age_minutes, now=self.now())
             except SubmissionError as exc:
                 skipped.append({"run_id": rec["run_id"], "reason": str(exc)[:200]})
                 continue
@@ -884,10 +886,16 @@ class Engine:
                         "partial": i.input_is_partial, "repeat": i.repeat_of_earlier_cycle, "excluded_same_cycle": i.same_cycle_excluded,
                         "also_from": len(i.also_from)})
                 made.append(i.key)
-        buffering = f"（同一出典で{self.cfg.batch_target_asins:,} ASIN単位への蓄積を継続）" if self.cfg.batch_target_asins and not made else ""
+        flush = self.cfg.flush_unfilled_batches
+        if flush:  # 5,000件待ちの廃止（#102）: 満杯まで蓄積するのではなく、同じ一巡の続きを待つ時間(flush_min_age_minutes)だけ待つ
+            buffering = (f"（同じ一巡の続きを待機中。{self.cfg.flush_min_age_minutes}分後に端数も計画へ回します）"
+                         if self.cfg.batch_target_asins and not made else "")
+        else:
+            buffering = f"（同一出典で{self.cfg.batch_target_asins:,} ASIN単位への蓄積を継続）" if self.cfg.batch_target_asins and not made else ""
         extra = {}
         if buffering:  # 仕様どおりの繰り越し（計画0件）を成果として見えるようにする。蓄積中の取得run（次回以降の投入計画に入る）
-            extra["carried_forward"] = {"reason": "BATCH_TARGET_BUFFERING", "batch_target_asins": self.cfg.batch_target_asins,
+            extra["carried_forward"] = {"reason": "FLUSH_WAITING" if flush else "BATCH_TARGET_BUFFERING",
+                                        "batch_target_asins": self.cfg.batch_target_asins,
                                         "run_ids": [rec["run_id"] for rec in acq.result.get("sources", {}).values()
                                                     if rec["mode"] in ("FETCHED", "REUSED", "PARTIAL_SAVED") and rec.get("run_id")]}
         self._set(t, "DONE", f"投入計画{len(made)}件" + buffering + (f"（見送り{len(skipped)}件）" if skipped else ""), keys=made, skipped=skipped, **extra)
@@ -948,7 +956,7 @@ class Engine:
                 return self._set(t, "HELD", f"この実行で新しく投入できる件数（方向{item.direction}あたり{cap}件）に達しています")
             if self._submit_asins_used() + item.asin_count > self.cfg.totals.max_submit_asins:
                 return self._set(t, "HELD", f"投入件数の上限（{self.cfg.totals.max_submit_asins}）を超えるため投入しません")
-            others = pending_others(self.ledger, key)
+            others = pending_others(self.ledger, key, tolerate_needs_human=self._tolerate_needs_human())
             if others:
                 return self._set(t, "HELD", f"別の投入が未完了です: {others}（完了・解決するまで次の投入に進みません）")
             amounts = {f"submit:{item.direction}": 1, "asins": item.asin_count}
@@ -965,7 +973,10 @@ class Engine:
         self._save_task(t)  # 保存に失敗しても、投入台帳はSAVEの前に送信開始を記録するので再送しない
         if st.state in ("MEMO_SAVED",):
             return self._link(t, item, page)
-        r = submit_item(self.ledger, page, item, Path(item.input_file), require_evidence=True)
+        auto = self.cfg.auto_registration
+        if st.state == "UNKNOWN" and auto.enabled:
+            return self._recover_unknown(t, item, page)
+        r = submit_item(self.ledger, page, item, Path(item.input_file), require_evidence=True, **self._submit_kwargs())
         t.result["tool_run_id"] = r.tool_run_id
         if fresh:
             if r.kind in ("NOT_SUBMITTED", "REFUSED") and not r.clicked:
@@ -981,6 +992,34 @@ class Engine:
                  "NOT_SUBMITTED": ("FAILED", "送信されていないことを確認しました。resumeで再試行します（試行は最大2回）"),
                  "REFUSED": ("HELD", "")}.get(r.kind, ("FAILED", r.kind))
         self._set(t, label[0], (label[1] + " " + (r.detail or "")).strip())
+
+    def _submit_kwargs(self) -> dict:
+        """登録の自動復旧（#102）の設定をsubmit_itemへ渡す。無効（既定）なら空＝従来どおり。"""
+        a = self.cfg.auto_registration
+        if not a.enabled:
+            return {}
+        return {"unreadable_waits": list(a.log_unreadable_waits_seconds), "post_save_wait": float(a.post_save_wait_seconds), "sleep": self.sleep,
+                "tolerate_needs_human": a.continue_past_needs_human}
+
+    def _tolerate_needs_human(self) -> bool:
+        a = self.cfg.auto_registration
+        return bool(a.enabled and a.continue_past_needs_human)
+
+    def _recover_unknown(self, t: Task, item, page) -> None:
+        """結果不明(UNKNOWN)の自動照合。再送しない（recover_unknownはSAVEを押さない）。解決しなければUNKNOWNのまま、一定時間後に
+        人の判断待ち(NEEDS_HUMAN)を台帳に記録する。"""
+        a = self.cfg.auto_registration
+        r = recover_unknown(self.ledger, page, item, sleep=self.sleep, unreadable_waits=list(a.log_unreadable_waits_seconds))
+        t.result["tool_run_id"] = r.tool_run_id
+        if r.kind == "RECOVERED":
+            return self._link(t, item, page)
+        if r.kind == "MEMO_CONFLICT":
+            return self._set(t, "HELD", "その実行IDには別のメモがあります（上書きしません）。画面で確認してください")
+        if r.kind == "MEMO_UNSAVED":
+            return self._set(t, "FAILED", f"実行IDは特定済みですがメモ未保存です。次の確認でメモ保存から再開します（ASINは再投入しません）: {r.detail}")
+        flagged = escalate_if_stale(self.ledger, item.key, after_minutes=a.needs_human_after_minutes, now=self.now())
+        note = "（人の判断待ちに記録しました。再送はしません）" if flagged or self.ledger.state(item.key).needs_human else ""
+        self._set(t, "UNKNOWN", f"結果不明の自動照合: {r.kind} {r.detail}{note}"[:480], recover=r.kind, needs_human=bool(note))
 
     def _link(self, t: Task, item, page) -> None:
         st = self.ledger.state(item.key)

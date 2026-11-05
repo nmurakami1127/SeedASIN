@@ -16,6 +16,9 @@
    メモ保存から再開する（同じ文字列の保存なので繰り返しても安全。上限あり）
 8. その後、既存の`ingest-log`が`tool_execution_link`へ記録し、確認できたらLINKED（`link-check`）
 
+SAVE後にログ画面を読めない（5,000件の保存直後はlogs.phpが重い）ときは、段階的に待ちを延ばして読み直す（unreadable_waits。読み取りのたびに
+ページを読み込み直す。SAVEは繰り返さない）。それでも読めなければUNKNOWN（再送しない）。docs/DEVIATIONS.md #102。
+
 見つからないとき: アダプターが「クリック前の失敗（何も送っていない）」と明示した場合だけ、ログを読めたことを条件にNOT_SUBMITTED
 （再試行は合計2回まで）。それ以外（クリック後の失敗・原因不明）は結果不明のままで再送しない。後からログ画面を照合し直して確定する。
 """
@@ -24,7 +27,7 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Protocol
+from typing import Callable, Protocol, Sequence
 
 from tool_submission.ledger import MEMO_MAX_ATTEMPTS, LedgerBusy, SubmissionLedger, max_attempts
 from tool_submission.model import SubmissionItem, option_blockers
@@ -72,14 +75,32 @@ class SubmitResult:
     clicked: bool = False  # このプロセスがSAVE（ASIN投入）を押したか
 
 
+def read_log_with_waits(page, waits: Sequence[float], sleep: Callable[[float], None]) -> list[LogEntry]:
+    """ログ画面を読む。LogUnreadableのときだけ、waitsの秒数を順に待って読み直す（アダプターは読むたびにページを読み込み直す）。
+    最後まで読めなければLogUnreadableを送出する。waitsが空なら1回だけ読む（従来どおり）。**読むだけで、送信はしない**。"""
+    waits = list(waits)
+    for i in range(len(waits) + 1):
+        try:
+            return page.read_log()
+        except LogUnreadable:
+            if i >= len(waits):
+                raise
+            sleep(waits[i])
+    raise AssertionError("unreachable")
+
+
 def submit_item(ledger: SubmissionLedger, page: ToolPage, item: SubmissionItem, input_path: Path, *, log_retries: int = 3,
-                sleep: Callable[[float], None] = time.sleep, require_evidence: bool = False) -> SubmitResult:
+                sleep: Callable[[float], None] = time.sleep, require_evidence: bool = False,
+                unreadable_waits: Sequence[float] = (), post_save_wait: float = 0.0, tolerate_needs_human: bool = False) -> SubmitResult:
     """require_evidence=True（実画面向け）: 送信リクエスト・応答の根拠と、新規行の設定値の一致が無ければ、新規行が1件でも自分の送信と
-    断定しない（結果不明として止める）。"""
+    断定しない（結果不明として止める）。
+    unreadable_waits / post_save_wait（既定は従来どおり待たない）: SAVE後のログ読み取りの再試行の待ちと、最初に読む前の待ち（#102）。
+    tolerate_needs_human: 人の判断待ちに記録済みの結果不明の投入があっても、他の独立した投入を止めない（既定False。#102）。"""
     try:
         with ledger.key_lock(GLOBAL_LOCK):  # 実行IDの特定を一意にするため、自動の送信は同時に1件だけ
             with ledger.key_lock(item.key):
-                return _locked(ledger, page, item, input_path, log_retries, sleep, require_evidence)
+                return _locked(ledger, page, item, input_path, log_retries, sleep, require_evidence, unreadable_waits, post_save_wait,
+                               tolerate_needs_human)
     except LedgerBusy as exc:
         return SubmitResult("REFUSED", detail=str(exc))
 
@@ -87,9 +108,13 @@ def submit_item(ledger: SubmissionLedger, page: ToolPage, item: SubmissionItem, 
 PENDING_STATES = ("SUBMITTING", "UNKNOWN", "AMBIGUOUS", "RUN_IDENTIFIED")
 
 
-def pending_others(ledger: SubmissionLedger, key: str) -> list[str]:
-    """別の投入計画で、結果不明・曖昧・実行ID確定でメモ未保存のものがあれば、そのキー（初回は1件ずつ。完了するまで次へ進まない）。"""
-    return [k for k, s in ledger.all_states().items() if k != key and s.state in PENDING_STATES]
+def pending_others(ledger: SubmissionLedger, key: str, *, tolerate_needs_human: bool = False) -> list[str]:
+    """別の投入計画で、結果不明・曖昧・実行ID確定でメモ未保存のものがあれば、そのキー（初回は1件ずつ。完了するまで次へ進まない）。
+    tolerate_needs_human=True（#102）: 自動照合で解決せず**人の判断待ち(NEEDS_HUMAN)に記録した**UNKNOWN/AMBIGUOUSだけは数えない
+    （他の独立した投入を無期限に止めない）。SUBMITTING（送信中・完了の記録なし）とRUN_IDENTIFIED（メモ未保存）は常に数える。
+    止めなくてよい理由: その行はログに既に存在し、以降の投入の送信前の基準に入るため、新しい投入の特定には混ざらない。"""
+    return [k for k, s in ledger.all_states().items() if k != key and s.state in PENDING_STATES
+            and not (tolerate_needs_human and s.needs_human is not None and s.state in ("UNKNOWN", "AMBIGUOUS"))]
 
 
 def retention_gate(entries: list[LogEntry] | None, *, dirs=None, db_rows=None, record_path: Path | None = None,
@@ -154,11 +179,12 @@ def claim_submission(ledger: SubmissionLedger, item: SubmissionItem, input_path:
 
 
 def _identify(ledger, page, item, before: set[int], response_run_id, retries, sleep, wait_seconds: float = 3.0,
-              require_evidence: bool = False):
-    """ログ画面を（複数回）読んで新しい行を特定する。確定・曖昧は台帳に残す。見つからなければNone。LogUnreadableを送出し得る。"""
+              require_evidence: bool = False, unreadable_waits: Sequence[float] = ()):
+    """ログ画面を（複数回）読んで新しい行を特定する。確定・曖昧は台帳に残す。見つからなければNone。LogUnreadableを送出し得る
+    （unreadable_waitsの再試行をすべて使っても読めないとき）。"""
     exclude = ledger.identified_run_ids(item.key)
     for i in range(max(1, retries)):
-        entries = page.read_log()
+        entries = read_log_with_waits(page, unreadable_waits, sleep)
         d = identify_new_entry(entries, before, expected_memo=item.memo, exclude_run_ids=exclude, response_run_id=response_run_id)
         if d.kind == "IDENTIFIED" and require_evidence:
             from tool_submission.reconcile import corroborate
@@ -183,12 +209,13 @@ def _identify(ledger, page, item, before: set[int], response_run_id, retries, sl
     return None
 
 
-def _memo_phase(ledger, page, item, run_id: str, retries, sleep, wait_seconds: float = 3.0, *, clicked: bool = False) -> SubmitResult:
+def _memo_phase(ledger, page, item, run_id: str, retries, sleep, wait_seconds: float = 3.0, *, clicked: bool = False,
+                unreadable_waits: Sequence[float] = ()) -> SubmitResult:
     """特定済みの実行IDの行にメモを保存して確認する。ASINは再投入しない。"""
     rid = int(run_id)
 
     def find():
-        for e in page.read_log():
+        for e in read_log_with_waits(page, unreadable_waits, sleep):
             if e.seq == rid:
                 return e
         return None
@@ -224,7 +251,8 @@ def _memo_phase(ledger, page, item, run_id: str, retries, sleep, wait_seconds: f
     return SubmitResult("MEMO_UNSAVED", run_id, "メモ保存を確認できません。ASINは再投入せず、メモ保存から再開してください", clicked)
 
 
-def _locked(ledger, page, item, input_path, log_retries, sleep, require_evidence: bool = False) -> SubmitResult:
+def _locked(ledger, page, item, input_path, log_retries, sleep, require_evidence: bool = False, unreadable_waits: Sequence[float] = (),
+            post_save_wait: float = 0.0, tolerate_needs_human: bool = False) -> SubmitResult:
     st = ledger.state(item.key)
     if st.state in ("ABANDONED", "WITHDRAWN"):
         return SubmitResult("REFUSED", detail="人の指示で追跡を取り下げ済みです。再送・メモ保存はしません")
@@ -233,7 +261,7 @@ def _locked(ledger, page, item, input_path, log_retries, sleep, require_evidence
     if st.state in ("MEMO_SAVED", "LINKED"):
         return SubmitResult("ALREADY_DONE", st.tool_run_id, "対応済みです（再投入しません）")
     if st.state == "RUN_IDENTIFIED":  # 実行ID確定・メモ未保存: ASINは再投入せず、メモ保存から再開する
-        return _memo_phase(ledger, page, item, st.tool_run_id, log_retries, sleep)
+        return _memo_phase(ledger, page, item, st.tool_run_id, log_retries, sleep, unreadable_waits=unreadable_waits)
     if st.state == "AMBIGUOUS":
         return SubmitResult("AMBIGUOUS", detail="対応を一意に確認できない状態です。resolveで人が実行IDを選ぶまで、送信もメモ保存もしません")
     if st.state in ("SUBMITTING", "UNKNOWN"):
@@ -241,13 +269,14 @@ def _locked(ledger, page, item, input_path, log_retries, sleep, require_evidence
         if not st.before_run_ids and not any(e["event"] == "SUBMIT_STARTED" for e in st.events):
             return SubmitResult("UNKNOWN", detail="送信前の基準がありません")
         try:
-            d = _identify(ledger, page, item, set(st.before_run_ids), None, log_retries, sleep, require_evidence=require_evidence)
+            d = _identify(ledger, page, item, set(st.before_run_ids), None, log_retries, sleep, require_evidence=require_evidence,
+                          unreadable_waits=unreadable_waits)
         except LogUnreadable as exc:
             return SubmitResult("UNKNOWN", detail=f"結果が不明のままです。ログ画面を読めません: {exc}")
         if d is not None and d.kind == "UNCORROBORATED":
             return SubmitResult("UNKNOWN", detail=f"新規行{list(d.candidates)}がありますが、自分の送信と対応する根拠がありません。メモを付けずに止めます")
         if d is not None and d.kind == "IDENTIFIED":
-            return _memo_phase(ledger, page, item, d.tool_run_id, log_retries, sleep)
+            return _memo_phase(ledger, page, item, d.tool_run_id, log_retries, sleep, unreadable_waits=unreadable_waits)
         if d is not None:
             return SubmitResult("AMBIGUOUS", detail=f"新規行が複数あります: {list(d.candidates)}（対応を一意に確認できません）")
         if st.state == "SUBMITTING":
@@ -255,7 +284,7 @@ def _locked(ledger, page, item, input_path, log_retries, sleep, require_evidence
         return SubmitResult("UNKNOWN", detail="結果が不明のままです（該当する新規行がありません）。再送しません")
     if st.attempts >= max_attempts(st):
         return SubmitResult("REFUSED", detail=f"送信の試行が上限（{max_attempts(st)}回）に達しています")
-    others = pending_others(ledger, item.key)
+    others = pending_others(ledger, item.key, tolerate_needs_human=tolerate_needs_human)
     if others:
         return SubmitResult("REFUSED", detail=f"別の投入が未完了です: {others}（完了するまで次の投入に進みません）")
 
@@ -309,7 +338,10 @@ def _locked(ledger, page, item, input_path, log_retries, sleep, require_evidence
 
             plan_asins = [x for x in Path(input_path).read_text(encoding="utf-8").splitlines() if x.strip()]
             ledger.append(item.key, "EVIDENCE", evidence=check_capture(plan_asins, resp.evidence))
-        d = _identify(ledger, page, item, before, resp.run_id if resp else None, log_retries, sleep, require_evidence=require_evidence)
+        if post_save_wait > 0:
+            sleep(post_save_wait)  # SAVE直後はlogs.phpが重いことがある。少し置いてから読む（SAVEは繰り返さない）
+        d = _identify(ledger, page, item, before, resp.run_id if resp else None, log_retries, sleep, require_evidence=require_evidence,
+                      unreadable_waits=unreadable_waits)
     except LogUnreadable as exc:
         ledger.append(item.key, "OUTCOME_UNKNOWN", reason=f"ログ画面を読めない: {exc}"[:300])
         return SubmitResult("UNKNOWN", detail="送信の結果を照合できません。再送しません", clicked=True)
@@ -317,7 +349,7 @@ def _locked(ledger, page, item, input_path, log_retries, sleep, require_evidence
         return SubmitResult("UNKNOWN", detail=f"新規行{list(d.candidates)}がありますが、自分の送信と対応する根拠がありません。メモを付けずに止めます",
                             clicked=True)
     if d is not None and d.kind == "IDENTIFIED":
-        return _memo_phase(ledger, page, item, d.tool_run_id, log_retries, sleep, clicked=True)
+        return _memo_phase(ledger, page, item, d.tool_run_id, log_retries, sleep, clicked=True, unreadable_waits=unreadable_waits)
     if d is not None:
         return SubmitResult("AMBIGUOUS", detail=f"新規行が複数あり、送信結果との対応を一意に確認できません: {list(d.candidates)}。"
                                                   "適当な行にメモを付けず停止します", clicked=True)

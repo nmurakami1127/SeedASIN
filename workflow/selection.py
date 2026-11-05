@@ -139,7 +139,8 @@ class PendingChecker:
                 continue  # 取得間隔内/除外/保留/実行中など。今は進められないので枠を塞がない（状態が変われば次の選択で再評価される）
             try:
                 items, _ = build_items(self.e.factory, self.pm, run["run_id"], out_dir=Path(cfg.submission_dir), max_per_input=cfg.tool_max_asins,
-                                       ledger=self.e.ledger, batch_target=cfg.batch_target_asins)
+                                       ledger=self.e.ledger, batch_target=cfg.batch_target_asins, flush_unfilled=cfg.flush_unfilled_batches,
+                                       flush_min_age_minutes=cfg.flush_min_age_minutes)
             except SubmissionError:
                 continue
             for it in items:

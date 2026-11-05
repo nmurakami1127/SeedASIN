@@ -17,6 +17,7 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import asdict
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from sqlalchemy import text
@@ -82,13 +83,17 @@ def _occupancy(states: dict, run_id: int, source_id: int, direction: str, market
 def build_items(app: SessionFactory, fetch_market: str, run_id: int, *, out_dir: Path, direction_override: str | None = None,
                 max_per_input: int = MAX_ASINS_PER_INPUT, ledger: SubmissionLedger | None = None,
                 batch_target: int = 0, allow_saved_partial: bool = False,
-                flush_buffer: bool = False) -> tuple[list[SubmissionItem], list[bytes]]:
+                flush_buffer: bool = False, flush_unfilled: bool = False, flush_min_age_minutes: int = 0,
+                now: datetime | None = None) -> tuple[list[SubmissionItem], list[bytes]]:
     """計画と、各入力ファイルの内容を返す。書き込みはしない。
     ledgerを渡すと、**同じ出典・業務方向**の投入差分を管理する:
     - 同じ一巡で既に投入（送信開始済み・結果不明・未送信の投入計画への予約を含む）したASINは、この入力から除く（再送しない）。
     - 過去の別の一巡で投入済みのASINは、新しいASINとは**別の入力**（repeat_of_earlier_cycle）にして、明示許可があるまで投入しない
       （黙って再送もしない・永久に除外もしない。新しいASINの投入は、その判断を待たずに進められる）。
-    - 別の出典・別の業務方向は別に判定する。別の出典の入力にも同じASINがある場合は、参照情報(also_from)として残す。"""
+    - 別の出典・別の業務方向は別に判定する。別の出典の入力にも同じASINがある場合は、参照情報(also_from)として残す。
+    flush_unfilled=True（batch_targetが前提。docs/DEVIATIONS.md #102）: 末尾到達前でも、この取得run（同じ一巡の最新）の完了から
+    flush_min_age_minutes分が過ぎていれば、batch_target未満の端数も計画に含める（切り捨てない）。続きのrunをまとめるための待ちで、
+    過ぎていなければ従来どおり端数を持ち越す。重複の除外（台帳）・repeatの扱い・方向の分離は変えない。"""
     if not 0 <= batch_target <= max_per_input:
         raise SubmissionError("batch_target は0〜max_per_inputで指定してください")
     with app.get_session(fetch_market) as conn, conn.begin():
@@ -135,6 +140,7 @@ def build_items(app: SessionFactory, fetch_market: str, run_id: int, *, out_dir:
     # OPEN・BROKEN・その他のCLOSED_NO_CURSOR（再開位置の消失など）は末尾到達ではないので従来どおり保留。
     reached_end = run.cycle_state == "COMPLETE" or (run.cycle_state == "CLOSED_NO_CURSOR" and run.truncation_reason == "DEPTH_LIMIT")
     ckey = _cycle_key(run.cycle_id, run_id)
+    flush_ok = bool(flush_unfilled and batch_target and _aged(run.completed_at, flush_min_age_minutes, now))
     states = ledger.all_states() if ledger is not None else {}  # 台帳は計画作成ごとに読み直す（方向ごとに読み直さない）
     file_cache: dict = {}
     prior: dict[str, list[str]] = {}
@@ -161,9 +167,9 @@ def build_items(app: SessionFactory, fetch_market: str, run_id: int, *, out_dir:
         for is_repeat, part in ((False, new_part), (True, repeat_part)):
             if not part:
                 continue
-            if batch_target and not reached_end:
+            if batch_target and not reached_end and not flush_ok:
                 # 失敗・停滞・再開位置の消失は末尾到達ではない（DEPTH_LIMITで閉じた一巡は末尾到達として扱う。reached_end）。
-                # flush_bufferは旧呼び出しとの互換用に受け取るだけで、端数を放出しない。
+                # flush_bufferは旧呼び出しとの互換用に受け取るだけで、端数を放出しない（端数の放出はflush_unfilled。#102）。
                 # 同じ出典・方向・一巡で満杯になるまで残りを持ち越す。
                 part = part[:len(part) // batch_target * batch_target]
                 if not part:
@@ -175,6 +181,15 @@ def build_items(app: SessionFactory, fetch_market: str, run_id: int, *, out_dir:
             items += items_d
             files += files_d
     return items, files
+
+
+def _aged(completed_at, minutes: int, now: datetime | None) -> bool:
+    """取得runの完了から minutes 分が過ぎたか。完了時刻が無い（未完了）なら False（安全側＝持ち越し）。"""
+    if completed_at is None:
+        return False
+    if completed_at.tzinfo is None:
+        completed_at = completed_at.replace(tzinfo=timezone.utc)
+    return (now or datetime.now(timezone.utc)) - completed_at >= timedelta(minutes=max(0, minutes))
 
 
 def _items_for(d, part, chunks, is_repeat, run_id, fetch_market, src, key_name, run, partial, partial_reason, asins, raw, paths, dpaths, best, directions,
