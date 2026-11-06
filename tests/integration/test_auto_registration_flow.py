@@ -135,3 +135,110 @@ def test_unreadable_log_and_unresolvable_unknown_stop_only_registration_the_loop
     assert states.count("UNKNOWN") == 1 and "LINKED" not in states
     assert res["states"].get("UNKNOWN", 0) == 1 and any("UNKNOWN" in x for x in said)
     assert (tmp_path / "wf").exists()  # 探索側の状態（watch/run）には触れない
+
+
+# ------------------------------------------------------------------ --only-keys（docs/DEVIATIONS.md #103）
+def _planned_world(app_role_factory, tmp_path, cfg_extra=None, tool=None):
+    """探索・取得・計画までを済ませ、送信はしていない状態（2件ともPLANNED）を作る。"""
+    w = World(app_role_factory, tmp_path, cfg_extra=cfg_extra or AUTO0)
+    if tool is not None:
+        w.tool = w.ports.tool = tool
+    w.ports.blocked_tool = "統合ツール未接続（テスト）"
+    w.run()
+    w.ports.blocked_tool = None
+    led = ledger_of(w)
+    keys = sorted(led.all_states())
+    assert len(keys) == 2 and {led.state(k).state for k in keys} == {"PLANNED"} and w.tool.submits == 0
+    return w, led, keys
+
+
+def _only(w, factory, keys, say=None):
+    from workflow.registration_loop import run_only_keys
+    out = []
+    code = run_only_keys(w.cfg, factory, w.ports, keys, say=(say or out.append))
+    return code, out
+
+
+def test_only_keys_registers_just_the_specified_key_and_leaves_the_other_untouched(app_role_factory, tmp_path, own):
+    w, led, (k1, k2) = _planned_world(app_role_factory, tmp_path)
+    other_before = [e for e in led.events() if e["key"] == k2]
+    code, out = _only(w, app_role_factory, [k1])
+    assert code == 0, out
+    assert w.tool.submits == 1 and led.state(k1).state == "LINKED" and led.state(k2).state == "PLANNED"
+    assert [e for e in led.events() if e["key"] == k2] == other_before  # 指定外の鍵には1行も追記しない
+    text = "\n".join(out)
+    assert f"{k1}: 状態 PLANNED→LINKED" in text and "ASIN 3件" in text and f"tool_run_id={led.state(k1).tool_run_id}" in text and "秒" in text
+    assert "指定外の鍵の台帳は開始前後で不変" in text and "[警告]" not in text
+
+
+def test_only_keys_creates_no_new_plans_even_when_flush_is_enabled(app_role_factory, tmp_path, own, monkeypatch):
+    from workflow import registration_loop as L
+    extra = {**AUTO0, "flush_unfilled_batches": True, "batch_target_asins": 5000}
+    w, led, (k1, k2) = _planned_world(app_role_factory, tmp_path, cfg_extra=extra)
+    assert w.cfg.flush_unfilled_batches
+    n_events = len(led.events())
+
+    def boom(*a, **k):
+        raise AssertionError("--only-keysでは計画の追加(_plan_flush)を呼んではいけない")
+
+    monkeypatch.setattr(L, "_plan_flush", boom)
+    code, out = _only(w, app_role_factory, [k1])
+    assert code == 0, out
+    assert set(led.all_states()) == {k1, k2}  # 新しい投入鍵は作られない
+    assert not any(e["event"] == "PLANNED" for e in led.events()[n_events:])
+
+
+def test_only_keys_missing_or_linked_key_does_nothing_and_exits_non_zero(app_role_factory, tmp_path, own):
+    w, led, (k1, k2) = _planned_world(app_role_factory, tmp_path)
+    assert _only(w, app_role_factory, [k1])[0] == 0  # k1をLINKEDにする
+    before, subs = led.events(), w.tool.submits
+    code, out = _only(w, app_role_factory, [k2, k1])  # 1つでも処理できなければ全体で何もしない（k2も送らない）
+    assert code == 2 and w.tool.submits == subs and led.events() == before
+    text = "\n".join(out)
+    assert f"{k1}: 状態がLINKED" in text and "何も変更していません" in text
+    code, out = _only(w, app_role_factory, ["nonexistent0000"])
+    assert code == 2 and "台帳にありません" in "\n".join(out) and led.events() == before and w.tool.submits == subs
+
+
+def test_only_keys_blocked_by_another_keys_unknown_does_not_send_and_never_touches_that_key(app_role_factory, tmp_path, own):
+    w = World(app_role_factory, tmp_path)  # 既定: 1件目がUNKNOWN、2件目はPLANNEDのまま保留
+    tool = w.tool = w.ports.tool = SlowLogTool(fail_n=None)
+    w.run()
+    led = ledger_of(w)
+    (unk,) = [k for k, s in led.all_states().items() if s.state == "UNKNOWN"]
+    (planned,) = [k for k, s in led.all_states().items() if s.state == "PLANNED"]
+    cfg = config_from_dict({**w.cfg_dict, **AUTO0})
+    w.cfg = cfg
+    before = led.events()
+    code, out = _only(w, app_role_factory, [planned])  # ログ画面はまだ読めない: UNKNOWNが他にあるので送らない（安全側）
+    assert code == 3 and tool.submits == 1 and led.state(planned).state == "PLANNED"
+    unk_events = [e["event"] for e in led.events() if e["key"] == unk]
+    assert unk_events == [e["event"] for e in before if e["key"] == unk]  # 指定外のUNKNOWNに照合の記録も追記しない
+    assert any("HELD" in x or "未完了" in x or "保留" in x for x in out), out
+
+
+def test_only_keys_on_an_unknown_key_only_reconciles_and_never_resends(app_role_factory, tmp_path, own):
+    w = World(app_role_factory, tmp_path)
+    tool = w.tool = w.ports.tool = SlowLogTool(fail_n=None)
+    w.run()
+    led = ledger_of(w)
+    (unk,) = [k for k, s in led.all_states().items() if s.state == "UNKNOWN"]
+    (planned,) = [k for k, s in led.all_states().items() if s.state == "PLANNED"]
+    w.cfg = config_from_dict({**w.cfg_dict, **AUTO0})
+    tool.readable = True
+    code, out = _only(w, app_role_factory, [unk])
+    assert code == 0, out
+    assert led.state(unk).state == "LINKED" and tool.submits == 1  # 再送なし
+    assert led.state(planned).state == "PLANNED"  # 保留されていた別の入力も、指定外なので送らない
+
+
+def test_only_keys_keeps_the_global_lock_and_engine_lock(app_role_factory, tmp_path, own):
+    from workflow.store import WorkflowStore
+    w, led, (k1, k2) = _planned_world(app_role_factory, tmp_path)
+    store = WorkflowStore(str(tmp_path / "sub" / "registration"))  # register_savedが使う登録用のロック
+    before = led.events()
+    with store.engine_lock("registration"):  # 別の登録処理が実行中
+        code, out = _only(w, app_role_factory, [k1])
+    assert code == 3 and w.tool.submits == 0 and led.events() == before
+    assert any("実行中" in x for x in out)
+    assert _only(w, app_role_factory, [k1])[0] == 0  # 解除後は進む

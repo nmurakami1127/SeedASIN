@@ -1646,3 +1646,21 @@ Amazonのナビゲーションはdomcontentloadedで待機し、第三者リソ�
 - `workflow/registration.py register_saved`: UNKNOWNを最初に自動照合してから新規投入へ。`workflow/registration_loop.py`: 一定間隔で「付与→flush計画の追加→register_saved→needs-human通知」。
   日次上限・`retention_gate`・GLOBAL_LOCK（同時1件）は維持。exportsは変更していない。起動は利用者（`python -m workflow.registration_loop --config X`。実画面では未確認）。
 - 先行の取り決めとの関係: #78（端数を末尾到達まで放出しない）は、`flush_unfilled_batches=false`（既定）のとき完全に有効。trueにすると、利用者が待ち時間（既定30分）を許容した場合に限り端数も計画する。
+
+## 103. 登録ループに `--only-keys`（指定した投入鍵だけを1周期処理する）を追加（2026-11-06）
+
+- 目的: 過去の一巡で投入済みのASINなど、台帳に残っている特定の投入だけを、他の投入に触れず安全に登録・照合したい場合のため。既定の動作（引数なし）は不変。
+- `python -m workflow.registration_loop --config X --only-keys K1,K2`（カンマ区切り・複数回指定可）。`register_saved(..., only_keys=)`（`allow_keys`とは別の引数）で対象を指定鍵に限定する。
+  指定外の鍵は処理せず、台帳へも追記しない（再試行権の自動付与も指定鍵だけ）。
+- 新規の投入計画は作らない（`flush_unfilled_batches=true`でも`_plan_flush`を呼ばない）。人の判断待ち(needs_human.jsonl)への記録も指定鍵だけ。
+- 起動前の検証（全部OKでなければ何もせず、理由を表示して終了コード2）: 台帳にない鍵／処理できない状態（処理できるのはPLANNED・NOT_SUBMITTED・RUN_IDENTIFIED・MEMO_SAVED・UNKNOWN。
+  LINKED・AMBIGUOUS・SUBMITTING・ABANDONED・WITHDRAWNは対象外）／マニフェストの無いUNKNOWN／業務市場が設定のlanesにない鍵。
+  `repeat_of_earlier_cycle`の鍵（結果不明の照合を除く）は`--only-keys`では許可しない。許可は従来どおり`allow_keys`だけ（明示の許可と`--only-keys`は別）。
+- 維持するもの: 重複の除外、`engine_lock`、GLOBAL_LOCK、ループの二重起動防止(`loop_lock`)、`retention_gate`、日次上限、UNKNOWNの自動照合と再送しない原則。
+  指定鍵がUNKNOWNなら照合だけ行う。指定外の鍵のUNKNOWN等が`pending_others`で指定鍵の送信を止めるときは、理由(HELD)を表示して送らない（安全側。指定外の鍵は触らない）。
+  他のプロセスが`engine_lock`を持っているときは、台帳に何も追記せず「実行中」と表示して終了コード3。
+- 1周期の後に鍵ごとに表示: 状態（開始→終了）・ASIN件数・tool_run_id・台帳イベント間の秒数・保留/エラーの理由。続けて、指定外の鍵の台帳が開始前後で不変であることを確認して表示する
+  （既存の記録の書き換え・指定外への追記・状態変化があれば警告して終了コード4）。
+- 終了コード: 0=指定鍵すべて完了／2=指定鍵が処理対象外（何もしていない）／3=保留・結果不明・ロック競合などで人の対応待ち／4=指定外の鍵の台帳が変わった。
+- `--max-cycles`未指定なら1周期で終了（常駐しない）。`--max-cycles N`（N>1）なら、指定鍵が全てLINKEDになるかN周期まで`--interval-minutes`間隔で繰り返す（完了した鍵は2周期目以降から除く）。
+- 影響範囲: `workflow/registration.py`・`workflow/registration_loop.py`のみ。台帳の形式・DB・exportsは不変。実画面（実の統合ツール）では未確認。

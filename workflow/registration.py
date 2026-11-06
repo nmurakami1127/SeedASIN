@@ -6,14 +6,17 @@ from workflow.engine import Engine
 from workflow.store import State, Task, WorkflowStore, now_iso
 
 
-def register_saved(cfg, factory, ports, allow_keys=(), *, now=None):
+def register_saved(cfg, factory, ports, allow_keys=(), *, now=None, only_keys=None):
     """一回の実行。ログイン監視・再試行ループ・Amazonアクセスは行わない。
 
     cfg.auto_registration.enabled=true（docs/DEVIATIONS.md #102）のとき:
     - SAVE前の一時的なタイムアウトで試行上限に達した投入へ、待ちを置いて再試行権を自動付与する（追記のみ）
     - 結果不明(UNKNOWN)の投入を**最初に**自動照合する（再送しない。tool_submission/recovery.py）。復旧できれば対応記録(LINKED)まで進む
     - 復旧できないUNKNOWNは台帳にNEEDS_HUMANとして記録する。continue_past_needs_human=trueなら、それがあっても他の独立した投入を続ける
-    既定（無効）は従来どおり、UNKNOWNは対象にしない。"""
+    既定（無効）は従来どおり、UNKNOWNは対象にしない。
+
+    only_keys（#103。allow_keysとは別）: 指定した投入鍵だけを対象にする（None=従来どおり全部）。指定外の鍵は対象にせず、台帳へも追記しない
+    （自動付与も指定鍵だけ）。repeat_of_earlier_cycleの許可はallow_keysだけで、only_keysでは許可されない。"""
     import copy
     from datetime import datetime, timezone
 
@@ -24,9 +27,10 @@ def register_saved(cfg, factory, ports, allow_keys=(), *, now=None):
     store = WorkflowStore(cfg.state_dir)
     ledger = SubmissionLedger(Path(cfg.submission_dir) / 'ledger.jsonl')
     auto = cfg.auto_registration
+    only = None if only_keys is None else set(only_keys)
     with store.engine_lock('registration'):
         if auto.enabled:
-            _auto_grant(ledger, auto, now or datetime.now(timezone.utc))
+            _auto_grant(ledger, auto, now or datetime.now(timezone.utc), only)
         entries = ledger.all_states()
         st = State(store.new_id(), now_iso(), cfg.to_dict(), cfg.sha256())
         ordered = list(entries.items())
@@ -34,6 +38,8 @@ def register_saved(cfg, factory, ports, allow_keys=(), *, now=None):
             rank = {'UNKNOWN': 0, 'RUN_IDENTIFIED': 1, 'MEMO_SAVED': 1}
             ordered.sort(key=lambda kv: rank.get(kv[1].state, 2))
         for key, entry in ordered:
+            if only is not None and key not in only:
+                continue  # 指定外の鍵は対象にしない（台帳にも追記しない）
             m = entry.manifest or {}
             if entry.state == 'UNKNOWN' and auto.enabled:
                 if not m.get('direction'):
@@ -57,10 +63,12 @@ def register_saved(cfg, factory, ports, allow_keys=(), *, now=None):
         return eng.drive()
 
 
-def _auto_grant(ledger, auto, now) -> list[str]:
+def _auto_grant(ledger, auto, now, only=None) -> list[str]:
     """SAVE前の一時的なタイムアウトで試行上限に達した投入へ、再試行権を自動で付与する（追記のみ）。付与したキーを返す。"""
     out = []
     for key, s in ledger.all_states().items():
+        if only is not None and key not in only:
+            continue
         if s.state == 'NOT_SUBMITTED' and ledger.auto_grant_pre_save_retry(
                 key, wait_minutes=auto.pre_save_retry_wait_minutes, max_auto_grants=auto.pre_save_retry_max_grants, now=now):
             out.append(key)

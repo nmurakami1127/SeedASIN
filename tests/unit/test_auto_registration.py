@@ -528,3 +528,199 @@ def test_ledger_key_lock_dead_owner_is_released_live_owner_is_not(ledger):
             pass
     assert lock.exists()
     lock.unlink()
+
+
+# ------------------------------------------------------------------ --only-keys（docs/DEVIATIONS.md #103）
+def _man(**k):
+    return {"business_market": "US", "direction": "EXPORT", "asin_count": 12, **k}
+
+
+def test_parse_only_keys_accepts_commas_and_repeats_and_drops_duplicates():
+    from workflow.registration_loop import parse_only_keys
+    assert parse_only_keys(["a, b", "c", "a", " ,"]) == ["a", "b", "c"]
+    assert parse_only_keys(None) == [] and parse_only_keys([""]) == []
+
+
+def test_validate_only_keys_rejects_missing_non_processable_and_repeat_keys_but_never_writes(tmp_path):
+    from workflow.registration_loop import validate_only_keys
+    cfg = auto_cfg(tmp_path)
+    lg = SubmissionLedger(Path(cfg.submission_dir) / "ledger.jsonl")
+    lg.append("ok", "PLANNED", manifest=_man())
+    lg.append("rep", "PLANNED", manifest=_man(repeat_of_earlier_cycle=True))
+    lg.append("lane", "PLANNED", manifest=_man(business_market="JP"))
+    lg.append("done", "PLANNED", manifest=_man())
+    lg.append("done", "RUN_IDENTIFIED", tool_run_id="7")
+    lg.append("done", "MEMO_SAVED")
+    lg.append("done", "LINKED")
+    make_unknown(lg, "unk")
+    n = len(lg.events())
+    assert validate_only_keys(cfg, lg, ["ok"]) == []
+    why = validate_only_keys(cfg, lg, ["ok", "nope", "done", "rep", "lane"])
+    assert len(why) == 4 and "nope: 台帳にありません" in why[0] and "done: 状態がLINKED" in why[1]
+    assert "repeat_of_earlier_cycle" in why[2] and "lanes" in why[3]
+    assert len(lg.events()) == n  # 検証は台帳を読むだけ
+    # 結果不明は処理対象（マニフェストが無ければ人の確認）
+    assert "マニフェスト" in validate_only_keys(cfg, lg, ["unk"])[0]
+
+
+def _fake_register(monkeypatch, seen):
+    from workflow import registration
+
+    class FakeEngine:
+        def __init__(self, factory, ports, cfg_, store):
+            pass
+
+        def drive(self):
+            seen["order"] = list(self.st.tasks)
+            return self.st
+
+    monkeypatch.setattr(registration, "Engine", FakeEngine)
+    return registration
+
+
+def test_register_saved_only_keys_targets_just_those_keys_and_does_not_permit_repeats(tmp_path, monkeypatch):
+    cfg = auto_cfg(tmp_path)
+    lg = SubmissionLedger(Path(cfg.submission_dir) / "ledger.jsonl")
+    for k in ("a", "b", "c"):
+        lg.append(k, "PLANNED", manifest=_man())
+    lg.append("rep", "PLANNED", manifest=_man(repeat_of_earlier_cycle=True))
+    seen = {}
+    registration = _fake_register(monkeypatch, seen)
+    registration.register_saved(cfg, None, object(), only_keys={"b", "rep"})
+    assert seen["order"] == ["submit:b"]  # 指定外は対象外。repeatはonly_keysでは許可されない
+    registration.register_saved(cfg, None, object(), only_keys={"rep"}, allow_keys=("rep",))
+    assert seen["order"] == ["submit:rep"]  # 許可はallow_keysだけ
+    registration.register_saved(cfg, None, object())
+    assert seen["order"] == ["submit:a", "submit:b", "submit:c"]  # only_keys無しは従来どおり
+    registration.register_saved(cfg, None, object(), only_keys=set())
+    assert seen["order"] == []
+
+
+def test_auto_grant_with_only_keys_appends_only_for_the_specified_keys(tmp_path):
+    from workflow.registration import _auto_grant
+    cfg = auto_cfg(tmp_path, pre_save_retry_wait_minutes=0)
+    lg = SubmissionLedger(Path(cfg.submission_dir) / "ledger.jsonl")
+    for k in ("a", "b"):
+        lg.append(k, "PLANNED", manifest=_man())
+        _not_submitted(lg, k)
+    later = datetime.now(timezone.utc) + timedelta(minutes=5)
+    before_b = [e for e in lg.events() if e["key"] == "b"]
+    assert _auto_grant(lg, cfg.auto_registration, later, {"a"}) == ["a"]
+    assert [e for e in lg.events() if e["key"] == "b"] == before_b  # 指定外には追記しない
+    assert _auto_grant(lg, cfg.auto_registration, later, None) == ["b"]  # 指定なしは従来どおり
+
+
+def _only_run(tmp_path, monkeypatch, effect, keys=("a",)):
+    """run_cycleの代わりに effect(ledger) を実行し、run_only_keysの出力と終了コードを得る。"""
+    from workflow import registration_loop as L
+    cfg = auto_cfg(tmp_path)
+    lg = SubmissionLedger(Path(cfg.submission_dir) / "ledger.jsonl")
+    for k in ("a", "b"):
+        lg.append(k, "PLANNED", manifest=_man())
+    seen = {}
+
+    def fake_cycle(cfg_, factory, ports, **kw):
+        seen["kw"] = kw
+        return effect(lg)
+
+    monkeypatch.setattr(L, "run_cycle", fake_cycle)
+    out = []
+    return L.run_only_keys(cfg, None, object(), list(keys), say=out.append), out, lg, seen
+
+
+def test_only_keys_report_shows_state_asin_run_id_seconds_and_that_other_keys_are_unchanged(tmp_path, monkeypatch):
+    def effect(lg):
+        lg.append("a", "RUN_IDENTIFIED", tool_run_id="555")
+        lg.append("a", "MEMO_SAVED")
+        lg.append("a", "LINKED")
+        return {"tasks": {"submit:a": ("DONE", "")}}
+
+    code, out, lg, seen = _only_run(tmp_path, monkeypatch, effect)
+    text = "\n".join(out)
+    assert code == 0 and seen["kw"]["only_keys"] == {"a"}
+    assert "a: 状態 PLANNED→LINKED / ASIN 12件 / tool_run_id=555 / 台帳イベント間" in text and "秒" in text
+    assert "指定外の鍵の台帳は開始前後で不変（1件を確認）" in text and "[警告]" not in text
+
+
+def test_only_keys_report_prints_the_hold_reason_and_exits_3(tmp_path, monkeypatch):
+    code, out, lg, _ = _only_run(tmp_path, monkeypatch, lambda lg: {"tasks": {"submit:a": ("HELD", "別の投入(b)が未完了のため送信しません")}})
+    assert code == 3 and any("PLANNED→PLANNED" in x and "HELD: 別の投入(b)が未完了" in x for x in out)
+
+
+def test_only_keys_warns_and_exits_4_when_a_non_specified_key_changed(tmp_path, monkeypatch):
+    def effect(lg):
+        lg.append("b", "NEEDS_HUMAN", reason="x")  # 指定外への追記（あってはならない）
+        return {"tasks": {"submit:a": ("DONE", "")}}
+
+    code, out, lg, _ = _only_run(tmp_path, monkeypatch, effect)
+    assert code == 4 and any("[警告]" in x and "'b'" in x for x in out)
+
+
+def test_only_keys_invalid_keys_do_nothing_and_never_run_a_cycle(tmp_path, monkeypatch):
+    from workflow import registration_loop as L
+    cfg = auto_cfg(tmp_path)
+    lg = SubmissionLedger(Path(cfg.submission_dir) / "ledger.jsonl")
+    lg.append("a", "PLANNED", manifest=_man())
+    n = len(lg.events())
+    monkeypatch.setattr(L, "run_cycle", lambda *a, **k: pytest.fail("周期を実行してはいけない"))
+    out = []
+    assert L.run_only_keys(cfg, None, object(), ["a", "zzz"], say=out.append) == 2
+    assert len(lg.events()) == n and any("zzz: 台帳にありません" in x for x in out)
+
+
+def test_only_keys_busy_lock_is_reported_without_sending(tmp_path, monkeypatch):
+    from workflow.store import WorkflowBusy
+
+    def effect(lg):
+        raise WorkflowBusy("別の実行が実行中です")
+
+    code, out, lg, _ = _only_run(tmp_path, monkeypatch, effect)
+    assert code == 3 and any("他の処理が実行中" in x for x in out) and any("未実行" in x for x in out)
+
+
+def test_cycle_with_only_keys_never_calls_plan_flush_and_limits_needs_human(tmp_path, monkeypatch):
+    from workflow import registration_loop as L
+    cfg = config_from_dict({"lanes": {"US": {"origin_import": 1}}, "state_dir": str(tmp_path / "wf"), "submission_dir": str(tmp_path / "sub"),
+                            "batch_target_asins": 5000, "flush_unfilled_batches": True, "auto_registration": {"enabled": True}})
+    lg = SubmissionLedger(tmp_path / "sub" / "ledger.jsonl")
+    for k in ("k1", "k2"):
+        lg.append(k, "PLANNED", manifest={})
+        make_unknown(lg, k)
+        lg.append(k, "NEEDS_HUMAN", reason="解決しません")
+    monkeypatch.setattr(L, "_plan_flush", lambda *a: pytest.fail("--only-keysでは計画を追加しない"))
+    got = {}
+    monkeypatch.setattr(L, "register_saved", lambda *a, **k: (got.update(k), SimpleNamespace(tasks={}))[1])
+    res = L.run_cycle(cfg, None, object(), now=datetime(2026, 11, 6, tzinfo=timezone.utc), say=lambda s: None, only_keys={"k1"})
+    assert got["only_keys"] == {"k1"} and res["needs_human"] == 1  # 指定外(k2)は人の判断待ちにも記録しない
+
+
+def _only_main(tmp_path, monkeypatch, argv, codes):
+    import json as _json
+
+    from workflow import registration_loop as L
+    cfg = auto_cfg(tmp_path)
+    SubmissionLedger(Path(cfg.submission_dir) / "ledger.jsonl").append("a", "PLANNED", manifest=_man())
+    f = tmp_path / "c.json"
+    f.write_text(_json.dumps(cfg.to_dict()), encoding="utf-8")
+    calls, sleeps = [], []
+    monkeypatch.setattr(L, "run_only_keys", lambda *a, **k: (calls.append(a[3]), codes[min(len(calls), len(codes)) - 1])[1])
+    monkeypatch.setattr(L.time, "sleep", sleeps.append)
+    monkeypatch.setattr(L, "run_loop", lambda *a, **k: pytest.fail("--only-keysで常駐ループに入ってはいけない"))
+    rc = L.main(["--config", str(f), *argv], factory=object(), ports=object())
+    return rc, calls, sleeps
+
+
+def test_main_with_only_keys_runs_exactly_one_cycle_by_default_and_never_stays_resident(tmp_path, monkeypatch):
+    rc, calls, sleeps = _only_main(tmp_path, monkeypatch, ["--only-keys", "a"], [3])
+    assert rc == 3 and calls == [["a"]] and sleeps == []
+
+
+def test_main_with_only_keys_and_max_cycles_repeats_with_the_interval_until_done(tmp_path, monkeypatch):
+    rc, calls, sleeps = _only_main(tmp_path, monkeypatch, ["--only-keys", "a", "--max-cycles", "3", "--interval-minutes", "2"], [3, 3, 0])
+    assert rc == 0 and len(calls) == 3 and sleeps == [120, 120]
+
+
+def test_main_only_keys_with_unknown_key_exits_2_before_taking_any_lock_or_browser(tmp_path, monkeypatch, capsys):
+    rc, calls, sleeps = _only_main(tmp_path, monkeypatch, ["--only-keys", "a,zzz"], [0])
+    assert rc == 2 and calls == [] and "zzz: 台帳にありません" in capsys.readouterr().out
+    assert not (tmp_path / "inputs" / "registration" / "registration_loop.lock").exists()
