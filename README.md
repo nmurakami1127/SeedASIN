@@ -2,6 +2,60 @@
 
 Amazon.com（US）/ Amazon.co.jp（JP）でのアービトラージ（並行輸出入）を支援するシステムです。恒久ルールは [CLAUDE.md](CLAUDE.md)、実装指示は [docs/phase3_implementation_guide.md](docs/phase3_implementation_guide.md)、設計書との差分は [docs/DEVIATIONS.md](docs/DEVIATIONS.md) を参照してください。
 
+## 普段の起動手順（`cli.py` のメニュー）
+
+このPC（`C:\Projects\SeedASIN`）で日々の操作メニューを開く手順です。
+
+1. **Docker Desktopを起動**し、起動完了を待ちます。
+2. **PowerShellを開き、次を順に実行**します。
+
+```powershell
+cd C:\Projects\SeedASIN
+docker compose up -d db
+
+$env:SEEDASIN_APP_DATABASE_URL = "postgresql+psycopg://app_role:local_dev_app_role_pw@localhost:5432/seedasin"
+
+.\.venv\Scripts\python.exe -m cli
+```
+
+上記のDB接続先は、プロジェクト標準の**ローカル開発DB用**です。接続情報を変更済みの場合は、その設定を使ってください。環境変数は今開いているPowerShellだけに有効なので、PowerShellを開き直したら再設定します（`.env` の自動読み込みはありません）。
+
+仮想環境のPythonを直接指定するため、有効化操作は不要です。通常の起動時に、ライブラリの再インストールやDBの初期化・マイグレーションは行いません。
+
+### 起動後の操作
+
+表示されたメニューの番号を入力し、Enterを押します。
+
+| 番号 | 操作 |
+| --- | --- |
+| 1 | セラー・ブランド・キーワードの取得履歴を見る |
+| 2 | 統合ツールのIDとセラー・ブランド・キーワードをひもづける |
+| 3 | 統合ツールで取得したファイルをSeedASINへ取り込む |
+| 4 | ブランド・ランキングページからASINを集める |
+| 5 | 継続的に使えるセラーを確認する |
+| 6 | 出品完了リストを取り込む |
+| 7・8 | 記録の訂正用にセラー・ひもづけの記録を削除する（確認あり） |
+| 9 | 取得できないセラーとして記録する |
+| 10 | 未取込ファイルをまとめて確認・取り込む |
+| 0 | 終了 |
+
+メニュー3・10は、統合ツールの取得結果を**SeedASINへ取り込む操作**です。探索したASINを統合ツールへ新しく登録する操作とは別です。
+
+メニュー4のASIN収集では専用ブラウザーが開きます。配送先は人が手動で設定します（US: `97005`、JP: `289-1223`）。CAPTCHAが出たら画面で解き、PowerShellの案内に従ってください。収集後のCSV出力には `SEEDASIN_KPI_REPORT_DATABASE_URL`、メニュー7・8の削除には `SEEDASIN_ADMIN_DATABASE_URL` の追加設定が必要です。通常のメニュー起動自体にこれら2つの設定は不要です。
+
+### 起動できないとき
+
+- **DB接続エラー**：Docker Desktopが起動しているか、`docker compose ps db` でDBが動いているか、接続先の設定が正しいかを確認します。
+- **`SEEDASIN_APP_DATABASE_URL` が未設定**：上の環境変数の設定を、起動するのと同じPowerShellで実行します。
+- **`.venv\Scripts\python.exe` がない**：初回セットアップが必要です。既存環境がある場合は作り直さないでください。
+- **初回セットアップのみ**：Python 3.12を用意し、プロジェクトフォルダーで以下を実行します。新規DBのスキーマ構築は既存DBの起動とは別のセットアップです。
+
+```powershell
+py -3.12 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -e .
+.\.venv\Scripts\python.exe -m playwright install chromium
+```
+
 ## 役割と対象marketplace
 
 現在のスコープ（Phase 3以降）:
