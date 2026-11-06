@@ -145,3 +145,176 @@ def test_keepalive_logout_is_reported_without_reopening_or_logging_in(monkeypatc
         locator=lambda _: SimpleNamespace(count=lambda: 0), context=SimpleNamespace(new_page=lambda: probe)))
     clock[0] = 601
     assert ports.keep_tool_session_alive() == 'LOGIN_REQUIRED' and closed == [True]
+
+
+# ------------------------------------------------------------------ 登録ループ用のログイン待ち（docs/DEVIATIONS.md #104）
+class LoginPage:
+    """未ログインの疑似画面（tests/unit/test_tool_login.pyと同じ作り）。logged_inにするとログ一覧の見出しが読める。"""
+
+    def __init__(self, logged_in=False):
+        from tool_submission.import_tool_page import Selectors
+        self.logged_in = logged_in
+        self.url = Selectors().log_url if logged_in else "https://import-tools.jp/login.php"
+        self.closed = False
+        self.fail_with = None
+
+    def is_closed(self):
+        return self.closed
+
+    def locator(self, selector):
+        if self.fail_with is not None:
+            raise self.fail_with
+        if selector == "table tr":
+            return SimpleNamespace(first=SimpleNamespace(count=lambda: int(self.logged_in), inner_text=lambda: "CSV名 メモ DL 取得日時"))
+        return SimpleNamespace(count=lambda: int(not self.logged_in))
+
+    def goto(self, url):
+        self.url = url
+
+
+class Clock:
+    def __init__(self):
+        self.t = 0.0
+        self.sleeps = 0
+
+    def monotonic(self):
+        return self.t
+
+    def sleep(self, seconds):
+        self.t += seconds
+        self.sleeps += 1
+
+
+def _ports(monkeypatch, page, *, timeout, login_after=None, clock=None):
+    """keep_tool_open経路のRealPorts。実際のブラウザは開かず、時計・待機・表示は疑似。login_after=N: N回待ったらログイン完了。"""
+    clock = clock or Clock()
+    preflights, notices = [], []
+    tool = SimpleNamespace(preflight=lambda: preflights.append(1) or [], _p=page)
+
+    @contextmanager
+    def open_tool(_, **kwargs):
+        yield tool
+
+    monkeypatch.setattr("tool_submission.cli._open_tool_page", open_tool)
+    ports = RealPorts()
+    ports.keep_tool_open = True
+    ports._runtime = lambda: object()
+    ports.tool_login_timeout = timeout
+
+    def sleep(seconds):
+        clock.sleep(seconds)
+        if login_after is not None and clock.sleeps >= login_after:
+            page.logged_in = True
+            page.url = "https://import-tools.jp/asin/main.php"
+
+    ports._login_sleep, ports._login_clock = sleep, clock.monotonic
+    ports._login_say = lambda msg, **kw: notices.append((clock.t, msg))
+    return ports, clock, preflights, notices
+
+
+def test_loop_waits_for_login_then_continues_in_the_same_call(monkeypatch):
+    page = LoginPage()
+    ports, clock, preflights, notices = _ports(monkeypatch, page, timeout=600, login_after=40)  # 約2分後にログイン
+    body = []
+    with ports.tool_page() as tool:
+        body.append(tool)
+    assert body and preflights == [1]  # ログイン完了後、同じ呼び出しの中でpreflightを通って本体へ進む
+    assert clock.t == pytest.approx(120, abs=3)
+    # 「あと」表示は控えめ（3秒ごとの連打はしない）: 約2分で30秒間隔→数回
+    assert 2 <= len(notices) <= 5 and all("ログイン待ち（あと" in m for _, m in notices)
+    gaps = [b[0] - a[0] for a, b in zip(notices, notices[1:])]
+    assert all(g >= 30 for g in gaps)
+    ports.close()
+
+
+def test_loop_login_already_done_does_not_wait_or_print(monkeypatch):
+    ports, clock, preflights, notices = _ports(monkeypatch, LoginPage(logged_in=True), timeout=600)
+    with ports.tool_page():
+        pass
+    assert clock.sleeps == 0 and notices == [] and preflights == [1]
+
+
+def test_loop_login_wait_timeout_is_port_blocked_before_preflight_or_body(monkeypatch):
+    page = LoginPage()
+    ports, clock, preflights, notices = _ports(monkeypatch, page, timeout=60)
+    with pytest.raises(PortBlocked, match="時間切れ.*未送信"):
+        with ports.tool_page():
+            pytest.fail("ログイン前に本体（送信）へ進まない")
+    assert preflights == [] and 60 <= clock.t <= 63
+    # ブラウザは維持される（後からログインして次の周期で続行できる）
+    page.logged_in = True
+    page.url = "https://import-tools.jp/asin/main.php"
+    with ports.tool_page() as tool:
+        assert tool._p is page
+    assert preflights == [1]
+
+
+def test_default_is_the_watch_behaviour_3_seconds_and_no_extra_wait_hooks(monkeypatch):
+    seen = []
+
+    def login(page, selectors, **kwargs):
+        seen.append(kwargs)
+
+    monkeypatch.setattr("tool_submission.cli._wait_for_tool_login", login)
+    tool = SimpleNamespace(preflight=lambda: [], _p=LoginPage(logged_in=True))
+
+    @contextmanager
+    def open_tool(_, **kwargs):
+        yield tool
+
+    monkeypatch.setattr("tool_submission.cli._open_tool_page", open_tool)
+    ports = RealPorts()
+    assert ports.tool_login_timeout == 3
+    ports.keep_tool_open = True
+    ports._runtime = lambda: object()
+    with ports.tool_page():
+        pass
+    assert seen == [{"timeout": 3}]  # watchは従来のまま（待機・時計の差し替え・表示なし）
+
+
+@pytest.mark.parametrize("value", [0, -1, -3600, 3])
+def test_non_positive_or_3_login_timeout_is_the_old_3_seconds(monkeypatch, value):
+    seen = []
+    monkeypatch.setattr("tool_submission.cli._wait_for_tool_login", lambda page, selectors, **kw: seen.append(kw))
+    ports, _, _, notices = _ports(monkeypatch, LoginPage(logged_in=True), timeout=value)
+    with ports.tool_page():
+        pass
+    assert seen == [{"timeout": 3}] and notices == []
+
+
+def test_watch_login_timeout_is_still_port_blocked_via_eof(monkeypatch):
+    ports, clock, preflights, _ = _ports(monkeypatch, LoginPage(), timeout=3)
+    with pytest.raises(PortBlocked, match="Enter不要"):
+        with ports.tool_page():
+            pass
+    assert preflights == []
+
+
+def test_browser_closed_during_login_wait_is_port_blocked_not_a_crash(monkeypatch):
+    page = LoginPage()
+    ports, clock, preflights, _ = _ports(monkeypatch, page, timeout=600)
+    original = ports._login_sleep
+
+    def sleep_then_close(seconds):
+        original(seconds)
+        page.closed = True
+        page.fail_with = RuntimeError("Target page, context or browser has been closed")
+
+    ports._login_sleep = sleep_then_close
+    with pytest.raises(PortBlocked, match="閉じられ.*未送信"):
+        with ports.tool_page():
+            pytest.fail("送信へ進まない")
+    assert preflights == []
+
+
+def test_ctrl_c_during_login_wait_propagates_and_is_flagged(monkeypatch):
+    ports, clock, preflights, _ = _ports(monkeypatch, LoginPage(), timeout=600)
+
+    def interrupt(seconds):
+        raise KeyboardInterrupt
+
+    ports._login_sleep = interrupt
+    with pytest.raises(KeyboardInterrupt):
+        with ports.tool_page():
+            pytest.fail("送信へ進まない")
+    assert ports.interrupted_in_login_wait is True and preflights == []

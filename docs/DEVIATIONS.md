@@ -1664,3 +1664,25 @@ Amazonのナビゲーションはdomcontentloadedで待機し、第三者リソ�
 - 終了コード: 0=指定鍵すべて完了／2=指定鍵が処理対象外（何もしていない）／3=保留・結果不明・ロック競合などで人の対応待ち／4=指定外の鍵の台帳が変わった。
 - `--max-cycles`未指定なら1周期で終了（常駐しない）。`--max-cycles N`（N>1）なら、指定鍵が全てLINKEDになるかN周期まで`--interval-minutes`間隔で繰り返す（完了した鍵は2周期目以降から除く）。
 - 影響範囲: `workflow/registration.py`・`workflow/registration_loop.py`のみ。台帳の形式・DB・exportsは不変。実画面（実の統合ツール）では未確認。
+
+## 104. 登録ループ: 統合ツールが未ログインのとき、同じ周期内でログイン完了を待って続行する（2026-11-06）
+
+- 背景: 従来の `exports/run_bulk_registration.py`（`keep_tool_open=False`）は、未ログインならブラウザを開いて最大300秒ログインを待ち、完了後に同じ実行内で続行した。
+  自動登録ループ（#102・#103）は `keep_tool_open=True` で、`RealPorts.tool_page()` が `_wait_for_tool_login(..., timeout=3)` と3秒しか待たず、
+  未ログインだと `PortBlocked`（WAITING）で1周期が終わった。`--only-keys ... --max-cycles 1` ではそのままプロセスが終わりブラウザも閉じるため、人がログインする時間が無かった。
+- 変更:
+  - `RealPorts.tool_login_timeout`（既定3秒＝探索watchの現状。`keep_tool_open`経路の `_wait_for_tool_login(timeout=)` に渡す）を新設。**探索watchの挙動は変えない**（watchは待たずに他の作業を続けるため3秒が意図。既定のまま）。
+  - 登録ループ（`workflow/registration_loop.py` の `main`。常駐ループも `--only-keys` も）だけが、設定 `auto_registration.login_wait_seconds`（新設・既定600秒・-3600〜3600）を `tool_login_timeout` に入れる。
+    0以下は従来の3秒相当（待たない）。3秒以下は従来の処理（EOFError→PortBlocked）のまま。
+  - 3秒を超えるときは、ブラウザを開いたままログイン完了を検知するまで待ち（既存の `_wait_for_tool_login` をそのまま使い、3秒ごとのポーリング・ログイン済みなら待たない）、
+    完了したら**同じ周期内で** preflight → submit へ続行する。待機中は30秒間隔で「ログイン待ち（あとN秒）」を表示する（3秒ごとの連打はしない）。`tool_submission/cli.py` は変更していない。
+  - `config.py`: `login_wait_seconds` が既定(600)のときは `to_dict()` に出さない（従来の設定のsha256・保存済みスナップショットは不変。既定の設定3パターンのsha256が実装前後で一致することをテストで固定）。
+- 安全性（コードで確認）:
+  - ログイン待ちは `register_saved` の `engine_lock('registration')` と登録ループの `loop_lock` の保持中に行われる。待機中に別の登録ループ／bulk登録（`register_saved`）が起動しても `WorkflowBusy` で拒否される（既存ロック。テストで確認）。
+  - 待機は `Engine._run_submit` の `self._page()`（= `tool_page()`）の中。SAVE（`submit_item`→`claim_submission`の `SUBMIT_STARTED` 追記→入力→SAVE）も、日次枠の `usage.reserve` も、**`_page()` の後**。待機中・待機時間切れ・中断では台帳に何も追記しない。
+  - 待機時間切れ／待機中にブラウザ・画面が閉じられた場合は `PortBlocked`（その投入は WAITING。再送・状態変更なし。ブラウザは維持。`--only-keys` の結果表示に「時間切れ」「未送信」が出て終了コード3）。
+  - Ctrl+C（KeyboardInterrupt）は握りつぶさず伝える。`--only-keys` では「[中断] 統合ツールのログイン待ちを中断しました。SAVE前のため未送信で、投入台帳は変更していません」と表示して終了コード3（従来は表示なしの終了コード0）。ロックは解放される。
+  - ログインは人が行い、認証情報は保存・入力しない（不変）。専用プロファイルは従来どおり `playwright_profiles/import_tool`。
+- 注意（未対応・要相談）: プロファイルのパス（`tool_submission/cli.py` の `Path("playwright_profiles")/"import_tool"` と `asin_collector/browser_session.py` の `_PROFILE_ROOT`）は**カレントディレクトリ基準の相対パス**。
+  登録ループをリポジトリのルート以外のcwdで起動すると、別の（ログインしていない）プロファイルを新規に作る。これまでの運用（ルートから起動）と同じ前提で、今回は変更していない。
+- 影響範囲: `workflow/ports.py`・`workflow/registration_loop.py`・`workflow/config.py`・`config/workflow.example.json`のみ。台帳・DB・exportsは不変。実画面（実の統合ツール・実ブラウザ）では未確認。

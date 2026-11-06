@@ -724,3 +724,25 @@ def test_main_only_keys_with_unknown_key_exits_2_before_taking_any_lock_or_brows
     rc, calls, sleeps = _only_main(tmp_path, monkeypatch, ["--only-keys", "a,zzz"], [0])
     assert rc == 2 and calls == [] and "zzz: 台帳にありません" in capsys.readouterr().out
     assert not (tmp_path / "inputs" / "registration" / "registration_loop.lock").exists()
+
+
+def test_login_wait_seconds_default_is_omitted_from_dict_and_hash_is_unchanged():
+    """#104: 新設のlogin_wait_secondsは既定(600)のとき出さない。従来の設定のsha256（実装前に計算した値）が変わらない。"""
+    base = {"lanes": {"US": {"origin_import": 1}}}
+    assert config_from_dict(base).sha256() == "dbeae8a38c826d8064aa94d431aef468f9ffc5675f4504b034c5597fd10dc833"
+    enabled = config_from_dict({**base, "auto_registration": {"enabled": True}})
+    assert enabled.sha256() == "e5281e4600eb5eeb4a9f91ec8646c63f2bd19b26eb4d68eac3121eac0b46d5ce"
+    assert "login_wait_seconds" not in enabled.to_dict()["auto_registration"] and enabled.auto_registration.login_wait_seconds == 600
+    custom = config_from_dict({**base, "auto_registration": {"enabled": True, "loop_interval_minutes": 5, "post_save_wait_seconds": 0}})
+    assert custom.sha256() == "538570e79b9d746d212f21f61c2a6e024b4be256795d2b4ea26f2f74232d4852"
+    # 既定値を明示しても同じ。既定以外は出力され、往復できる。
+    assert config_from_dict({**base, "auto_registration": {"enabled": True, "login_wait_seconds": 600}}).sha256() == enabled.sha256()
+    other = config_from_dict({**base, "auto_registration": {"enabled": True, "login_wait_seconds": 0}})
+    d = other.to_dict()
+    assert d["auto_registration"]["login_wait_seconds"] == 0 and config_from_dict(d).to_dict() == d and other.sha256() != enabled.sha256()
+    # login_wait_secondsだけを既定以外にした設定は、auto_registrationが既定扱いにならず出力される
+    only = config_from_dict({**base, "auto_registration": {"login_wait_seconds": 30}})
+    assert only.to_dict()["auto_registration"]["login_wait_seconds"] == 30
+    for bad in (True, "600", 3601, -3601, 1.5):
+        with pytest.raises(ConfigError):
+            config_from_dict({**base, "auto_registration": {"login_wait_seconds": bad}})

@@ -242,3 +242,150 @@ def test_only_keys_keeps_the_global_lock_and_engine_lock(app_role_factory, tmp_p
     assert code == 3 and w.tool.submits == 0 and led.events() == before
     assert any("実行中" in x for x in out)
     assert _only(w, app_role_factory, [k1])[0] == 0  # 解除後は進む
+
+
+# ------------------------------------------------------------------ 登録ループのログイン待ち（docs/DEVIATIONS.md #104）
+class _LoginPage:
+    """未ログインの疑似画面。logged_in=Trueでログ一覧の見出しが読める（本物の_wait_for_tool_loginがこれを見て判定する）。"""
+
+    def __init__(self):
+        self.logged_in = False
+        self.url = "https://import-tools.jp/login.php"
+
+    def is_closed(self):
+        return False
+
+    def locator(self, selector):
+        from types import SimpleNamespace
+        if selector == "table tr":
+            return SimpleNamespace(first=SimpleNamespace(count=lambda: int(self.logged_in), inner_text=lambda: "CSV名 メモ DL 取得日時"))
+        return SimpleNamespace(count=lambda: int(not self.logged_in))
+
+    def goto(self, url):
+        self.url = url
+
+
+class LoginPorts:
+    """探索側はFakePorts、統合ツール側は本物のRealPorts.tool_page（keep_tool_open経路）を通す。ブラウザは疑似。待機・時計はテストが制御する。"""
+
+    def __init__(self, world, monkeypatch, *, login_after=None, on_wait=None):
+        from contextlib import contextmanager
+        from workflow.ports import RealPorts
+
+        self.world, self.page, self.clock, self.waits, self.notices = world, _LoginPage(), [0.0], 0, []
+        world.tool._p = self.page
+
+        @contextmanager
+        def open_tool(_, **kwargs):
+            yield world.tool
+
+        monkeypatch.setattr("tool_submission.cli._open_tool_page", open_tool)
+        self.real = real = RealPorts()
+        real.keep_tool_open = True
+        real._runtime = lambda: object()
+        self.login_after, self.on_wait = login_after, on_wait
+
+        def sleep(seconds):
+            self.clock[0] += seconds
+            self.waits += 1
+            if self.on_wait:
+                self.on_wait(self)
+            if self.login_after is not None and self.waits >= self.login_after:
+                self.page.logged_in = True
+                self.page.url = "https://import-tools.jp/asin/main.php"
+
+        real._login_sleep, real._login_clock = sleep, lambda: self.clock[0]
+        real._login_say = lambda msg, **kw: self.notices.append(msg)
+
+    tool_login_timeout = property(lambda s: s.real.tool_login_timeout, lambda s, v: setattr(s.real, "tool_login_timeout", v))
+    interrupted_in_login_wait = property(lambda s: s.real.interrupted_in_login_wait)
+
+    def fetcher(self, market):
+        return self.world.ports.fetcher(market)
+
+    def tool_page(self):
+        return self.real.tool_page()
+
+
+def _main_only(w, factory, keys, ports, wait_seconds, capsys):
+    import json
+    from workflow.registration_loop import main
+
+    d = {**w.cfg_dict, "auto_registration": {"enabled": True, "post_save_wait_seconds": 0, "log_unreadable_waits_seconds": [0, 0],
+                                              "login_wait_seconds": wait_seconds}}
+    path = w.tmp / "wf_login.json"
+    path.write_text(json.dumps(d), encoding="utf-8")
+    code = main(["--config", str(path), "--only-keys", ",".join(keys)], factory=factory, ports=ports)
+    return code, capsys.readouterr().out
+
+
+def test_login_wait_logs_in_during_the_wait_and_registers_in_the_same_cycle(app_role_factory, tmp_path, own, monkeypatch, capsys):
+    from workflow.registration import register_saved
+    from workflow.registration_loop import loop_lock
+    from workflow.store import WorkflowBusy
+
+    w, led, (k1, k2) = _planned_world(app_role_factory, tmp_path)
+    before, probes = led.events(), []
+
+    def during_wait(p):  # 待機中（engine_lockとloop_lockの保持中）: 台帳は無変更・SAVE前。別の登録ループ/bulk登録は拒否される
+        assert led.events() == before and w.tool.submits == 0
+        if not probes:
+            for name, fn in (("register_saved", lambda: register_saved(w.cfg, app_role_factory, w.ports)), ("loop_lock", lambda: loop_lock(w.cfg).__enter__())):
+                try:
+                    fn()
+                    probes.append((name, "ACQUIRED"))
+                except WorkflowBusy:
+                    probes.append((name, "BUSY"))
+
+    ports = LoginPorts(w, monkeypatch, login_after=7, on_wait=during_wait)
+    code, out = _main_only(w, app_role_factory, [k1], ports, 600, capsys)
+    assert code == 0, out
+    assert ports.tool_login_timeout == 600  # 設定値がRealPortsへ渡る
+    assert probes == [("register_saved", "BUSY"), ("loop_lock", "BUSY")]
+    assert ports.waits == 7 and w.tool.submits == 1  # ログイン完了後、同じ周期でSAVE（1回）
+    assert led.state(k1).state == "LINKED" and led.state(k2).state == "PLANNED"
+    assert [e["event"] for e in led.events() if e["key"] == k1].count("SUBMIT_STARTED") == 1
+    assert len([n for n in ports.notices if "ログイン待ち（あと" in n]) == 1  # 21秒の待機では「あと」表示は最初の1回だけ
+    assert f"{k1}: 状態 PLANNED→LINKED" in out
+
+
+def test_login_wait_timeout_leaves_the_ledger_untouched_and_a_later_run_proceeds(app_role_factory, tmp_path, own, monkeypatch, capsys):
+    w, led, (k1, k2) = _planned_world(app_role_factory, tmp_path)
+    before = led.events()
+    ports = LoginPorts(w, monkeypatch)  # ログインされない
+    code, out = _main_only(w, app_role_factory, [k1], ports, 20, capsys)
+    assert code == 3 and w.tool.submits == 0 and led.events() == before  # 時間切れ: 未送信・台帳に変更なし
+    assert led.state(k1).state == "PLANNED" and led.state(k2).state == "PLANNED"
+    assert "WAITING" in out and "時間切れ" in out and "未送信" in out and f"{k1}: 状態 PLANNED→PLANNED" in out
+    assert ports.waits >= 6 and any("ログイン待ち（あと" in n for n in ports.notices)
+    # ログイン後に再実行すれば、再送ではなく通常の1回目として進む
+    ports.page.logged_in, ports.page.url = True, "https://import-tools.jp/asin/main.php"
+    code, out = _main_only(w, app_role_factory, [k1], ports, 20, capsys)
+    assert code == 0 and led.state(k1).state == "LINKED" and w.tool.submits == 1
+
+
+def test_login_wait_zero_does_not_wait_beyond_the_old_3_seconds(app_role_factory, tmp_path, own, monkeypatch, capsys):
+    w, led, (k1, k2) = _planned_world(app_role_factory, tmp_path)
+    before = led.events()
+    ports = LoginPorts(w, monkeypatch)
+    code, out = _main_only(w, app_role_factory, [k1], ports, 0, capsys)
+    assert code == 3 and w.tool.submits == 0 and led.events() == before
+    assert ports.waits <= 1 and ports.notices == []  # 従来どおり（長い待機・「あと」表示なし）
+    assert "ログインしてください" in out
+
+
+def test_ctrl_c_during_login_wait_is_reported_and_leaves_the_ledger_untouched(app_role_factory, tmp_path, own, monkeypatch, capsys):
+    w, led, (k1, k2) = _planned_world(app_role_factory, tmp_path)
+    before = led.events()
+
+    def interrupt(p):
+        raise KeyboardInterrupt
+
+    ports = LoginPorts(w, monkeypatch, on_wait=interrupt)
+    code, out = _main_only(w, app_role_factory, [k1], ports, 600, capsys)
+    assert code == 3 and w.tool.submits == 0 and led.events() == before
+    assert "[中断]" in out and "SAVE前のため未送信" in out
+    # 中断のあと、ロックは解放されている（再実行できる）
+    ports2 = LoginPorts(w, monkeypatch, login_after=1)
+    code, out = _main_only(w, app_role_factory, [k1], ports2, 600, capsys)
+    assert code == 0 and led.state(k1).state == "LINKED"

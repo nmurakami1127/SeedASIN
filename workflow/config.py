@@ -140,6 +140,9 @@ class AutoRegistration:
     pre_save_retry_wait_minutes: int = 30
     pre_save_retry_max_grants: int = 2     # 1投入あたりの自動付与の上限回数。0=自動付与しない
     loop_interval_minutes: int = 10        # 常駐ループ(workflow/registration_loop.py)の間隔
+    # 登録ループ（--only-keys含む）で統合ツールが未ログインのとき、同じ周期内でログイン完了を待つ秒数（#104）。0以下=従来の3秒相当（待たない）。-3600〜3600。
+    # 探索watch（keep_tool_open）の3秒は変えない（この設定は登録ループだけが使う）。
+    login_wait_seconds: int = 600
 
 
 @dataclass
@@ -183,7 +186,12 @@ class WorkflowConfig:
             d.pop("flush_unfilled_batches", None)
         if d.get("flush_min_age_minutes") == 30:
             d.pop("flush_min_age_minutes", None)
-        if d.get("auto_registration") == asdict(AutoRegistration()):
+        # login_wait_seconds（#104）も既定のときは出さない（従来の設定のsha256・保存済みスナップショットと同一にする）
+        if (d.get("auto_registration") or {}).get("login_wait_seconds") == AutoRegistration().login_wait_seconds:
+            d["auto_registration"].pop("login_wait_seconds", None)
+        default_auto = asdict(AutoRegistration())
+        default_auto.pop("login_wait_seconds", None)
+        if d.get("auto_registration") == default_auto:
             d.pop("auto_registration", None)
         return d
 
@@ -322,7 +330,8 @@ class WorkflowConfig:
             if not isinstance(getattr(a, name), bool):
                 raise ConfigError(f"auto_registration.{name} はtrue/falseで指定してください")
         for name, lo, hi in (("post_save_wait_seconds", 0, 600), ("needs_human_after_minutes", 1, 10080), ("pre_save_retry_wait_minutes", 0, 1440),
-                             ("pre_save_retry_max_grants", 0, 10), ("loop_interval_minutes", 1, 1440)):
+                             ("pre_save_retry_max_grants", 0, 10), ("loop_interval_minutes", 1, 1440),
+                             ("login_wait_seconds", -3600, 3600)):
             v = getattr(a, name)
             if isinstance(v, bool) or not isinstance(v, int) or not lo <= v <= hi:
                 raise ConfigError(f"auto_registration.{name} は{lo}〜{hi}の整数で指定してください（指定: {v!r}）")

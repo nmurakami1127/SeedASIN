@@ -23,9 +23,18 @@ class Ports(Protocol):
     def tool_page(self): ...              # context manager -> ToolPage（統合ツール）
 
 
+WATCH_LOGIN_WAIT_SECONDS = 3  # 探索watch（keep_tool_open）の従来のログイン待ち。待たずに他の作業を続けるための値で、変えない
+LOGIN_NOTICE_INTERVAL_SECONDS = 30  # 長いログイン待ちの「あとN秒」表示の間隔（3秒ごとの連打はしない）
+
+
 class RealPorts:
     def __init__(self):
         self.keep_tool_open = False
+        # keep_tool_open経路で、未ログインのとき同じ呼び出しの中でログイン完了を待つ秒数（#104）。既定=watchの現状（3秒）。
+        # 自動登録ループ(workflow/registration_loop.py)だけが auto_registration.login_wait_seconds を入れる。0以下は3秒相当。
+        self.tool_login_timeout = WATCH_LOGIN_WAIT_SECONDS
+        self.interrupted_in_login_wait = False  # ログイン待ち中にCtrl+Cで中断した（SAVE前なので未送信）
+        self._login_sleep, self._login_clock, self._login_say = time.sleep, time.monotonic, print  # テスト用に差し替え可能
         self._tool_context = None
         self._tool = None
         self._playwright_manager = self._playwright = None
@@ -118,6 +127,42 @@ class RealPorts:
                 print(f"[警告] {market}のお届け先地域: {warning}", flush=True)
             yield f
 
+    def _await_tool_login(self, selectors) -> None:
+        """keep_tool_open経路のログイン確認。tool_login_timeoutが3秒以下ならwatch従来どおり（EOFErrorは呼び出し側がPortBlockedにする）。
+        それより長いとき（自動登録ループ）は、ブラウザを開いたままログイン完了まで待ち、完了したら呼び出し元がそのまま続行する。
+        時間切れ・ブラウザが閉じられた場合はPortBlocked（この時点ではpreflightもSAVEもしていないので未送信）。Ctrl+Cはそのまま伝える。"""
+        from tool_submission.cli import _wait_for_tool_login
+
+        timeout = self.tool_login_timeout if self.tool_login_timeout > 0 else WATCH_LOGIN_WAIT_SECONDS
+        if timeout <= WATCH_LOGIN_WAIT_SECONDS:
+            _wait_for_tool_login(self._tool._p, selectors, timeout=timeout)
+            return
+        clock, say = self._login_clock, self._login_say
+        start, last = clock(), [None]
+
+        def sleep(seconds):
+            self._login_sleep(seconds)
+            now = clock()
+            if last[0] is None or now - last[0] >= LOGIN_NOTICE_INTERVAL_SECONDS:
+                last[0] = now
+                say(f"ログイン待ち（あと{max(0, int(timeout - (now - start)))}秒）: 開いている統合ツールのブラウザでログインしてください。完了後に自動で続行します", flush=True)
+
+        try:
+            _wait_for_tool_login(self._tool._p, selectors, timeout=timeout, sleep=sleep, monotonic=clock)
+        except EOFError as exc:
+            raise PortBlocked(f"統合ツールのログイン待ちが{timeout}秒で時間切れになりました（未送信。ブラウザは維持します）。"
+                              "ログインしてから次の周期（または再実行）で続行します") from exc
+        except KeyboardInterrupt:
+            self.interrupted_in_login_wait = True
+            raise
+        except Exception as exc:  # noqa: BLE001 - 待機中にブラウザ・画面が閉じられた（Playwrightのエラー）。ログイン待ちはSAVEの前
+            try:
+                self._recover_tool_page()
+            except Exception:
+                pass
+            raise PortBlocked(f"ログイン待ちの途中で統合ツールの画面が閉じられました（{type(exc).__name__}）。未送信です。"
+                              "ブラウザを開き直して再実行してください") from exc
+
     @contextmanager
     def tool_page(self) -> Iterator[ToolPage]:
         from tool_submission.cli import _open_tool_page, _wait_for_tool_login
@@ -131,7 +176,7 @@ class RealPorts:
                     page = manager.__enter__()
                     self._tool_context, self._tool = manager, page
                 # 認証が時間切れになってもブラウザは維持する。後から人がログインできる。
-                _wait_for_tool_login(self._tool._p, Selectors(), timeout=3)
+                self._await_tool_login(Selectors())
                 problems = self._tool.preflight()
                 if problems:
                     raise PortBlocked("統合ツールの画面設定: " + "; ".join(problems))

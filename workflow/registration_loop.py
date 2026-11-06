@@ -236,6 +236,8 @@ def main(argv=None, *, factory=None, ports=None) -> int:
     ports = ports or RealPorts()
     if own_ports:
         ports.keep_tool_open = True  # 人手待ち（ログイン等）でもブラウザを開いたまま、次の周期で自動続行する
+    if hasattr(ports, "tool_login_timeout"):  # 未ログインなら、同じ周期内でログイン完了を待って続行する（#104。0以下=従来の3秒相当）。watchは別の設定
+        ports.tool_login_timeout = cfg.auto_registration.login_wait_seconds
     code = 0
     try:
         fac = factory or SessionFactory.for_app_role()
@@ -244,7 +246,12 @@ def main(argv=None, *, factory=None, ports=None) -> int:
         else:
             run_loop(cfg, fac, ports, interval_minutes=a.interval_minutes, max_cycles=a.max_cycles)
     except KeyboardInterrupt:
-        pass
+        if keys:  # --only-keys: 中断をはっきり示す（終了コード0にしない）
+            if getattr(ports, "interrupted_in_login_wait", False):
+                print("[中断] 統合ツールのログイン待ちを中断しました。SAVE前のため未送信で、投入台帳は変更していません")
+            else:
+                print("[中断] 処理を中断しました。投入台帳の状態を確認してください（送信済みの投入は再送しません）")
+            code = 3
     finally:
         if own_ports:
             ports.close()
