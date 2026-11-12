@@ -1695,3 +1695,19 @@ Amazonのナビゲーションはdomcontentloadedで待機し、第三者リソ�
 - 本番設定の変更は不要（`flush_unfilled_batches`は無効のままでよい。BROKEN・終了済みの端数は、設定に関係なく放出される）。`totals.max_submit_asins`（1実行の予算）を超える分はHELD（見送り）になるだけで、切り捨てではない（次の実行で投入される）。
 - 旧テストの更新: `tests/integration/test_planner_depth_limit_flush.py`の「BROKEN・DEPTH_LIMIT以外のCLOSED_NO_CURSORは端数を保留」を、「放出する」に変更した（本件の要件）。
 - 実PostgreSQLでの結合テストは`tests/integration/test_split_remainder.py`、単体は`tests/unit/test_split_remainder.py`。実画面（統合ツール）への投入は確認していない。
+
+- 追加（同日）:
+  - **OPEN周期の端数登録**: 既存の`flush_unfilled_batches`＋`flush_min_age_minutes`（既定30分。config既定値・本番設定は変更しない）で、周期がOPENでも取得済みの端数を猶予後に計画に回せることを、テストで確認した
+    （コードは#102のまま。無効時は従来どおり満杯分だけで、持ち越しは理由OPENで報告。有効で猶予の途中は理由FLUSH_WAITING。有効＋猶予経過なら端数も計画し、持ち越しは出ない）。
+    次回取得（同じ一巡の続き）では、既存の同じ一巡の除外（台帳の占有）で、前回計画した分を除いた増分だけが計画される。`build_items`はDBを読むだけなので、計画は取得側の周期・再開位置に影響しない（テストで`collector_run`の周期・状態が不変、続きのrunが先頭から取り直さないことを確認）。
+  - **未送信確認済み(NOT_SUBMITTED)の二重計画防止**: 同じ出典・取得先市場・方向でNOT_SUBMITTEDの投入鍵(他のrunの計画)のASINは、新しい別キーの計画に入れない（`planner._retry_pending`）。既存の鍵が再試行される
+    （`UNREGISTERED_STATES`・`ACTIONABLE_STATES`・`auto_grant_pre_save_retry`・`grant_retry`の既存の流れ。状態は変えない）。件数は`carryover`に`RETRY_PENDING_NOT_SUBMITTED`（reason=NOT_SUBMITTED_RETRY）で報告する。
+    UNKNOWN・AMBIGUOUS・LINKED・ABANDONEDは従来どおり占有で除外され、再送対象にならない。方向ごとに判定（IMPORT/EXPORTは分離）。同じrun自身の計画は従来どおり（同じ内容は同じ鍵）。
+    既存テスト`tests/integration/test_submission_delta.py`の2件は、「未送信と確認できたASINは再び送ってよい」という意図を保ったまま、「新しいキーの計画には入らず、既存の鍵（NOT_SUBMITTED・再試行対象）の側で送られる」に期待を更新した
+    （新しい別キーに入れると、既存の鍵の再試行と二重登録になるため。最終的な欠落なし＝新規＋repeat＋占有＋既存の鍵側の合計が全ASINに一致、も維持）。
+    注意: 再試行の上限に達した鍵は人の`grant_retry`が要る（自動付与はSAVE前のタイムアウトのみ）。その間、そのASINは他のキーで計画されない（`audit-coverage`では計画済みとして数える）。
+  - **audit-coverageの拡張**（読み取りのみ）: 各周期・方向に (a)未計画 (b)正味未登録（同じ方向の他の周期・出典で計画済みのASINを除く。`overlap_other`）(c)取り下げ・保留（`held_withdrawn`、`plan_asins_by_state`）
+    (d)この修正を適用した場合に新たに計画される数（`would_plan`=従来の設定。OPENはbatch_targetの満杯分のみ・終了周期は全件、`would_plan_flush`=flush有効＋猶予経過を仮定、`excluded_failed_run`=失敗runだけが保存したASINで`skip_failures=false`のため入力にならない分）を追加。
+    `--state OPEN,BROKEN`・`--min-asins`・`--batch-target`・`--skip-failures`・`--input-base`・`--json`。入力ファイルのパスは、Windowsのバックスラッシュ区切り・Linuxのスラッシュ区切り、相対・別環境の絶対パスのどちらも、台帳のフォルダー・その親・カレント・`--input-base`の下から探して読む（BOM付きも可。`resolve_input_path`）。
+    ドライラン計算は planner の規則の近似（run単位の候補選定・実時刻は見ない）。実際の計画は`flush-plan`（見積もりは書き込まない）で確認できる。
+  - 気づいた点: 周期の最初のrun自体が失敗(BROKEN)で、使える取得が1つも無い周期は、`skip_failures=false`では入力にできない（`build_items`が「入力に使えません」）。`skip_failures=true`（#70で実運用に有効化とある）なら端数を含めて全件計画される。

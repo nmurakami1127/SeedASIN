@@ -83,6 +83,20 @@ def _occupancy(states: dict, run_id: int, source_id: int, direction: str, market
     return by_cycle, others
 
 
+def _retry_pending(states: dict, run_id: int, source_id: int, market: str, direction: str, cache: dict) -> set[str]:
+    """同じ出典・取得先市場・業務方向で、**未送信と確認済み(NOT_SUBMITTED)**の投入鍵のASIN（同じrun自身の計画は除く）。
+    これらは既存の鍵で再試行する（retry / grant_retry）。新しい別キーの計画に入れると、同じASINが二重に登録されるので除外する（#104）。
+    UNKNOWN・AMBIGUOUS・LINKED等は占有(OCCUPYING)の側で除外され、再送対象にならない。"""
+    out: set[str] = set()
+    for st in states.values():
+        m = st.manifest
+        if st.state != "NOT_SUBMITTED" or not m or m.get("collector_run_id") == run_id or m.get("direction") != direction:
+            continue
+        if m.get("source_id") == source_id and m.get("fetch_market") == market:
+            out.update(_read_asins(m.get("input_file", ""), cache))
+    return out
+
+
 def _withdrawn_asins(states: dict, source_id: int, market: str, direction: str, ckey: str, cache: dict) -> set[str]:
     """この出典・取得先市場・方向・一巡で、人が取り下げた計画(PLAN_WITHDRAWN。重複のための取り下げを除く)のASIN。"""
     out: set[str] = set()
@@ -207,6 +221,15 @@ def build_items(app: SessionFactory, fetch_market: str, run_id: int, *, out_dir:
         same_cycle = by_cycle.get(ckey, set())
         earlier = set().union(*[v for k, v in by_cycle.items() if k != ckey]) if by_cycle else set()
         remaining = [a for a in asins if a not in same_cycle]
+        excluded_same = len(asins) - len(remaining)
+        pending = _retry_pending(states, run_id, src.source_id, fetch_market, d, file_cache)
+        if pending:  # 未送信確認済みの鍵のASINは、新しい別キーの計画に入れない（既存の鍵で再試行する）
+            n_before = len(remaining)
+            remaining = [a for a in remaining if a not in pending]
+            if n_before != len(remaining) and carryover is not None:
+                carryover.append({"kind": "RETRY_PENDING_NOT_SUBMITTED", "run_id": run_id, "source_id": src.source_id, "fetch_market": fetch_market,
+                                  "direction": d, "cycle_key": ckey, "cycle_state": cycle_state, "repeat": False, "asin_count": n_before - len(remaining),
+                                  "reason": "NOT_SUBMITTED_RETRY", "later_run_id": None})
         withdrawn_asins = _withdrawn_asins(states, src.source_id, fetch_market, d, ckey, file_cache) if newly_released else set()
         new_part = [a for a in remaining if a not in earlier]
         repeat_part = [a for a in remaining if a in earlier]
@@ -242,7 +265,7 @@ def build_items(app: SessionFactory, fetch_market: str, run_id: int, *, out_dir:
             parent = {"id": split_parent_id(run_id, d, is_repeat, part[0]), "run_id": run_id, "direction": d, "repeat": is_repeat,
                       "parent_asin_count": len(part), "chunk_count": len(chunks_d), "held_asin_count": len(held)}
             items_d, files_d = _items_for(d, planned, chunks_d, is_repeat, run_id, fetch_market, src, key_name, run, partial, partial_reason, asins, raw, paths,
-                                          dpaths, best, directions, prior, out_dir, ckey, len(asins) - len(remaining), fetched_from, also_from,
+                                          dpaths, best, directions, prior, out_dir, ckey, excluded_same, fetched_from, also_from,
                                           carried_runs, parent)
             items += items_d
             files += files_d
@@ -257,6 +280,7 @@ CARRYOVER_REASON_TEXT = {
     "OPEN": "周期が未終了(OPEN)で、続きの取得を待つ", "FLUSH_WAITING": "続きの取得を待つ時間の途中", "DEFERRED_TO_LATER_RUN": "後続runの入力に含まれる",
     "FAILED_RUN_NOT_ALLOWED": "失敗runの保存分で、設定(skip_failures)が許さないため入力にしない",
     "PLAN_WITHDRAWN": "取り下げ済みの計画のASIN。自動では再計画しない",
+    "NOT_SUBMITTED_RETRY": "未送信と確認済みの投入鍵のASIN。既存の鍵で再試行する（別キーで再計画しない）",
 }
 
 

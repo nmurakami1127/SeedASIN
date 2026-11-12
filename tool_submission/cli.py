@@ -613,11 +613,14 @@ def _cmd_audit_coverage(a: argparse.Namespace) -> int:
     from tool_submission import coverage_audit
 
     markets = ["US", "JP"] if a.market == "both" else [a.market]
-    rep = coverage_audit.audit(SessionFactory.for_app_role(), _ledger(a), markets)
+    rep = coverage_audit.audit(SessionFactory.for_app_role(), _ledger(a), markets, batch_target=a.batch_target, flush=a.flush,
+                               skip_failures=a.skip_failures, base_dirs=[Path(x) for x in (a.input_base or [])])
+    states = tuple(x.strip().upper() for x in a.state.split(",")) if a.state else ()
     if a.json:
+        rep = {**rep, "rows": [r for r in rep["rows"] if r["total"] >= a.min_asins and (not states or (r["cycle_state"] or "LEGACY") in states)]}
         print(json.dumps(rep, ensure_ascii=False, indent=2, default=list))
     else:
-        print("\n".join(coverage_audit.format_report(rep, only_gaps=a.only_gaps, min_asins=a.min_asins, detail=a.detail)))
+        print("\n".join(coverage_audit.format_report(rep, only_gaps=a.only_gaps, min_asins=a.min_asins, detail=a.detail, states=states)))
     return 0 if rep["identity_ok"] else 1
 
 
@@ -637,6 +640,11 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--min-asins", type=int, default=0, help="周期のASIN数がこの件数以上の周期だけ表示する（例: 5001で5,000件超のみ）")
     sp.add_argument("--detail", action="store_true", help="分割の親（取得run・分割親id）ごとの入力数・ASIN数・状態を表示する")
     sp.add_argument("--json", action="store_true")
+    sp.add_argument("--state", default=None, help="周期の状態で絞る（カンマ区切り。例: OPEN,BROKEN。旧方式はLEGACY）")
+    sp.add_argument("--batch-target", type=int, default=5000, help="ドライラン計算の前提（本番設定のbatch_target_asins。既定5000）")
+    sp.add_argument("--flush", action="store_true", help="（前提の記録用）flush有効・猶予経過を仮定した場合の数は would_plan_flush に常に出る")
+    sp.add_argument("--skip-failures", action="store_true", help="ドライラン計算の前提: 本番設定のskip_failures=true（失敗runの保存分も入力にする）")
+    sp.add_argument("--input-base", action="append", default=None, help="入力ファイルの相対パスを探す基準フォルダー（複数可。既定は台帳のフォルダーとその親・カレント）")
 
     sp = add("abandon", _cmd_abandon, "結果不明の投入の追跡を取り下げる（外部ジョブの取消ではない）")
     sp.add_argument("--key", required=True)

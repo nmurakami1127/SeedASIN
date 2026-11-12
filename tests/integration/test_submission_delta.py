@@ -89,12 +89,14 @@ def test_same_cycle_asins_already_submitted_reserved_or_unknown_are_removed_but_
     items, files = build_items(app_role_factory, "US", run2, out_dir=tmp_path / "out", direction_override="EXPORT", ledger=ledger)
     assert ids(items) == [(False, 4)] and items[0].same_cycle_excluded == 2
     assert not set(shared) & set(files[0].decode().split())
-    # 3) 送信されていないと確認できたもの(NOT_SUBMITTED)は予約から外れ、再び対象になる
+    # 3) 送信されていないと確認できたもの(NOT_SUBMITTED)は、既存の鍵で再試行する（意図: 未送信なので送ってよい）。新しい別キーの計画には入れない
+    #    （入れると同じASINが二重に登録される。#104。再試行は既存の retry / grant_retry の流れ）
     phantom(ledger, tmp_path, "k_notsent", run_id=999003, source_id=src.source_id, source_key="X", cycle_key=ck, asins=[run2_asins[2]], events=("SUBMIT_STARTED", "NOT_SUBMITTED_VERIFIED"))
     items, files = build_items(app_role_factory, "US", run2, out_dir=tmp_path / "out", direction_override="EXPORT", ledger=ledger)
-    assert ids(items) == [(False, 4)]
+    assert ids(items) == [(False, 3)]
     text_ = files[0].decode()
-    assert run2_asins[2] in text_ and not set(shared) & set(text_.split())
+    assert run2_asins[2] not in text_ and not set(shared) & set(text_.split())
+    assert ledger.state("k_notsent").state == "NOT_SUBMITTED"  # 既存の鍵は未送信のまま残り、再試行の対象（UNREGISTERED_STATES / ACTIONABLE）
     # 同じrun自身の計画は自分自身を除外しない（再計画しても同じキー）
     write_plan(items, files, ledger)
     again, _ = build_items(app_role_factory, "US", run2, out_dir=tmp_path / "out", direction_override="EXPORT", ledger=ledger)
@@ -322,8 +324,9 @@ def test_carried_asins_already_submitted_reserved_or_unknown_are_never_sent_twic
     new_asins = [a for i, f in zip(items, files) if not i.repeat_of_earlier_cycle for a in f.decode().split()]
     repeat_asins = [a for i, f in zip(items, files) if i.repeat_of_earlier_cycle for a in f.decode().split()]
     assert not set(carried[0:3]) & set(new_asins + repeat_asins)  # 投入済み・予約済み・結果不明は送らない
-    assert carried[3] in new_asins and carried[5] in new_asins  # 未送信と確認済み・別の出典のASINは対象
+    assert carried[3] not in new_asins + repeat_asins  # 未送信と確認済みは、既存の鍵(k_notsent)で再試行する。別キーでは再計画しない（二重登録の防止。#104）
+    assert carried[5] in new_asins  # 別の出典のASINは対象
     assert repeat_asins == [carried[4]]  # 過去の一巡で投入済みは別の入力（黙って再送しない）
     assert new_items[0].carried_from_runs == [c2.run_id] and new_items[0].same_cycle_excluded == 3
     assert any(a["source_id"] == other.source_id for a in new_items[0].also_from)
-    assert sorted(new_asins + repeat_asins + carried[0:3]) == sorted(carried + pages[3])  # 欠落なし
+    assert sorted(new_asins + repeat_asins + carried[0:3] + carried[3:4]) == sorted(carried + pages[3])  # 欠落なし（未送信確認済みは既存の鍵の側）

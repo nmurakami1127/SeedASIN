@@ -153,3 +153,24 @@ def test_expand_reports_the_carryover_count_and_reason(monkeypatch):
     t = _expand(eng, "acquire")
     assert t.result["carryover_asins"] == 2300 and t.result["carryover"][0]["reason"] == "OPEN"
     assert "持ち越し2,300件（" in t.detail and "OPEN" in t.detail
+
+
+# ---------------------------------------------------------------- audit-coverage: Windows・Linuxのパス
+
+@pytest.mark.parametrize("raw", [
+    "exports\\tool_submission\\inputs\\a.csv",                       # Windowsの相対（バックスラッシュ）
+    "exports/tool_submission/inputs/a.csv",                          # Linux/スラッシュの相対
+    "C:\\Users\\someone\\SeedASIN\\exports\\tool_submission\\inputs\\a.csv",   # 別環境（Windows）の絶対パス
+    "inputs\\a.csv",                                                 # 台帳のフォルダー基準の相対
+])
+def test_resolve_input_path_reads_windows_and_linux_paths(tmp_path, raw):
+    base = tmp_path / "repo" / "exports" / "tool_submission"
+    (base / "inputs").mkdir(parents=True)
+    f = base / "inputs" / "a.csv"
+    f.write_text("\ufeffB000000001\nB000000002\n", encoding="utf-8")
+    got = coverage_audit.resolve_input_path(raw, [base, base.parent, tmp_path / "repo"])
+    assert got is not None and got.samefile(f)
+    cache: dict = {}
+    assert coverage_audit._read_input(raw, [base, base.parent, tmp_path / "repo"], cache) == ["B000000001", "B000000002"]  # BOM付きも読める
+    assert coverage_audit.resolve_input_path("missing\\x.csv", [base]) is None
+    assert coverage_audit.resolve_input_path("", [base]) is None
