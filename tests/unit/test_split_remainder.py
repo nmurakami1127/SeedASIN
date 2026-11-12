@@ -136,24 +136,7 @@ def test_write_plan_is_idempotent_for_split_inputs(tmp_path):
     assert all(s.manifest["split_parent"]["id"] == "p" for s in st.values())
 
 
-# ---------------------------------------------------------------- workflow: 持ち越しを結果・ログに出す
-
-def test_expand_reports_the_carryover_count_and_reason(monkeypatch):
-    from tests.unit.test_workflow_extra_origin import _engine_for_expand, _expand, _item, cfg_with
-    import workflow.engine as E
-
-    cfg = cfg_with(US={"origin_import": 1})
-    eng, _ = _engine_for_expand(monkeypatch, cfg, [_item("k-exp", "EXPORT", [1])])
-
-    def fake_build(*a, carryover=None, **k):
-        carryover.append({"kind": "HELD_REMAINDER", "reason": "OPEN", "asin_count": 2300, "run_id": 100, "cycle_state": "OPEN"})
-        return [_item("k-exp", "EXPORT", [1])], [b"x"]
-
-    monkeypatch.setattr(E, "build_items", fake_build)
-    t = _expand(eng, "acquire")
-    assert t.result["carryover_asins"] == 2300 and t.result["carryover"][0]["reason"] == "OPEN"
-    assert "持ち越し2,300件（" in t.detail and "OPEN" in t.detail
-
+# （workflow._run_expand の持ち越し報告のテストは、_run_expandがプール方式（#106）になり持ち越しが無くなったため削除。時間待ちの報告は tests/integration/test_pool_registration.py）
 
 # ---------------------------------------------------------------- audit-coverage: Windows・Linuxのパス
 

@@ -34,7 +34,7 @@ RUNNING_STATUSES = ("RUNNING", "CAPTCHA_WAIT")
 REASON_LABELS = {
     "register": "登録対象", "registered_same_source": "台帳の同じ出典・方向で登録済み", "not_submitted": "未送信確認済みの鍵（既存の鍵で再試行）",
     "withdrawn": "取り下げ済み（復活させない）", "invalid_format": "形式不正", "source_excluded": "除外出典", "no_direction": "方向なし",
-    "no_lane_path": "レーン経路なし", "time_wait": "時間待ち", "error": "処理失敗（この出典・方向のみ）",
+    "no_lane_path": "レーン経路なし", "history_same_source_direction": "統合ツール取込済み履歴に同じ出典・同じ方向で既にある", "time_wait": "時間待ち", "error": "処理失敗（この出典・方向のみ）",
 }
 REASONS = tuple(REASON_LABELS)
 
@@ -54,13 +54,17 @@ def _aware(t):
     return t if t is None or t.tzinfo else t.replace(tzinfo=timezone.utc)
 
 
-def _run_time(r, now: datetime) -> datetime:
+def _run_time(r, now: datetime, stale_minutes: int = 0) -> datetime:
+    """RUNNING/CAPTCHA_WAITは現在扱い。ただしstarted_atからstale_minutes分以上たったものは（異常終了の残りとみなし）started_atを時刻にする。DBは書き換えない。"""
     if r["status"] in RUNNING_STATUSES:
+        started = _aware(r["started_at"])
+        if stale_minutes > 0 and started is not None and now - started >= timedelta(minutes=stale_minutes):
+            return started
         return now
     return _aware(r["completed_at"] or r["started_at"]) or now
 
 
-def gather(factory, markets: list[str]) -> dict:
+def gather(factory, markets: list[str], sources: set[int] | None = None) -> dict:
     """DBを読み取る（SELECTのみ）。{市場: {"rows": [(asin, run_id, source_id)...](collector_asin.id順), "runs": {run_id: {...}}, "sources", "paths"}} と
     marketplaceに依存しないblocked（セラーID(大文字) -> reason）。"""
     out: dict = {}
@@ -70,7 +74,8 @@ def gather(factory, markets: list[str]) -> dict:
             rows, runs = [], {}
             for r in conn.execute(text(
                     "SELECT ca.asin, r.id, r.source_id, r.status, r.outcome, r.started_at, r.completed_at, r.pages_fetched "
-                    "FROM collector_asin ca JOIN collector_run r ON r.id = ca.collector_run_id WHERE r.source_id IS NOT NULL ORDER BY ca.id")):
+                    "FROM collector_asin ca JOIN collector_run r ON r.id = ca.collector_run_id WHERE r.source_id IS NOT NULL "
+                    "AND (CAST(:s AS bigint[]) IS NULL OR r.source_id = ANY(CAST(:s AS bigint[]))) ORDER BY ca.id"), {"s": sorted(sources) if sources else None}):
                 rows.append((str(r[0]).strip().upper(), r[1], r[2]))
                 runs.setdefault(r[1], {"status": r[3], "outcome": r[4], "started_at": r[5], "completed_at": r[6], "pages_fetched": r[7]})
             sources = {r.source_id: r for r in conn.execute(text("SELECT source_id, source_type, key_primary, display_primary, status FROM acquisition_source"))}
@@ -117,6 +122,23 @@ def _ledger_occupancy(entries, bases, cache) -> tuple[dict[str, set[str]], list[
     return occ, bad
 
 
+def _history_same_source(factory, direction: str, source_key: str, asin_list: list[str]) -> set[str]:
+    """統合ツール取込済み履歴（SELECTのみ）のうち、**同じ出典・同じ業務方向**のASIN。tool_execution_link.seller_id=出典キー（メモ「輸出_/輸入_<出典キー>」から
+    log_ingestが決めた値）かつ marketplace=その方向の業務市場（輸出=US・輸入=JP）の実行(tool_run_id)の出力(tool_output_asin。marketplaceとtool_run_idで対応)に出たASIN。
+    他の出典・他の方向の履歴は見ない（対応が確認できないものは含めない）。"""
+    out: set[str] = set()
+    if not asin_list:
+        return out
+    bm = BUSINESS_MARKET[direction]
+    with factory.get_session(bm) as conn, conn.begin():
+        for i in range(0, len(asin_list), 5000):
+            out.update(r[0] for r in conn.execute(text(
+                "SELECT DISTINCT o.asin FROM tool_output_asin o JOIN tool_execution_link l ON l.marketplace = o.marketplace AND l.tool_run_id = o.tool_run_id "
+                "WHERE o.marketplace = :m AND l.marketplace = :m AND l.seller_id = :k AND o.asin = ANY(:a)"),
+                {"m": bm, "k": source_key, "a": asin_list[i:i + 5000]}))
+    return out
+
+
 def _wait_decision(times: list[datetime], now: datetime, quiet: int, max_wait: int) -> tuple[bool, datetime | None]:
     """(計画してよいか, 待ちが終わる時刻)。未登録ASINの時刻のうち、最新からquiet分以上、または最古からmax_wait分以上で計画する。"""
     newest, oldest = max(times), min(times)
@@ -140,7 +162,7 @@ def compute(factory, cfg, ledger: SubmissionLedger, *, now: datetime | None = No
     bases = [ledger_dir, ledger_dir.parent, *(base_dirs or [])]
     imports, lanes_of = lane_imports_by_market(cfg)
     fetch_markets = list(markets or ["US", "JP"])
-    data, blocked = gather(factory, fetch_markets)
+    data, blocked = gather(factory, fetch_markets, sources)
     scopes: dict[tuple, list] = defaultdict(list)
     for key, st in ledger.all_states().items():
         m = st.manifest
@@ -212,6 +234,7 @@ def _scope(cfg, market, sid, src, direction, dirs, paths, entries, d, blocked, s
     occ, bad = _ledger_occupancy(scopes.get((market, sid, direction), []), bases, cache)
     if bad:
         raise RuntimeError(f"台帳の計画の入力ファイルを読めない（二重計画を避けて計画しない）: {bad[:3]}{'…' if len(bad) > 3 else ''}")
+    hist = _history_same_source(factory, direction, key_name, [a for a in uniq if ASIN_RE.match(a) and not any(a in v for v in occ.values())])
     elig: list[str] = []
     for a in uniq:
         if not ASIN_RE.match(a):
@@ -222,12 +245,14 @@ def _scope(cfg, market, sid, src, direction, dirs, paths, entries, d, blocked, s
             R["not_submitted"] += 1
         elif a in occ["withdrawn"]:
             R["withdrawn"] += 1
+        elif a in hist:
+            R["history_same_source_direction"] += 1
         else:
             elig.append(a)
     if not elig:
         return
     runs = d["runs"]
-    times = [_run_time(runs[first[a]], now) for a in elig]
+    times = [_run_time(runs[first[a]], now, cfg.pool_stale_run_minutes) for a in elig]
     row["newest"], row["oldest"] = max(times).isoformat(), min(times).isoformat()
     ready, until = _wait_decision(times, now, cfg.pool_quiet_minutes, cfg.pool_max_wait_minutes)
     if not ready:
@@ -237,7 +262,7 @@ def _scope(cfg, market, sid, src, direction, dirs, paths, entries, d, blocked, s
     R["register"] = len(elig)
     run_id = max(first[a] for a in elig)  # 入力に寄与した最新のrun
     rr = runs[run_id]
-    t = _run_time(rr, now)
+    t = _run_time(rr, now, cfg.pool_stale_run_minutes)
     run = SimpleNamespace(outcome=rr["outcome"] or rr["status"], completed_at=t, pages_fetched=rr["pages_fetched"], completeness=None)
     unfinished = sorted({first[a] for a in elig if not (runs[first[a]]["status"] == "COMPLETED" and runs[first[a]]["outcome"] in USABLE_OUTCOMES)})
     partial = bool(unfinished)
@@ -296,10 +321,19 @@ def write_items(entries: list[dict], ledger: SubmissionLedger) -> tuple[list[dic
     return done, skipped
 
 
-def plan_pool(factory, cfg, ledger, *, now=None, out_dir=None) -> dict:
-    """計算して台帳へPLANNEDを追記する（watch・登録ループ用）。{"report":…, "written": [...], "skipped": [...]}。"""
-    rep = compute(factory, cfg, ledger, now=now, out_dir=out_dir)
-    done, skipped = write_items(rep["items"], ledger)
+def plan_lock(cfg):
+    """計画の確定（台帳へのPLANNED追記）を、watch・登録ループ・手動plan-pool --applyの間で直列化するロック（既存のWorkflowStore.process_lock。待たない。
+    取れなければWorkflowBusy）。読み取り・dry-runにはロック不要。submission_dir配下で共通。"""
+    from workflow.store import WorkflowStore
+
+    return WorkflowStore(Path(cfg.submission_dir) / "registration").process_lock("pool_plan", "別のプール計画（watch・登録ループ・plan-pool --apply）", who="pool")
+
+
+def plan_pool(factory, cfg, ledger, *, now=None, out_dir=None, **filters) -> dict:
+    """ロックを取り、台帳を読み直して計算し、PLANNEDを追記する。{"report":…, "written": [...], "skipped": [...]}。ロックが取れなければWorkflowBusy（何も書かない）。"""
+    with plan_lock(cfg):
+        rep = compute(factory, cfg, ledger, now=now, out_dir=out_dir, **filters)
+        done, skipped = write_items(rep["items"], ledger)
     return {"report": rep, "written": done, "skipped": skipped}
 
 
@@ -307,7 +341,13 @@ def stage_pool_inputs(factory, cfg, store, ledger, *, now=None, say=print) -> tu
     """watch用: プール計画を台帳へ書き、書いた入力を登録用のworkflow状態（submit工程）にする。戻り値は (入力数, ASIN数)。"""
     from workflow.store import State, Task, now_iso
 
-    res = plan_pool(factory, cfg, ledger, now=now)
+    from workflow.store import WorkflowBusy
+
+    try:
+        res = plan_pool(factory, cfg, ledger, now=now)
+    except WorkflowBusy as exc:
+        say(f"プール登録の計画を見送り（次の周期で再実行）: {exc}")
+        return 0, 0
     by_lane: dict[str, list] = defaultdict(list)
     for e in res["written"]:
         by_lane[e["lane"]].append(e)
@@ -382,8 +422,8 @@ def write_report(rep: dict, report_dir: Path, *, applied: bool = False, extra: d
 # ------------------------------------------------------------------ pool-history-check（読み取り専用。登録経路には入れない）
 
 def history_check(factory, rep: dict) -> list[dict]:
-    """登録対象ASINのうち、統合ツールの履歴（tool_output_asin・tool_execution_link）に既にあるものの件数を出典×方向別に返す。SELECTのみ。
-    same_source=同じ出典キー(seller_id)の実行の出力に出たASIN / any_source=どの実行の出力にも出たASIN / links=その出典キーの対応記録(実行)の数。"""
+    """出典×方向別の、統合ツール履歴との重なり（SELECTのみ）。excluded_same_source=履歴に同じ出典・同じ方向で既にあるため登録対象から除いた件数（理由 history_same_source_direction。
+    定義は`_history_same_source`）／targets=残った登録対象／in_output_any_source=残った登録対象のうち他の出典の実行の出力に出ているASIN（情報のみ。除外しない）／links=その出典キーの対応記録(実行)の数。"""
     targets: dict[tuple, set] = defaultdict(set)
     keys: dict[tuple, str] = {}
     for e in rep["items"]:
@@ -392,18 +432,18 @@ def history_check(factory, rep: dict) -> list[dict]:
         targets[k].update(x.strip().upper() for x in e["content"].decode("utf-8").splitlines() if x.strip())
         keys[k] = it.source_key
     out = []
-    for (market, sid, d), asins in sorted(targets.items(), key=lambda kv: (kv[0][0], kv[0][2], kv[0][1])):
-        bm, lst = BUSINESS_MARKET[d], sorted(asins)
-        same: set = set()
-        anyw: set = set()
-        with factory.get_session(bm) as conn, conn.begin():
-            for i in range(0, len(lst), 5000):
-                part = lst[i:i + 5000]
-                same.update(r[0] for r in conn.execute(text(
-                    "SELECT DISTINCT o.asin FROM tool_output_asin o JOIN tool_execution_link l ON l.marketplace = o.marketplace AND l.tool_run_id = o.tool_run_id "
-                    "WHERE o.asin = ANY(:a) AND l.seller_id = :k"), {"a": part, "k": keys[(market, sid, d)]}))
-                anyw.update(r[0] for r in conn.execute(text("SELECT DISTINCT asin FROM tool_output_asin WHERE asin = ANY(:a)"), {"a": part}))
-            links = conn.execute(text("SELECT count(*) FROM tool_execution_link WHERE seller_id = :k"), {"k": keys[(market, sid, d)]}).scalar()
-        out.append({"market": market, "source_id": sid, "source_key": keys[(market, sid, d)], "direction": d, "business_market": bm, "targets": len(lst),
-                    "in_output_same_source": len(same), "in_output_any_source": len(anyw), "source_link_count": int(links or 0)})
+    for r in sorted(rep["rows"], key=lambda r: (r["market"], r["direction"] or "", r["source_id"])):
+        ex = r["reasons"]["history_same_source_direction"]
+        k = (r["market"], r["source_id"], r["direction"])
+        if not ex and k not in targets:
+            continue
+        lst, anyw, links = sorted(targets.get(k, ())), set(), 0
+        if r["direction"]:
+            with factory.get_session(BUSINESS_MARKET[r["direction"]]) as conn, conn.begin():
+                for i in range(0, len(lst), 5000):
+                    anyw.update(x[0] for x in conn.execute(text("SELECT DISTINCT asin FROM tool_output_asin WHERE asin = ANY(:a)"), {"a": lst[i:i + 5000]}))
+                links = conn.execute(text("SELECT count(*) FROM tool_execution_link WHERE seller_id = :k"), {"k": r["source_key"]}).scalar() or 0
+        out.append({"market": r["market"], "source_id": r["source_id"], "source_key": r["source_key"], "direction": r["direction"],
+                    "business_market": BUSINESS_MARKET.get(r["direction"]), "excluded_same_source": ex, "targets": len(lst),
+                    "in_output_any_source": len(anyw), "source_link_count": int(links)})
     return out

@@ -176,6 +176,7 @@ class WorkflowConfig:
     # pool_quiet_minutes分が過ぎた（追加が落ち着いた）か、最古の保存から pool_max_wait_minutes分が過ぎたら計画する。0=その待ちを使わない（quietが0なら待たない）
     pool_quiet_minutes: int = 30
     pool_max_wait_minutes: int = 360
+    pool_stale_run_minutes: int = 720  # RUNNING/CAPTCHA_WAITのrunがstarted_atからこの分数更新されなければ、そのASINの時刻をstarted_atとみなす（異常終了の残り。0=無効=常に現在扱い）
 
     def to_dict(self) -> dict:
         d = asdict(self)
@@ -191,6 +192,8 @@ class WorkflowConfig:
             d.pop("pool_quiet_minutes", None)
         if d.get("pool_max_wait_minutes") == 360:
             d.pop("pool_max_wait_minutes", None)
+        if d.get("pool_stale_run_minutes") == 720:
+            d.pop("pool_stale_run_minutes", None)
         if d.get("auto_registration") == asdict(AutoRegistration()):
             d.pop("auto_registration", None)
         return d
@@ -321,7 +324,7 @@ class WorkflowConfig:
             raise ConfigError(f"flush_min_age_minutes は0〜1440（分）の整数で指定してください（指定: {self.flush_min_age_minutes!r}）")
         if self.flush_unfilled_batches and not self.batch_target_asins:
             raise ConfigError("flush_unfilled_batches=true には batch_target_asins>0 が必要です（端数は蓄積方式の中でだけ扱います）")
-        for name in ("pool_quiet_minutes", "pool_max_wait_minutes"):
+        for name in ("pool_quiet_minutes", "pool_max_wait_minutes", "pool_stale_run_minutes"):
             v = getattr(self, name)
             if isinstance(v, bool) or not isinstance(v, int) or not 0 <= v <= 10080:
                 raise ConfigError(f"{name} は0〜10080（分）の整数で指定してください（0=その待ちを使わない。指定: {v!r}）")
@@ -386,7 +389,7 @@ def config_from_dict(d: dict) -> WorkflowConfig:
             **{k: d[k] for k in ("brand_enabled", "tool_max_asins", "result_max_age_days", "state_dir", "submission_dir",
                                  "page_revisit_days", "profile", "listing_feedback", "skip_failures", "batch_target_asins",
                                  "submission_enabled", "tool_session_monitor", "close_on_repeated_page", "flush_unfilled_batches",
-                                 "flush_min_age_minutes", "pool_quiet_minutes", "pool_max_wait_minutes") if k in d},
+                                 "flush_min_age_minutes", "pool_quiet_minutes", "pool_max_wait_minutes", "pool_stale_run_minutes") if k in d},
         )
     except TypeError as exc:
         raise ConfigError(f"設定に未知の項目があります: {exc}") from exc

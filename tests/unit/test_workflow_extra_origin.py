@@ -209,17 +209,19 @@ def test_direction_must_have_a_path_from_one_of_the_lane_imports():
     assert has_lane_path([imp, exp], "EXPORT", [1, 2]) and has_lane_path([imp, exp], "IMPORT", [1, 2])
 
 
-def _engine_for_expand(monkeypatch, cfg, items, reports=REPORTS):
-    import workflow.engine as E
+def _engine_for_expand(monkeypatch, cfg, items, reports=REPORTS, errors=()):
+    """_run_expandは、プール方式の計画（tool_submission/pool.plan_pool。#106）が返した入力からsubmit工程を作る。レーンのimportによる方向の判定はpool側
+    （tests/integration/test_pool_registration.py）で確認するので、ここではplan_poolを差し替える。"""
+    import tool_submission.pool as P
 
     eng = Engine.__new__(Engine)
     eng.cfg, eng.reports, eng.factory, eng.ledger = cfg, reports, object(), object()
     eng.now = lambda: AS_OF
     eng.store = SimpleNamespace(save=lambda st: None)
     eng.st = State("wf-x", "now", {}, "h")
-    written = []
-    monkeypatch.setattr(E, "build_items", lambda *a, **k: (items, [b"x"] * len(items)))
-    monkeypatch.setattr(E, "write_plan", lambda its, files, ledger: written.extend(its))
+    written = list(items)
+    rep = {"errors": list(errors), "rows": []}
+    monkeypatch.setattr(P, "plan_pool", lambda *a, **k: {"report": rep, "written": [{"item": i, "content": b"x", "lane": "US"} for i in items], "skipped": []})
     return eng, written
 
 
@@ -237,28 +239,19 @@ def _expand(eng, acq_kind):
     return t
 
 
-def test_expand_keeps_only_directions_with_a_path_from_the_lane_imports(monkeypatch):
+def test_expand_creates_submit_tasks_from_the_pool_plan_keeping_direction_and_memo(monkeypatch):
     cfg = cfg_with(US={"origin_import": 1, "extra_origin_imports": [2]})
-    items = [_item("k-imp", "IMPORT", [2]), _item("k-exp-other", "EXPORT", [9])]
-    eng, written = _engine_for_expand(monkeypatch, cfg, items)
+    eng, written = _engine_for_expand(monkeypatch, cfg, [_item("k-imp", "IMPORT", [2])])
     t = _expand(eng, "acquire")
-    assert t.result["keys"] == ["k-imp"] and [i.key for i in written] == ["k-imp"]
+    assert t.result["keys"] == ["k-imp"]
     sub = eng.st.tasks["submit:k-imp"].result
     assert (sub["direction"], sub["business_market"], sub["memo"]) == ("IMPORT", "JP", "IMPORT_memo")  # IMPORTの出典はIMPORTのまま
-    assert [s["direction"] for s in t.result["skipped"]] == ["EXPORT"] and "経路が無い方向" in t.result["skipped"][0]["reason"]
 
 
-def test_without_extra_an_import_derived_item_is_still_skipped(monkeypatch):
-    eng, written = _engine_for_expand(monkeypatch, cfg_with(US={"origin_import": 1}), [_item("k-imp", "IMPORT", [2])])
+def test_expand_reports_the_pool_errors_of_a_source_as_skipped_and_still_succeeds(monkeypatch):
+    eng, written = _engine_for_expand(monkeypatch, cfg_with(US={"origin_import": 1}), [], errors=[{"market": "US", "source_id": 11, "direction": "IMPORT", "error": "x"}])
     t = _expand(eng, "acquire")
-    assert t.result["keys"] == [] and written == [] and len(t.result["skipped"]) == 1
-
-
-def test_extra_is_not_used_for_the_cross_acquire_results(monkeypatch):
-    cfg = cfg_with(US={"origin_import": 1, "extra_origin_imports": [2]})
-    eng, written = _engine_for_expand(monkeypatch, cfg, [_item("k-imp", "IMPORT", [2]), _item("k-exp", "EXPORT", [1])])
-    t = _expand(eng, "acquire_x")                      # crossで発見した反対側の出典: 従来どおり origin_import だけ
-    assert t.result["keys"] == ["k-exp"]
+    assert t.status == "DONE" and t.result["keys"] == [] and [s["reason"] for s in t.result["skipped"]] == ["x"] and "見送り1件" in t.detail
 
 
 # ---------------------------------------------------------------- (e) 不正なextraの拒否と他市場への非波及

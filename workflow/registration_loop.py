@@ -48,7 +48,13 @@ def _plan_pool(cfg, factory, ledger, now, say=print) -> tuple[int, int]:
     """保存済みの未登録ASINを台帳へPLANNEDとして追記する（workflowの状態は作らない）。出典・方向ごとの失敗は他を止めず、通知する。"""
     from tool_submission.pool import plan_pool
 
-    res = plan_pool(factory, cfg, ledger, now=now)
+    from workflow.store import WorkflowBusy
+
+    try:
+        res = plan_pool(factory, cfg, ledger, now=now)
+    except WorkflowBusy as exc:  # 他の計画処理が実行中。待たずに見送り、次の周期で再実行する
+        say(f"プール登録の計画を見送り（次の周期で再実行）: {exc}")
+        return 0, 0
     for r in res["report"]["errors"]:
         say(f"プール登録の計画を見送り: {r['market']} 出典{r['source_id']} {r['direction']}: {r['error']}")
     for s_ in res["skipped"]:

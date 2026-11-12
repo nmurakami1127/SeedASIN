@@ -674,10 +674,16 @@ def _cmd_plan_pool(a: argparse.Namespace, factory=None, confirm=None) -> int:
     if not confirm(f"台帳へ新しい入力{n}件（{sum(e['item'].asin_count for e in rep['items']):,} ASIN）をPLANNEDとして追記します（送信はしません）。よろしいですか [y/N] "):
         print("確認が取れなかったので何も変更していません")
         return 2
-    rep = pool.compute(factory, cfg, ledger, now=rep["now"], out_dir=Path(a.out_dir) if a.out_dir else None, markets=rep["params"]["markets"],
-                       directions=set(rep["params"]["directions"] or []) or None, sources=set(rep["params"]["sources"] or []) or None,
-                       base_dirs=[Path(x) for x in (a.input_base or [])])  # 確認の間に台帳が変わっていても、最新の状態で計画する
-    done, skipped = pool.write_items(rep["items"], ledger)
+    from workflow.store import WorkflowBusy
+
+    try:  # 計画の確定はロックを取り、台帳を読み直してから追記する（watch・登録ループとの二重計画を防ぐ）
+        res = pool.plan_pool(factory, cfg, ledger, now=rep["now"], out_dir=Path(a.out_dir) if a.out_dir else None, markets=rep["params"]["markets"],
+                             directions=set(rep["params"]["directions"] or []) or None, sources=set(rep["params"]["sources"] or []) or None,
+                             base_dirs=[Path(x) for x in (a.input_base or [])])
+    except WorkflowBusy as exc:
+        print(f"[中止] 他の計画処理（watch・登録ループ・別のplan-pool --apply）が実行中のため、何も書いていません: {exc}")
+        return 2
+    rep, done, skipped = res["report"], res["written"], res["skipped"]
     print(f"台帳へ追記しました: 入力{len(done)}件・{sum(e['item'].asin_count for e in done):,} ASIN（送信はしていません）")
     for s_ in skipped:
         print(f"  書かなかった: {s_['key']}: {s_['reason']}")
@@ -692,13 +698,13 @@ def _cmd_pool_history_check(a: argparse.Namespace, factory=None) -> int:
     rows = pool.history_check(factory, rep)
     print("pool-history-check: 登録対象ASINと統合ツール履歴の重なり（読み取り専用。登録経路には使いません）")
     for r in rows:
-        print(f"  {r['market']} 出典{r['source_id']}({str(r['source_key'])[:24]}) {r['direction']}（業務市場{r['business_market']}）: 登録対象{r['targets']:,}"
-              f" ／同じ出典キーの実行の出力に既にある{r['in_output_same_source']:,} ／どの実行の出力にも既にある{r['in_output_any_source']:,}"
+        print(f"  {r['market']} 出典{r['source_id']}({str(r['source_key'])[:24]}) {r['direction']}（業務市場{r['business_market']}）: 履歴に同じ出典・方向で既にあり除外{r['excluded_same_source']:,}"
+              f" ／残った登録対象{r['targets']:,} ／うち他の出典の実行の出力にある{r['in_output_any_source']:,}（除外しない）"
               f" ／この出典キーの対応記録（実行）{r['source_link_count']}件")
     if not rows:
         print("  登録対象なし")
     else:
-        print(f"  合計: 登録対象{sum(r['targets'] for r in rows):,} ／同じ出典キーで既に{sum(r['in_output_same_source'] for r in rows):,} ／どの実行にも既に{sum(r['in_output_any_source'] for r in rows):,}")
+        print(f"  合計: 履歴で除外{sum(r['excluded_same_source'] for r in rows):,} ／残った登録対象{sum(r['targets'] for r in rows):,} ／うち他の出典の履歴にもある{sum(r['in_output_any_source'] for r in rows):,}")
     return 0
 
 

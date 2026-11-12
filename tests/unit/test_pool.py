@@ -34,7 +34,11 @@ def test_wait_decision(times, quiet, max_wait, ready):
 
 def test_config_defaults_do_not_change_the_snapshot_hash_and_are_validated():
     cfg = config_from_dict(BASE)
-    assert (cfg.pool_quiet_minutes, cfg.pool_max_wait_minutes) == (30, 360)
+    assert (cfg.pool_quiet_minutes, cfg.pool_max_wait_minutes, cfg.pool_stale_run_minutes) == (30, 360, 720)
+    assert "pool_stale_run_minutes" not in cfg.to_dict()
+    assert config_from_dict({**BASE, "pool_stale_run_minutes": 0}).to_dict()["pool_stale_run_minutes"] == 0
+    with pytest.raises(ConfigError):
+        config_from_dict({**BASE, "pool_stale_run_minutes": -5})
     assert "pool_quiet_minutes" not in cfg.to_dict() and "pool_max_wait_minutes" not in cfg.to_dict()  # 既定は出さない（従来のsha256と同一）
     c2 = config_from_dict({**BASE, "pool_quiet_minutes": 0, "pool_max_wait_minutes": 0})
     assert c2.to_dict()["pool_quiet_minutes"] == 0 and c2.sha256() != cfg.sha256()

@@ -424,18 +424,164 @@ def test_cli_plan_pool_dry_run_writes_nothing_and_apply_needs_confirmation(env, 
     assert list((tmp_path / "rep").glob("pool_apply_*.json"))
 
 
-def test_pool_history_check_counts_targets_already_in_tool_output_history(env):
+HIST = "history_same_source_direction"
+
+
+def key_of(env, sid, market="US") -> str:
+    with env.f.get_session(market) as conn, conn.begin():
+        return conn.execute(text("SELECT key_primary FROM acquisition_source WHERE source_id = :s"), {"s": sid}).scalar_one()
+
+
+def put_history(f, *, link_market: str | None, out_market: str | None, seller: str, tool_run: str, items: list[str]) -> None:
+    """統合ツール履歴を直接INSERTする。link_market=None→tool_execution_linkなし（対応不明）、out_market=None→出力なし。"""
+    if link_market:
+        with f.get_session(link_market) as conn, conn.begin():
+            conn.execute(text("INSERT INTO tool_execution_link (marketplace, seller_id, tool_run_id, source) VALUES (:m, :k, :t, NULL)"),
+                         {"m": link_market, "k": seller, "t": tool_run})
+    if out_market:
+        with f.get_session(out_market) as conn, conn.begin():
+            conn.execute(text("INSERT INTO tool_output_asin (marketplace, tool_run_id, asin, acquired_at) VALUES (:m, :t, :a, now())"),
+                         [{"m": out_market, "t": tool_run, "a": a} for a in items])
+
+
+def test_tool_history_excludes_only_the_same_source_and_the_same_direction_with_a_confirmed_correspondence(env):
+    a, b = env.source(export=True, import_=True), env.source()
+    ga = asins("H1", 12)
+    insert_run(env.f, "US", a, ga)
+    insert_run(env.f, "US", b, ga[:2])  # 別の出典bにも同じASIN（bの履歴は無い）
+    ka = key_of(env, a)
+    u = lambda n: f"T-{uuid.uuid4().hex[:6]}-{n}"  # noqa: E731
+    put_history(env.f, link_market="US", out_market="US", seller=ka, tool_run=u(1), items=ga[0:3])  # 同じ出典・EXPORT（輸出=US）→ EXPORTだけ除外
+    put_history(env.f, link_market="JP", out_market="JP", seller=ka, tool_run=u(2), items=ga[3:5])  # 同じ出典・IMPORT（輸入=JP）→ IMPORTだけ除外
+    put_history(env.f, link_market="US", out_market="US", seller="OTHER" + ka, tool_run=u(3), items=ga[5:7])  # 他の出典の履歴 → 除外しない
+    put_history(env.f, link_market=None, out_market="US", seller=ka, tool_run=u(4), items=ga[7:9])  # 出力だけで対応（link）が無い → 除外しない
+    t5 = u(5)
+    put_history(env.f, link_market="JP", out_market=None, seller=ka, tool_run=t5, items=[])
+    put_history(env.f, link_market=None, out_market="US", seller=ka, tool_run=t5, items=ga[9:11])  # linkのmarketplaceが出力と違う → 対応を確認できない → 除外しない
+    rep = env.compute()
+    ok(rep)
+    ex, im = row_of(rep, a, "EXPORT"), row_of(rep, a, "IMPORT")
+    assert (ex["reasons"][HIST], ex["reasons"]["register"]) == (3, 9)
+    assert (im["reasons"][HIST], im["reasons"]["register"]) == (2, 10)
+    assert listed(rep, a).count(ga[0]) == 1 and ga[0] not in [x for e in rep["items"] if e["item"].direction == "EXPORT" and e["item"].source_id == a
+                                                              for x in e["content"].decode().split()]
+    assert row_of(rep, b)["reasons"][HIST] == 0 and row_of(rep, b)["reasons"]["register"] == 2  # 他の出典bは、aの履歴では除外されない
+    assert any("履歴" in x for x in pool.format_report(rep))
+    # pool-history-check: 除外件数と、残った登録対象のうち他の出典の履歴にもあるASIN
+    rows = {(r["source_id"], r["direction"]): r for r in pool.history_check(env.f, rep)}
+    assert (rows[(a, "EXPORT")]["excluded_same_source"], rows[(a, "EXPORT")]["targets"]) == (3, 9)
+    assert rows[(a, "EXPORT")]["in_output_any_source"] == 6 and rows[(a, "EXPORT")]["source_link_count"] >= 1  # ga[5:11]は他の出典・対応不明の出力にある（情報のみ）
+    assert not env.ledger.path.exists()  # 読み取り専用
+
+
+def test_run_expand_plans_through_the_pool_for_the_fetched_sources_only(env, monkeypatch):
+    from types import SimpleNamespace
+
+    from workflow.engine import Engine
+    import tool_submission.planner as planner
+
+    monkeypatch.setattr(planner, "build_items", lambda *a, **k: pytest.fail("周期依存のbuild_itemsは呼ばれない"))
+    a, other, fresh = env.source(), env.source(), env.source()
+    ra = insert_run(env.f, "US", a, asins("E1", 13))
+    insert_run(env.f, "US", other, asins("E2", 5))  # 取得していない別の出典は計画しない
+    rf = insert_run(env.f, "US", fresh, asins("E3", 4), minutes_ago=5)  # 取得直後 → 時間待ち
+    eng = Engine(env.f, SimpleNamespace(), env.cfg, WorkflowStore(env.cfg.state_dir), now=_now)
+    eng.new_state()
+    acq = eng.st.tasks["acquire:US"]
+    acq.status = "DONE"
+    acq.result = {"market": "US", "sources": {str(a): {"mode": "FETCHED", "run_id": ra}, str(fresh): {"mode": "REUSED", "run_id": rf}}}
+    t = eng.st.tasks["expand:US"]
+    eng._run_expand(t)
+    assert t.status == "DONE" and len(t.result["keys"]) == 1 and t.result["waiting_asins"] == 4
+    (key,) = t.result["keys"]
+    assert eng.st.tasks[f"submit:{key}"].result["asin_count"] == 13 and eng.ledger.state(key).state == "PLANNED"
+    assert {s.manifest["source_id"] for s in eng.ledger.all_states().values()} == {a}
+    eng._run_expand(t)  # 再実行で増えない
+    assert t.result["keys"] == [] and len(eng.ledger.all_states()) == 1
+    # 他の計画処理がロックを持っているときは見送る（待たない・何も書かない）
+    insert_run(env.f, "US", a, asins("E1", 3, start=50), minutes_ago=100)
+    with pool.plan_lock(env.cfg):
+        eng._run_expand(t)
+    assert t.status == "DONE" and t.result["keys"] == [] and "見送り" in t.detail and len(eng.ledger.all_states()) == 1
+
+
+def test_stale_running_runs_do_not_make_their_asins_wait_forever(app_role_factory, tmp_path):
+    def row(tag, minutes_ago, **cfg):
+        e = Env(app_role_factory, tmp_path / tag, **cfg)
+        sid = e.source()
+        insert_run(e.f, "US", sid, asins(tag[:2].upper(), 3), status="RUNNING", minutes_ago=minutes_ago)
+        rep = e.compute()
+        ok(rep)
+        with e.f.get_session("US") as conn, conn.begin():  # DBのrunの状態は書き換えない
+            assert conn.execute(text("SELECT status FROM collector_run WHERE source_id = :s"), {"s": sid}).scalar_one() == "RUNNING"
+        return row_of(rep, sid)["reasons"]
+
+    assert row("s1", 800)["register"] == 3  # 既定720分より古い → started_atが時刻 → max_wait(360)超で計画
+    assert row("s2", 100)["time_wait"] == 3  # 新しいRUNNINGは現在扱い
+    assert row("s3", 800, pool_stale_run_minutes=0)["time_wait"] == 3  # 0=無効=従来どおり現在扱い
+    assert row("s4", 400, pool_stale_run_minutes=300)["register"] == 3  # 設定した分数で判定
+
+
+# ------------------------------------------------------------------ 排他制御
+
+def test_concurrent_planners_never_plan_the_same_asins_twice(env):
+    import threading
+
+    from workflow.store import WorkflowBusy
+
+    sid = env.source()
+    items = asins("CC", 40)
+    insert_run(env.f, "US", sid, items)
+    start, out = threading.Barrier(6), []
+
+    def worker():
+        start.wait()
+        try:
+            out.append(len(pool.plan_pool(env.f, env.cfg, env.ledger, now=_now())["written"]))
+        except WorkflowBusy:
+            out.append("busy")
+
+    ths = [threading.Thread(target=worker) for _ in range(6)]
+    [t.start() for t in ths]
+    [t.join() for t in ths]
+    assert sum(x for x in out if isinstance(x, int)) == 1  # 計画を書いたのは1つだけ
+    states = env.ledger.all_states()
+    assert len(states) == 1 and next(iter(states.values())).manifest["asin_count"] == 40
+    assert not (env.ledger.path.parent / "registration" / "pool_plan.lock").exists()  # ロックは解放される
+
+
+def test_when_the_plan_lock_is_held_watch_and_loop_skip_and_apply_aborts_without_writing(env, tmp_path, monkeypatch, capsys):
+    from workflow import registration_loop as rl
+    from workflow.store import WorkflowBusy
+
+    sid = env.source()
+    insert_run(env.f, "US", sid, asins("LK", 7))
+    said: list[str] = []
+    cfgp = tmp_path / "wf.json"
+    cfgp.write_text(json.dumps({"lanes": {"US": {"origin_import": env.us, "extra_origin_imports": [env.jp]}, "JP": {"origin_import": env.jp}},
+                                "submission_dir": str(env.tmp / "sub")}), encoding="utf-8")
+    with pool.plan_lock(env.cfg):
+        with pytest.raises(WorkflowBusy):
+            pool.plan_pool(env.f, env.cfg, env.ledger, now=_now())
+        assert pool.stage_pool_inputs(env.f, env.cfg, WorkflowStore(env.cfg.state_dir), env.ledger, now=_now(), say=said.append) == (0, 0)
+        assert rl._plan_pool(env.cfg, env.f, env.ledger, _now(), said.append) == (0, 0)
+        assert sum("見送り" in x for x in said) == 2
+        base = ["plan-pool", "--config", str(cfgp), "--market", "US", "--now", _now().isoformat(), "--apply"]
+        assert cli_main(base, factory=env.f, confirm=lambda q: True) == 2
+        assert "[中止]" in capsys.readouterr().out
+        assert not env.ledger.path.exists()  # ロックが取れないときは何も書かない
+    # ロックが解放されれば、次の周期で計画される
+    assert rl._plan_pool(env.cfg, env.f, env.ledger, _now(), said.append) == (1, 7)
+    assert rl._plan_pool(env.cfg, env.f, env.ledger, _now(), said.append) == (0, 0)
+
+
+def test_pool_history_check_cli_reads_only(env, tmp_path, capsys):
     sid = env.source()
     g = asins("HC", 10)
     insert_run(env.f, "US", sid, g)
-    rep = env.compute()
-    key = rep["items"][0]["item"].source_key
-    with env.f.get_session("US") as conn, conn.begin():
-        conn.execute(text("INSERT INTO tool_execution_link (marketplace, seller_id, tool_run_id, source) VALUES ('US', :k, 'T-PH1', NULL)"), {"k": key})
-        conn.execute(text("INSERT INTO tool_execution_link (marketplace, seller_id, tool_run_id, source) VALUES ('US', 'OTHERSELLER', 'T-PH2', NULL)"))
-        for tr, a in (("T-PH1", g[0]), ("T-PH1", g[1]), ("T-PH2", g[2]), ("T-PH2", g[0])):
-            conn.execute(text("INSERT INTO tool_output_asin (marketplace, tool_run_id, asin, acquired_at) VALUES ('US', :t, :a, now())"), {"t": tr, "a": a})
-    (r,) = pool.history_check(env.f, rep)
-    assert (r["targets"], r["in_output_same_source"], r["in_output_any_source"], r["source_link_count"], r["business_market"]) == (10, 2, 3, 1, "US")
-    # 読み取り専用: 台帳・入力ファイルは作らない
-    assert not env.ledger.path.exists()
+    put_history(env.f, link_market="US", out_market="US", seller=key_of(env, sid), tool_run="T-HC1", items=g[:4])
+    cfgp = tmp_path / "wf.json"
+    cfgp.write_text(json.dumps({"lanes": {"US": {"origin_import": env.us}}, "submission_dir": str(env.tmp / "sub")}), encoding="utf-8")
+    assert cli_main(["pool-history-check", "--config", str(cfgp), "--market", "US", "--now", _now().isoformat()], factory=env.f) == 0
+    out = capsys.readouterr().out
+    assert "除外4" in out and "残った登録対象6" in out and not env.ledger.path.exists()

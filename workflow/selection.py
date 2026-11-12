@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from types import SimpleNamespace
 from pathlib import Path
 
 from sqlalchemy import text
@@ -19,8 +20,7 @@ from sqlalchemy import text
 from acquisition.discovery import USABLE_FETCH_OUTCOMES, build_candidates, load_own_account_ids
 from acquisition.plan import PlanError, build_plan
 from asin_collector.product_page import product_url
-from tool_submission.model import SubmissionError
-from tool_submission.planner import build_items
+from tool_submission.pool import compute as pool_compute
 from workflow.dedupe import find_duplicates
 
 SUCCESS = tuple(USABLE_FETCH_OUTCOMES)
@@ -137,19 +137,24 @@ class PendingChecker:
                 return True
             if run is None:
                 continue  # 取得間隔内/除外/保留/実行中など。今は進められないので枠を塞がない（状態が変われば次の選択で再評価される）
-            try:
-                items, _ = build_items(self.e.factory, self.pm, run["run_id"], out_dir=Path(cfg.submission_dir), max_per_input=cfg.tool_max_asins,
-                                       ledger=self.e.ledger, batch_target=cfg.batch_target_asins, flush_unfilled=cfg.flush_unfilled_batches,
-                                       flush_min_age_minutes=cfg.flush_min_age_minutes)
-            except SubmissionError:
-                continue
-            for it in items:
-                if not any(p.get("direction") == it.direction and p.get("origin_import_id") == self.ln.origin_import for p in it.paths):
-                    continue
-                st = self.e.ledger.state(it.key).state
-                if it.repeat_of_earlier_cycle and it.key not in self.e.allowed_repeat_keys():
-                    continue  # 過去の一巡で投入済みのASINの再投入は、明示許可があるまで続きとして数えない（新しいASINを待たせない）
-                if st in ACTIONABLE_STATES and not self.e.ledger.state(it.key).duplicate_withdrawn and it.key not in self._held and not find_duplicates(self.e.ledger, it):
-                    self.reasons[cand.asin] = f"出典{sid}の取得結果に未投入の計画あり"
-                    return True
+            if self._has_pending_plan(sid):
+                self.reasons[cand.asin] = f"出典{sid}の取得結果に未投入の計画あり"
+                return True
         return False
+
+    def _has_pending_plan(self, sid: int) -> bool:
+        """この出典に、これから投入できる計画があるか（読み取りのみ。プール方式 #106）: ①台帳の未送信の計画（PLANNED/NOT_SUBMITTED等。repeatは明示許可が無ければ数えない）
+        ②時間ルールを満たして今計画できる保存済みの未登録ASIN。いずれもこのレーンのレポート(import)由来の方向だけ。"""
+        cfg, led = self.e.cfg, self.e.ledger
+        for key, st in led.all_states().items():
+            m = st.manifest or {}
+            if m.get("source_id") != sid or m.get("fetch_market") != self.pm or st.state not in ACTIONABLE_STATES or st.duplicate_withdrawn or key in self._held:
+                continue
+            if not any(p.get("direction") == m.get("direction") and p.get("origin_import_id") == self.ln.origin_import for p in m.get("paths") or []):
+                continue
+            if m.get("repeat_of_earlier_cycle") and key not in self.e.allowed_repeat_keys():
+                continue
+            if st.state in ("PLANNED", "NOT_SUBMITTED", "RUN_IDENTIFIED", "MEMO_SAVED") and not find_duplicates(led, SimpleNamespace(**{k: m.get(k) for k in ("key", "input_file", "direction", "business_market")})):
+                return True
+        rep = pool_compute(self.e.factory, cfg, led, now=self.e.now(), markets=[self.pm], sources={sid})
+        return any(any(p.get("direction") == e["item"].direction and p.get("origin_import_id") == self.ln.origin_import for p in e["item"].paths) for e in rep["items"])

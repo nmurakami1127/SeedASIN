@@ -197,7 +197,8 @@ class World:
         self.tool = FakeToolPage()
         self.ports = FakePorts({"US": self.us, "JP": self.jp}, self.tool)
         d = {"lanes": {"US": {"origin_import": self.us_import}, "JP": {"origin_import": self.jp_import}},
-             "state_dir": str(tmp_path / "wf"), "submission_dir": str(tmp_path / "sub")}
+             "state_dir": str(tmp_path / "wf"), "submission_dir": str(tmp_path / "sub"),
+             "pool_quiet_minutes": 0}  # 取得直後の計画（_run_expand）が時間ルールで待たないようにする（#106。待ちの挙動はtest_pool_registration.py）
         d.update(cfg_extra or {})
         self.cfg_dict = d
         self.cfg = config_from_dict(d)

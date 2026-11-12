@@ -48,7 +48,7 @@ class Env:
         self.tool = FakeToolPage()
         self.ports = FakePorts({"US": self.routing, "JP": Routing({}, {})}, self.tool)
         self.cfg_dict = {"lanes": {"US": {"origin_import": self.import_id, **(lane_extra or {})}}, "cross": {"enabled": False},
-                         "state_dir": str(tmp_path / "wf"), "submission_dir": str(tmp_path / "sub"), **(cfg_extra or {})}
+                         "state_dir": str(tmp_path / "wf"), "submission_dir": str(tmp_path / "sub"), "pool_quiet_minutes": 0, **(cfg_extra or {})}
         self.cfg = config_from_dict(self.cfg_dict)
         self.clock = Clock()
 
@@ -200,8 +200,8 @@ def test_switching_the_import_keeps_the_source_limit_and_submission_history(app_
     assert wcli.overall(second.st) == "COMPLETED"
     assert len(env.routing.urls) == n_urls  # ページ調査・出典取得の間隔は出典/ページ単位で共有（再アクセスなし）
     assert env.tool.submits == n_tool       # 投入履歴も共有（同じrun・方向・内容は再送しない）
-    assert [t.result.get("adopted") for t in submit_tasks(second)] == [True]
-    assert {t.result["key"] for t in submit_tasks(second)} == {t.result["key"] for t in submit_tasks(first)}
+    # プール方式（#106）: 登録済みのASINは新しい計画に入らないので、2回目のworkflowには新しいsubmit工程が作られない（再送もしない）
+    assert submit_tasks(second) == [] and len(submit_tasks(first)) == 1
 
 
 # ---------------------------------------------------------------- 4. 日次上限
@@ -636,7 +636,7 @@ def test_continuation_runs_through_the_workflow_counts_overlap_pages_and_submits
     assert sel.selected == [] and len(sel.done) == 1
 
 
-def test_repeat_input_is_held_until_explicitly_allowed_while_new_asins_are_submitted_first(app_role_factory, tmp_path, own, ranked_rows):
+def test_asins_registered_in_an_earlier_cycle_are_not_replanned_and_only_the_new_asins_are_submitted(app_role_factory, tmp_path, own, ranked_rows):
     from acquisition.registry import SourceRegistry
     from tests.integration.test_submission_delta import phantom
     from tool_submission.ledger import SubmissionLedger
@@ -652,17 +652,10 @@ def test_repeat_input_is_held_until_explicitly_allowed_while_new_asins_are_submi
             events=("SUBMIT_STARTED", ("RUN_IDENTIFIED", {"tool_run_id": "7000001"}), "MEMO_SAVED", "LINKED"))  # 過去の別の一巡で、2件を投入済み
     # （結果不明の投入が残っている間は、実行IDの特定を曖昧にしないため、ASINの内容に関係なく新しい送信自体を既存の規則で保留する）
     eng = env.run()
-    subs = {t.result["repeat"]: t for t in submit_tasks(eng)}
-    assert subs[False].status == "DONE" and subs[False].result["asin_count"] == 1  # 新しい1件は、過去の2件の判断を待たずに投入される
-    assert subs[True].status == "HELD" and "重複候補" in subs[True].detail and subs[True].result["asin_count"] == 2
+    # プール方式（#106）: 過去の一巡で投入済みの2件は同じ出典・方向の占有として新しい計画に入らない（repeat計画は作らない）。新しい1件だけが投入される
+    subs = submit_tasks(eng)
+    assert len(subs) == 1 and subs[0].status == "DONE" and subs[0].result["asin_count"] == 1 and subs[0].result["repeat"] is False
     assert env.tool.submits == 1
-    key = subs[True].result["key"]
-    eng2 = env.engine()
-    eng2.st = WorkflowStore(env.cfg.state_dir).load(eng.st.workflow_id)
-    eng2.st.allow_duplicates.append(key)  # 意図した再投入として明示許可
-    eng2.prepare_resume()
-    eng2.drive()
-    assert next(t for t in submit_tasks(eng2) if t.result["repeat"]).status == "DONE" and env.tool.submits == 2
 
 
 # ---------------------------------------------------------------- 冷却は再実行可能時刻まで飛ばす／実アクセス数は日次上限を超えない／対象指定の取得

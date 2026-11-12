@@ -1733,8 +1733,22 @@ DB（`collector_asin`）に保存済みの未登録ASINを、周期に関係な�
   CLIは`python -m tool_submission.cli plan-pool`（既定dry-run・`--apply`でy/n確認の上で台帳へPLANNED追記・`--report-dir`・`--market`・`--direction`・`--source`・`--now`・`--input-base`。DBはreadonly_factory）。
   `pool-history-check`（読み取り専用・登録経路には入れない）: 登録対象のうち、既に`tool_output_asin`（同じ出典キー=seller_idの実行の出力／どの実行の出力にも）に出ているASINと、出典キーの`tool_execution_link`の件数を出典×方向別に数える。
 - 維持: AMBIGUOUS鍵（例: e085ab161e1bfcc8）は状態を変えず、占有として扱うので再送・再計画しない。repeat（repeat_of_earlier_cycle=true）のPLANNED鍵は自動復活・自動送信しない（plan-poolは変更せず、そのASINを占有として扱う。`register_saved`がrepeatをスキップする既存挙動は不変）。
-- **登録経路から外したもの**（コードは削除していない＝呼ばれなくなった）: `buffer_recovery.stage_stalled_inputs`/`plan_stalled`/`candidate_runs`（watch・登録ループからは呼ばれない。`workflow.cli flush-plan`と既存テストだけが使う）、
-  `planner.build_items`の`batch_target`/`flush_unfilled`/`carryover`（HELD_REMAINDER等）/repeat分離（`engine._run_expand`・`selection`の候補判定は従来どおり呼ぶ。下記）、`workflow/flush_plan.py`（`flush-plan`コマンド。旧方式の見積もり用）。
-  `engine._run_expand`（取得直後の同じworkflow内の計画）は今回変えていない。`batch_target_asins=0`（既定）では、その取得runの全ASINを従来どおり計画する。プールはその占有（同じ出典・方向）を除いて計画するので二重登録にはならない。
-- 既存テストの変更（期待値は変えていない）: `tests/unit/test_auto_registration.py`・`tests/integration/test_auto_registration_flow.py`の4件が、登録ループの計画関数を差し替える`monkeypatch`の名前`_plan_flush`を新しい`_plan_pool`に変えた（関数名の置換のみ。旧関数・旧CLIは残したため、他の既存テストは無変更）。
-- テスト: `tests/integration/test_pool_registration.py`（実PostgreSQL）、`tests/unit/test_pool.py`。実画面（統合ツール）への投入は確認していない。
+- 追加（同日・最終修正）:
+  - **統合ツール取込済み履歴との除外**（理由 `history_same_source_direction`）: 登録対象のうち、`tool_execution_link.seller_id = 出典キー` かつ `tool_execution_link.marketplace = その方向の業務市場`（EXPORT=輸出=US・IMPORT=輸入=JP。`tool_intake/log_ingest.py`がメモ「輸出_/輸入_<出典キー>」から決める規則）の実行(`tool_run_id`)の出力で、
+    `tool_output_asin`が**同じmarketplace・同じtool_run_id**で持つASINを除く（`pool._history_same_source`。SELECTのみ）。他の出典の履歴・他の方向の履歴・linkが無い出力・linkとmarketplaceが違う出力は対応を確認できないので除外しない。
+    恒等式・レポートに追加。`pool-history-check`は同じ定義で「除外件数／残った登録対象／うち他の出典の履歴にもある件数（情報のみ）／出典キーの実行数」を表示する。
+    注意: メモが輸出_/輸入_で始まらない純粋なキーワード検索の履歴は、marketplaceがdata-country、seller_idがメモ全文になる（log_ingestの規則）。その文字列が出典キーと完全に一致した場合だけ誤って対応する可能性があるが、実質無視できると判断した（link側にメモの接頭辞が残らないため区別できない）。
+  - **取得直後の計画（`engine._run_expand`・`selection.PendingChecker`）をプール方式に統一**: `_run_expand`は取得したその出典のみを`plan_pool`で計画し（時間ルールを通る。取得直後のASINは`pool_quiet_minutes`の間は時間待ち→watchの15分ごとのプール計画が後で計画）、計画した入力のsubmit工程を作る。
+    `selection`の「取得結果に未投入の計画あり」判定は、台帳の未送信の計画（repeatは許可が無ければ数えない）か、今プールで計画できる保存済みASINがあるかで判断する（`build_items`は使わない）。`gather`は`sources`で絞って読む。取得側（探索・取得制御・保留判定）は不変。
+  - **古いRUNNING/CAPTCHA_WAIT**（設定`pool_stale_run_minutes`、既定720=12時間、0=無効=従来どおり現在扱い）: started_atからその分数たったrunのASINは、時刻をstarted_atとみなす（max_waitで計画される）。DBのrunの状態は書き換えない。
+  - **排他制御**: 計画の確定（台帳へのPLANNED追記）は`pool.plan_pool`が`WorkflowStore.process_lock("pool_plan")`（既存の仕組み。`<submission_dir>/registration/pool_plan.lock`。PID記録・持ち主が死んでいれば奪う）を取り、**台帳を読み直して占有を判定→追記→解放**する。
+    watch・登録ループ・`_run_expand`はロックが取れなければ待たずにその周期は見送り（次の周期で再実行）、手動`plan-pool --apply`は中止（終了コード2・何も書かない）。読み取り・dry-runはロック不要。確認(y/n)の間はロックを持たない。
+- **登録経路から外したもの**（コードは削除していない＝呼ばれなくなった。死んだコード）: `buffer_recovery.stage_stalled_inputs`/`plan_stalled`/`candidate_runs`（`workflow.cli flush-plan`と既存テストだけが使う）、`workflow/flush_plan.py`（`flush-plan`コマンド）、
+  `planner.build_items`（`batch_target`/`flush_unfilled`/`carryover`/repeat分離/`candidate_runs`のACTIVE限定。`tool_submission.cli plan`コマンドと`flush-plan`と既存テストだけが使う）、`planner.summarize_carryover`/`select_for_submission`/`TERMINAL_CYCLE_STATES`の周期依存部分、
+  `coverage_audit.audit`の周期ベースの計算（読み取り専用の監査として残す）。`engine`の`build_items`/`write_plan`/`summarize_carryover`のimportは削除した。`flush_unfilled_batches`・`batch_target_asins`の設定は互換のため残るが、登録経路では使われない。
+- 既存テストの変更（期待値の変更を伴うもの。理由=repeat分離・取得直後の持ち越し・時間待ちなしの即時計画が登録経路から無くなったため）:
+  `tests/unit/test_auto_registration.py`・`tests/integration/test_auto_registration_flow.py`の4件（monkeypatch名`_plan_flush`→`_plan_pool`のみ）／
+  `tests/integration/test_workflow.py`・`test_workflow_watch.py`のベース設定に`pool_quiet_minutes: 0`（取得直後の`_run_expand`が時間待ちで計画しないと、工程の流れを見る既存テストが成り立たないため）／
+  `test_workflow_watch.py`の2件（`test_switching_the_import_…`: 登録済みASINは新しいsubmit工程を作らない、`…repeat_input_is_held…`→`…registered_in_an_earlier_cycle_are_not_replanned…`: 過去の一巡で投入済みのASINはrepeat計画にならず新しい1件だけ投入）／
+  `tests/unit/test_workflow_extra_origin.py`（`_run_expand`を`plan_pool`差し替えに。レーンのimport判定はpoolの結合テストで確認）／`tests/unit/test_split_remainder.py`（`_run_expand`の持ち越し報告のテストを削除）。
+- テスト: `tests/integration/test_pool_registration.py`（実PostgreSQL。履歴除外・_run_expand・古いRUNNING・排他を含む）、`tests/unit/test_pool.py`。実画面（統合ツール）への投入は確認していない。

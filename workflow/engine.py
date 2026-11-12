@@ -35,12 +35,11 @@ from db.session import SessionFactory
 from origin_selection.report_import import ReportImportService
 from tool_submission.evidence import ingest_one_row, link_status
 from tool_submission.ledger import SubmissionLedger
-from tool_submission.model import SubmissionError, item_from_manifest
-from tool_submission.planner import build_items, summarize_carryover, write_plan
+from tool_submission.model import item_from_manifest
 from tool_submission.recovery import escalate_if_stale, recover_unknown
 from tool_submission.runner import pending_others, submit_item
 from workflow.config import OPPOSITE, WorkflowConfig
-from workflow.lane_imports import has_lane_path, lane_origin_imports, validate_lane_imports
+from workflow.lane_imports import lane_origin_imports, validate_lane_imports
 from workflow.daily_usage import DailyUsage, jst_day, next_jst_midnight
 from workflow.selection import PendingChecker, reusable_run
 from workflow.dedupe import SUBMITTED_STATES, find_duplicates, set_hash  # noqa: F401
@@ -49,7 +48,7 @@ from workflow.source_select import engine_selection
 from workflow.progress import (
     CARRY_IN_MAX, PAUSED_PAGE_CAP, RESTART_SUBSTANTIAL_PAGES, SourceProgress, assess_restart, note_low_yield, restart_gate, resume_snapshot,
 )
-from workflow.store import DONE_STATES, State, Task, WorkflowStore, dep_blocks, now_iso, usage
+from workflow.store import DONE_STATES, State, Task, WorkflowBusy, WorkflowStore, dep_blocks, now_iso, usage
 
 SUCCESS = tuple(USABLE_FETCH_OUTCOMES)
 POLICY_CODES = ("EXCLUDED", "ON_HOLD", "TOO_RECENT", "REVIEW_LEGACY", "CYCLE_RESTART_LIMIT")  # 方針による枝のスキップ（自動で再試行しない）
@@ -848,63 +847,35 @@ class Engine:
     # ------------------------------------------------------------------ 投入計画
 
     def _run_expand(self, t: Task) -> None:
-        lane = t.lane
-        ln, _ = self._lane_info(lane)
-        acq_id = t.deps[0]
-        acq = self.st.tasks[acq_id]
+        """取得後の投入計画。周期に依存せず、取得した出典の保存済み未登録ASINを、プール方式（tool_submission/pool.py。#106）で計画する（時間ルールを通る。
+        時間待ちのASINは、watchの15分ごとのプール計画が後で計画する）。計画した入力のsubmit工程をこのworkflowに作る。"""
+        from tool_submission.pool import plan_pool
+
+        acq = self.st.tasks[t.deps[0]]
         market = acq.result.get("market")
-        made, skipped = [], []
-        carry: list[dict] = []  # 持ち越した・使えなかったASINの報告（黙って捨てない。#104）
-        for sid, rec in acq.result.get("sources", {}).items():
-            if rec["mode"] not in ("FETCHED", "REUSED", "PARTIAL_SAVED") and not (self.cfg.batch_target_asins and rec["mode"] == "EMPTY"):
-                continue
+        recs = {int(sid): rec for sid, rec in acq.result.get("sources", {}).items() if rec["mode"] in ("FETCHED", "REUSED", "PARTIAL_SAVED")}
+        made, skipped, waiting = [], [], 0
+        if recs:
             try:
-                items, files = build_items(self.factory, market, rec["run_id"], out_dir=Path(self.cfg.submission_dir),
-                                           max_per_input=self.cfg.tool_max_asins, ledger=self.ledger, batch_target=self.cfg.batch_target_asins,
-                                           allow_saved_partial=self.cfg.skip_failures, flush_unfilled=self.cfg.flush_unfilled_batches,
-                                           flush_min_age_minutes=self.cfg.flush_min_age_minutes, now=self.now(), carryover=carry)
-            except SubmissionError as exc:
-                skipped.append({"run_id": rec["run_id"], "reason": str(exc)[:200]})
-                continue
-            keep = []
-            # extraは「既存の出典の取得」(acquire)の結果にだけ使う。crossで発見した反対側の出典(acquire_x)は従来どおり origin_import だけ
-            lane_imports = lane_origin_imports(ln) if acq.kind == "acquire" else [ln.origin_import]
-            for i, f in zip(items, files):
-                if has_lane_path(i.paths, i.direction, lane_imports):
-                    keep.append((i, f))
-                else:
-                    skipped.append({"run_id": rec["run_id"], "direction": i.direction,
-                                    "reason": "このレポート(import)の経路が無い方向のため投入しません"})
-            if not keep:
-                continue
-            write_plan([k for k, _ in keep], [f for _, f in keep], self.ledger)
-            for i, _ in keep:
+                res = plan_pool(self.factory, self.cfg, self.ledger, now=self.now(), markets=[market], sources=set(recs))
+            except WorkflowBusy as exc:  # 他の計画処理が実行中。待たずに見送る（watchの次のプール計画が計画する）
+                return self._set(t, "DONE", f"投入計画は見送り（{exc}）。次のプール計画で計画します", keys=[], skipped=[])
+            rep = res["report"]
+            skipped += [{"run_id": None, "source_id": e["source_id"], "direction": e["direction"], "reason": e["error"]} for e in rep["errors"]]
+            skipped += [{"run_id": None, "reason": f"{x['key']}: {x['reason']}"} for x in res["skipped"]]
+            waiting = sum(r["reasons"]["time_wait"] for r in rep["rows"])
+            for e in res["written"]:
+                i = e["item"]
                 tid = f"submit:{i.key}"
                 if tid not in self.st.tasks:
-                    self.st.tasks[tid] = Task(tid, "submit", lane, result={
+                    self.st.tasks[tid] = Task(tid, "submit", e["lane"], result={
                         "key": i.key, "run_id": i.collector_run_id, "direction": i.direction, "memo": i.memo, "asin_count": i.asin_count,
-                        "business_market": i.business_market, "source_id": i.source_id, "reused": rec["mode"] == "REUSED",
-                        "partial": i.input_is_partial, "repeat": i.repeat_of_earlier_cycle, "excluded_same_cycle": i.same_cycle_excluded,
-                        "also_from": len(i.also_from)})
+                        "business_market": i.business_market, "source_id": i.source_id, "reused": recs[i.source_id]["mode"] == "REUSED",
+                        "partial": i.input_is_partial, "repeat": False, "excluded_same_cycle": i.same_cycle_excluded, "also_from": 0})
                 made.append(i.key)
-        flush = self.cfg.flush_unfilled_batches
-        if flush:  # 5,000件待ちの廃止（#102）: 満杯まで蓄積するのではなく、同じ一巡の続きを待つ時間(flush_min_age_minutes)だけ待つ
-            buffering = (f"（同じ一巡の続きを待機中。{self.cfg.flush_min_age_minutes}分後に端数も計画へ回します）"
-                         if self.cfg.batch_target_asins and not made else "")
-        else:
-            buffering = f"（同一出典で{self.cfg.batch_target_asins:,} ASIN単位への蓄積を継続）" if self.cfg.batch_target_asins and not made else ""
-        extra = {}
-        if buffering:  # 仕様どおりの繰り越し（計画0件）を成果として見えるようにする。蓄積中の取得run（次回以降の投入計画に入る）
-            extra["carried_forward"] = {"reason": "FLUSH_WAITING" if flush else "BATCH_TARGET_BUFFERING",
-                                        "batch_target_asins": self.cfg.batch_target_asins,
-                                        "run_ids": [rec["run_id"] for rec in acq.result.get("sources", {}).values()
-                                                    if rec["mode"] in ("FETCHED", "REUSED", "PARTIAL_SAVED") and rec.get("run_id")]}
-        held_total, held_text = summarize_carryover(carry)
-        if carry:
-            extra["carryover"] = carry
-            extra["carryover_asins"] = held_total
-        self._set(t, "DONE", f"投入計画{len(made)}件" + buffering + (f"（見送り{len(skipped)}件）" if skipped else "") + (f" {held_text}" if held_text else ""),
-                  keys=made, skipped=skipped, **extra)
+        extra = {"waiting_asins": waiting} if waiting else {}
+        self._set(t, "DONE", f"投入計画{len(made)}件" + (f"（時間待ち{waiting:,}件。プール計画が後で計画）" if waiting else "")
+                  + (f"（見送り{len(skipped)}件）" if skipped else ""), keys=made, skipped=skipped, **extra)
 
     # ------------------------------------------------------------------ 投入・メモ保存・対応記録
 
