@@ -1751,4 +1751,5 @@ DB（`collector_asin`）に保存済みの未登録ASINを、周期に関係な�
   `tests/integration/test_workflow.py`・`test_workflow_watch.py`のベース設定に`pool_quiet_minutes: 0`（取得直後の`_run_expand`が時間待ちで計画しないと、工程の流れを見る既存テストが成り立たないため）／
   `test_workflow_watch.py`の2件（`test_switching_the_import_…`: 登録済みASINは新しいsubmit工程を作らない、`…repeat_input_is_held…`→`…registered_in_an_earlier_cycle_are_not_replanned…`: 過去の一巡で投入済みのASINはrepeat計画にならず新しい1件だけ投入）／
   `tests/unit/test_workflow_extra_origin.py`（`_run_expand`を`plan_pool`差し替えに。レーンのimport判定はpoolの結合テストで確認）／`tests/unit/test_split_remainder.py`（`_run_expand`の持ち越し報告のテストを削除）。
+- **不具合修正（本番dry-runで発見）**: `pool.gather`のループ内で`sources = {…}`が引数`sources`（出典の絞り込み）を上書きし、2市場目（JP）のSQLの絞り込みに1市場目（US）の出典ID一覧が入って、JPのASINがほぼ全て欠落していた（絞り込みなしでも発生）。ローカル変数を`source_rows`に改名。回帰テストを追加（US/JP両方にASINがある状態で`sources=None`と指定ありの`gather`/`compute`）。他の関数（`_scope`・`plan_pool`・`stage_pool_inputs`・`history_check`・`_run_expand`）に引数と同名の再代入が無いことをASTで確認した。
 - テスト: `tests/integration/test_pool_registration.py`（実PostgreSQL。履歴除外・_run_expand・古いRUNNING・排他を含む）、`tests/unit/test_pool.py`。実画面（統合ツール）への投入は確認していない。

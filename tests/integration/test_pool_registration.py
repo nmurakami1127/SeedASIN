@@ -585,3 +585,21 @@ def test_pool_history_check_cli_reads_only(env, tmp_path, capsys):
     assert cli_main(["pool-history-check", "--config", str(cfgp), "--market", "US", "--now", _now().isoformat()], factory=env.f) == 0
     out = capsys.readouterr().out
     assert "除外4" in out and "残った登録対象6" in out and not env.ledger.path.exists()
+
+
+def test_gather_and_compute_return_rows_of_both_markets_with_and_without_a_source_filter(env):
+    """回帰: gatherのループ内で引数sourcesを上書きすると、2市場目のSQLの絞り込みが1市場目の出典ID一覧になり、JPのASINが欠落した。"""
+    us_src = env.source("US")
+    jp_src = env.source("JP", export=False, import_=True)
+    insert_run(env.f, "US", us_src, asins("MU", 6))
+    insert_run(env.f, "JP", jp_src, asins("MJ", 4))
+    for flt in (None, {us_src, jp_src}):
+        data, _ = pool.gather(env.f, ["US", "JP"], flt)
+        assert {r[2] for r in data["US"]["rows"] if r[0].startswith("BMU")} == {us_src} and sum(r[0].startswith("BMU") for r in data["US"]["rows"]) == 6
+        assert {r[2] for r in data["JP"]["rows"] if r[0].startswith("BMJ")} == {jp_src} and sum(r[0].startswith("BMJ") for r in data["JP"]["rows"]) == 4
+        rep = env.compute(markets=["US", "JP"], sources=flt)
+        ok(rep)
+        assert {(r["market"], r["source_id"]) for r in rep["rows"]} >= {("US", us_src), ("JP", jp_src)}
+        assert set(asins("MU", 6)) <= set(listed(rep)) and set(asins("MJ", 4)) <= set(listed(rep))
+    only_jp = pool.gather(env.f, ["US", "JP"], {jp_src})[0]
+    assert not any(r[0].startswith("BMU") for r in only_jp["US"]["rows"]) and any(r[0].startswith("BMJ") for r in only_jp["JP"]["rows"])

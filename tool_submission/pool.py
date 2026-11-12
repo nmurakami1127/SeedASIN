@@ -64,8 +64,8 @@ def _run_time(r, now: datetime, stale_minutes: int = 0) -> datetime:
     return _aware(r["completed_at"] or r["started_at"]) or now
 
 
-def gather(factory, markets: list[str], sources: set[int] | None = None) -> dict:
-    """DBを読み取る（SELECTのみ）。{市場: {"rows": [(asin, run_id, source_id)...](collector_asin.id順), "runs": {run_id: {...}}, "sources", "paths"}} と
+def gather(factory, markets: list[str], sources: set[int] | None = None) -> tuple[dict, dict]:
+    """DBを読み取る（SELECTのみ）。戻り値は (data, blocked)。引数sourcesは絞り込み用で、ループ内で再代入しない（#106）。data={市場: {"rows": [(asin, run_id, source_id)...](collector_asin.id順), "runs": {run_id: {...}}, "sources", "paths"}} と
     marketplaceに依存しないblocked（セラーID(大文字) -> reason）。"""
     out: dict = {}
     blocked: dict[str, str] = {}
@@ -78,14 +78,14 @@ def gather(factory, markets: list[str], sources: set[int] | None = None) -> dict
                     "AND (CAST(:s AS bigint[]) IS NULL OR r.source_id = ANY(CAST(:s AS bigint[]))) ORDER BY ca.id"), {"s": sorted(sources) if sources else None}):
                 rows.append((str(r[0]).strip().upper(), r[1], r[2]))
                 runs.setdefault(r[1], {"status": r[3], "outcome": r[4], "started_at": r[5], "completed_at": r[6], "pages_fetched": r[7]})
-            sources = {r.source_id: r for r in conn.execute(text("SELECT source_id, source_type, key_primary, display_primary, status FROM acquisition_source"))}
+            source_rows = {r.source_id: r for r in conn.execute(text("SELECT source_id, source_type, key_primary, display_primary, status FROM acquisition_source"))}
             paths: dict[int, list] = defaultdict(list)
             for p in conn.execute(text("SELECT source_id, stage, direction, origin_marketplace, origin_import_id, origin_asin, origin_units, via_source_id, via_asin "
                                        "FROM acquisition_path ORDER BY path_id")):
                 paths[p.source_id].append(p)
             if not blocked:
                 blocked = {str(r.seller_id).strip().upper(): r.reason for r in conn.execute(text("SELECT seller_id, reason FROM storefront_blocked_seller"))}
-        out[m] = {"rows": rows, "runs": runs, "sources": sources, "paths": paths}
+        out[m] = {"rows": rows, "runs": runs, "sources": source_rows, "paths": paths}
     return out, blocked
 
 
