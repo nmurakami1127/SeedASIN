@@ -274,10 +274,16 @@ class Watcher:
             self._buffer_recovery_after = self.now() + timedelta(minutes=15)
             from workflow.buffer_recovery import stage_stalled_inputs
             try:
+                carry: list = []
                 staged, asins = stage_stalled_inputs(self.factory, self.cfg, self.store,
-                    self._engine(self.cfg).ledger)
+                    self._engine(self.cfg).ledger, carryover_out=carry)
                 if staged:
-                    self._say(f"保存済み結果の満杯バッチ・末尾到達済み端数を投入計画へ回します: {staged}件・{asins:,} ASIN")
+                    self._say(f"保存済み結果の満杯バッチ・終了済み周期の端数を投入計画へ回します: {staged}件・{asins:,} ASIN")
+                from tool_submission.planner import summarize_carryover
+                held_total, held_text = summarize_carryover(carry)
+                if held_total and held_text != getattr(self, "_last_held_text", None):  # 15分ごとに同じ内容を繰り返さない
+                    self._last_held_text = held_text
+                    self._say("保存済み結果の" + held_text)
             except Exception as exc:
                 self._say(f"保存済み結果の投入計画に失敗: {type(exc).__name__}: {exc}")
         if self.cfg.listing_feedback:

@@ -2,6 +2,7 @@
 
     python -m tool_submission.cli plan --fetch-market US --run-id 82 [--dry-run]
     python -m tool_submission.cli ledger
+    python -m tool_submission.cli audit-coverage [--market US|JP|both] [--only-gaps] [--min-asins 5001] [--detail] [--json]   # 取得ASINの投入計画への反映を確認（読み取り専用）
     # 手動で投入する場合（画面の手順は docs/DEVIATIONS.md #60）
     python -m tool_submission.cli begin     --key <投入キー> --log-json <送信直前のログ一覧> --options-json <画面の設定値>   # 送信権の確保・送信開始の記録（SAVEの前）
     python -m tool_submission.cli reconcile --key <投入キー> --log-html <送信後に保存したログ画面.html>
@@ -607,6 +608,19 @@ def _cmd_grant_retry(a: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_audit_coverage(a: argparse.Namespace) -> int:
+    """取得ASINと投入計画の対応を確認する（読み取り専用。DB・台帳・入力ファイルに書かない。再計画もしない）。"""
+    from tool_submission import coverage_audit
+
+    markets = ["US", "JP"] if a.market == "both" else [a.market]
+    rep = coverage_audit.audit(SessionFactory.for_app_role(), _ledger(a), markets)
+    if a.json:
+        print(json.dumps(rep, ensure_ascii=False, indent=2, default=list))
+    else:
+        print("\n".join(coverage_audit.format_report(rep, only_gaps=a.only_gaps, min_asins=a.min_asins, detail=a.detail)))
+    return 0 if rep["identity_ok"] else 1
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="python -m tool_submission.cli")
     sub = p.add_subparsers(dest="command", required=True)
@@ -616,6 +630,13 @@ def build_parser() -> argparse.ArgumentParser:
         sp.add_argument("--ledger", default=None)
         sp.set_defaults(func=func)
         return sp
+
+    sp = add("audit-coverage", _cmd_audit_coverage, "取得ASINが投入計画に漏れなく入っているか確認する（読み取り専用。再計画はしない）")
+    sp.add_argument("--market", default="both", choices=["US", "JP", "both"], help="取得先市場（collector_runの市場）")
+    sp.add_argument("--only-gaps", action="store_true", help="未計画・取り下げ済みのある周期だけ表示する")
+    sp.add_argument("--min-asins", type=int, default=0, help="周期のASIN数がこの件数以上の周期だけ表示する（例: 5001で5,000件超のみ）")
+    sp.add_argument("--detail", action="store_true", help="分割の親（取得run・分割親id）ごとの入力数・ASIN数・状態を表示する")
+    sp.add_argument("--json", action="store_true")
 
     sp = add("abandon", _cmd_abandon, "結果不明の投入の追跡を取り下げる（外部ジョブの取消ではない）")
     sp.add_argument("--key", required=True)

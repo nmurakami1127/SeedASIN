@@ -35,6 +35,7 @@ class RunPlan:
     items: list = field(default_factory=list)    # build_itemsの全項目（repeat・計画済みも含む）
     files: list = field(default_factory=list)
     kept: list = field(default_factory=list)     # 今回、新しく台帳へ計画してよい項目 [(item, bytes)]
+    carryover: list = field(default_factory=list)  # build_itemsが持ち越した・使えなかったASINの報告（件数と理由。黙って捨てない。#104）
     error: str | None = None
 
 
@@ -53,7 +54,14 @@ def candidate_runs(factory, cfg, lane, *, now=None):
               AND NOT EXISTS (SELECT 1 FROM collector_run newer
                   WHERE newer.source_id=r.source_id AND newer.marketplace=r.marketplace
                     AND newer.cycle_id IS NOT DISTINCT FROM r.cycle_id
-                    AND newer.id>r.id)
+                    AND newer.id>r.id
+                    -- 後続runがあれば、そちらが最新（このrunの端数はそちらの入力に入る）。ただし、後続が使えない失敗runだけで周期がBROKENに
+                    -- 終わっている場合は、このrunが最後の使えるrun（端数を放出する。#104。失敗runの保存分は設定(skip_failures)が許すときだけ入力にする）
+                    AND (newer.status IN ('RUNNING','CAPTCHA_WAIT')
+                         OR (newer.status='COMPLETED' AND newer.outcome IN ('SUCCESS_NONEMPTY','SUCCESS_TRUNCATED','SUCCESS_EMPTY'))
+                         OR (:partial AND newer.outcome='PARTIAL' AND newer.status='FAILED')
+                         OR NOT EXISTS (SELECT 1 FROM collector_run lst WHERE lst.source_id=r.source_id AND lst.marketplace=r.marketplace
+                                          AND lst.cycle_id IS NOT DISTINCT FROM r.cycle_id AND lst.cycle_state='BROKEN' AND lst.id>r.id)))
             ORDER BY r.id
         """), {"partial": cfg.skip_failures}).all()
     return market, rows
@@ -78,7 +86,8 @@ def plan_stalled(factory, cfg, ledger, *, now=None, lanes=None, out_dir=None, on
                 rp.items, rp.files = build_items(factory, market, rid, out_dir=Path(out_dir or cfg.submission_dir),
                     ledger=ledger, batch_target=cfg.batch_target_asins,
                     max_per_input=cfg.tool_max_asins, allow_saved_partial=cfg.skip_failures,
-                    flush_unfilled=cfg.flush_unfilled_batches, flush_min_age_minutes=cfg.flush_min_age_minutes, now=now)
+                    flush_unfilled=cfg.flush_unfilled_batches, flush_min_age_minutes=cfg.flush_min_age_minutes, now=now,
+                    carryover=rp.carryover)
             except SubmissionError as exc:
                 rp.error = str(exc)[:200]
                 continue
@@ -90,11 +99,13 @@ def plan_stalled(factory, cfg, ledger, *, now=None, lanes=None, out_dir=None, on
     return out
 
 
-def stage_stalled_inputs(factory, cfg, store, ledger, *, now=None) -> tuple[int, int]:
+def stage_stalled_inputs(factory, cfg, store, ledger, *, now=None, carryover_out: list | None = None) -> tuple[int, int]:
     """保存済みの満杯バッチを回収する。端数は末尾到達の確定時だけ扱う（flush_unfilled_batches=trueなら待ち時間の後に端数も）。"""
     tally = [0, 0]
 
     def stage(rp):
+        if carryover_out is not None:
+            carryover_out.extend(rp.carryover)  # 持ち越した端数の件数と理由（黙って捨てない）
         kept = rp.kept
         if not kept:
             return

@@ -58,6 +58,21 @@ def split_asins(asins: list[str], size: int = MAX_ASINS_PER_INPUT) -> list[list[
     return [asins[i:i + size] for i in range(0, len(asins), size)] or [[]]
 
 
+def select_for_submission(asins: list[str], *, batch_target: int = 0, release_remainder: bool = False) -> tuple[list[str], list[str]]:
+    """（投入に回すASIN, 持ち越すASIN）。保存順を保つ。**持ち越しは batch_target が有効で、かつ端数を放出しない（周期が未終了）ときだけ**で、
+    持ち越した分は呼び出し側が件数と理由を必ず報告する（黙って切り捨てない）。それ以外は全件を投入に回す（分割は split_asins）。"""
+    if batch_target and not release_remainder:
+        n = len(asins) // batch_target * batch_target
+        return list(asins[:n]), list(asins[n:])
+    return list(asins), []
+
+
+def split_parent_id(run_id: int, direction: str, repeat: bool, first_asin: str) -> str:
+    """5,000件を超える入力を分割したときの親（同じ取得run・業務方向・new/repeat・先頭ASIN）の識別。分割後の各入力のmanifestに同じ値を残し、
+    元のASIN集合との対応を追跡できるようにする（親の件数が後で増えても、先頭ASINが同じなら同じ親）。"""
+    return hashlib.sha256(f"v1|split|{run_id}|{direction}|{int(repeat)}|{first_asin}".encode()).hexdigest()[:12]
+
+
 # 画面の設定値（読み取って記録するだけ。無断で切り替えない）。バリエーションは子ASIN取得が大幅に増え得る（画面の説明: 1IDで3〜4日）ので、
 # ONのときは送信しない。それ以外（CNフラグ除外・詳細2段階目/3段階目）は今回の国指定とは別のオプションで、現在値を記録するだけ。
 VARIATION_KEYS = ("バリエーション", "variation")
@@ -113,6 +128,9 @@ class SubmissionItem:
     fetched_from: dict | None = None  # 実際の取得記録（取得run・出典・一巡）。collector_asinにある事実
     also_from: list[dict] = field(default_factory=list)  # 他の出典の投入入力にも同じASINがある（台帳の入力から推定した参照情報。取得記録ではない）
     carried_from_runs: list[int] = field(default_factory=list)  # 同じ一巡の先行runから引き継いだASIN（通常は中断・失敗、バッチ蓄積時は成功runも含む）
+    # 分割の親（docs/DEVIATIONS.md #104）: 同じ親から作られた入力は同じidを持つ。{id, run_id, direction, repeat, parent_asin_count(分割前の件数),
+    # chunk_count, held_asin_count(この計画で持ち越した端数)}。旧マニフェストには無い（write_planは旧計画をこの項目だけで更新しない）
+    split_parent: dict | None = None
 
     @property
     def status(self) -> str:

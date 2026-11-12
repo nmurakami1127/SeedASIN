@@ -28,7 +28,13 @@ def run_cycle(cfg, factory, ports, *, now: datetime | None = None, say: Callable
     res: dict = {"planned": (0, 0), "states": {}, "needs_human": 0, "error": None}
     if cfg.flush_unfilled_batches and only_keys is None:
         try:
-            res["planned"] = _plan_flush(cfg, factory, ledger, now)
+            carry: list = []
+            res["planned"] = _plan_flush(cfg, factory, ledger, now, carry)
+            res["carryover"] = carry
+            from tool_submission.planner import summarize_carryover
+            held_total, held_text = summarize_carryover(carry)
+            if held_total:
+                say(held_text)  # 持ち越した端数の件数と理由（黙って切り捨てない）
             if res["planned"][0]:
                 say(f"端数を投入計画へ回しました: {res['planned'][0]}件・{res['planned'][1]:,} ASIN（台帳へPLANNEDを追記しただけで、送信は登録の一回分が行います）")
         except Exception as exc:  # noqa: BLE001 - 計画の追加の失敗で登録を止めない
@@ -44,7 +50,7 @@ def run_cycle(cfg, factory, ports, *, now: datetime | None = None, say: Callable
     return res
 
 
-def _plan_flush(cfg, factory, ledger, now) -> tuple[int, int]:
+def _plan_flush(cfg, factory, ledger, now, carryover_out: list | None = None) -> tuple[int, int]:
     """待ち時間が過ぎた端数を台帳へPLANNEDとして追記する（stage_stalled_inputsと同じ計画。workflowの状態は作らない）。"""
     from tool_submission.planner import write_plan
     from workflow.buffer_recovery import plan_stalled
@@ -52,6 +58,8 @@ def _plan_flush(cfg, factory, ledger, now) -> tuple[int, int]:
     tally = [0, 0]
 
     def on_plan(rp):
+        if carryover_out is not None:
+            carryover_out.extend(rp.carryover)
         if rp.kept:
             write_plan([it for it, _ in rp.kept], [d for _, d in rp.kept], ledger)
             tally[0] += len(rp.kept)

@@ -1664,3 +1664,34 @@ Amazonのナビゲーションはdomcontentloadedで待機し、第三者リソ�
 - 終了コード: 0=指定鍵すべて完了／2=指定鍵が処理対象外（何もしていない）／3=保留・結果不明・ロック競合などで人の対応待ち／4=指定外の鍵の台帳が変わった。
 - `--max-cycles`未指定なら1周期で終了（常駐しない）。`--max-cycles N`（N>1）なら、指定鍵が全てLINKEDになるかN周期まで`--interval-minutes`間隔で繰り返す（完了した鍵は2周期目以降から除く）。
 - 影響範囲: `workflow/registration.py`・`workflow/registration_loop.py`のみ。台帳の形式・DB・exportsは不変。実画面（実の統合ツール）では未確認。
+
+## 104. 5,000件超のASINを必ず分割して全件登録する: 終了済み周期の端数の放出・持ち越しの報告・`audit-coverage`（2026-11-12）
+
+- 目的: ASINが5,000件を超えても登録を諦めず、必ず5,000件以下に分割して全件を登録する（5,001→5000+1／12,300→5000+5000+2300／20,000→5000×4）。
+  `tool_max_asins=5000`は登録上限ではなく、1回の入力（投入単位）の分割サイズ。分割自体は従来から`build_items`が行っていた（分割ごとに別の入力CSV・sha256・投入キー・manifest）。
+- 取りこぼしの原因は分割ではなく、`batch_target_asins`（5,000件蓄積）の**端数の持ち越し**だった。端数は周期がCOMPLETE／DEPTH_LIMITのCLOSED_NO_CURSORのときだけ放出され、
+  BROKEN（後続runが来ない終了）や、BROKENより前に使えるrunがあるのに後続が失敗で使えない周期、長期OPENの周期では、端数が永久に投入されなかった（#78・#81の一部撤回）。
+- 変更（`tool_submission/planner.py`・`tool_submission/model.py`・`workflow/`）:
+  - 周期が**終了**（COMPLETE・BROKEN・CLOSED_NO_CURSOR（理由を問わない）、一巡の無い旧方式のrun）なら、端数も必ず計画に含める。持ち越すのは周期がOPEN（続きの取得がありうる）の間だけ。
+    周期の状態は、このrunより後のrunも見て決める（後続が使えるrunならそちらの入力に入る=DEFERRED。後続が実行中ならOPEN。後続が失敗で使えず周期がBROKENで終わったなら、BROKEN）。
+    端数の選別は純粋関数`select_for_submission`に切り出し、投入分は常に`split_asins`で`max_per_input`(5,000)以下に分割する（5,000超でも全件）。
+  - `build_items(..., carryover=list)`（任意引数。戻り値は不変）: 持ち越したASINを`{kind: HELD_REMAINDER, reason: OPEN|FLUSH_WAITING|DEFERRED_TO_LATER_RUN, asin_count, run_id, cycle_key, cycle_state, direction, repeat}`として追記する。
+    周期の終了後に、失敗runの保存分（設定`skip_failures=false`のため入力にしない分）があれば`UNUSED_FAILED_RUN_ASINS`（reason=FAILED_RUN_NOT_ALLOWED）として件数を報告する（黙って捨てない）。
+  - workflow: `engine._run_expand`は結果に`carryover`・`carryover_asins`を残し、詳細に「持ち越し N件（理由 件数）」を出す。`watch`（保存済み結果の計画）・`registration_loop`（flush）・`flush-plan`の表示にも同じ文を出す
+    （`stage_stalled_inputs(carryover_out=)`・`RunPlan.carryover`。`_plan_flush`は位置引数で受け取るので既存のスタブと互換）。
+  - `workflow/buffer_recovery.candidate_runs`: 後続の実行中・使えるrunが無く、周期が後続の失敗runだけでBROKENに終わっている場合は、最後の使えるrunを候補にする（従来は後続の失敗runがあるだけで候補から外れ、端数が永久に残った）。
+    最後のページが空で閉じた一巡(SUCCESS_EMPTY)も、周期にASINがあれば候補にする（端数の放出元）。
+  - manifestに`split_parent`（`{id, run_id, direction, repeat, parent_asin_count, chunk_count, held_asin_count}`）を追加。同じ親（取得run・方向・new/repeat・先頭ASIN）から分割された入力が同じidを持つ。
+    旧マニフェストの計画は、この項目だけの違いでは台帳に追記しない（`write_plan`の`_manifest_changed`）。
+- 読み取り専用の確認コマンド: `python -m tool_submission.cli audit-coverage [--market US|JP|both] [--only-gaps] [--min-asins 5001] [--detail] [--json]`（`tool_submission/coverage_audit.py`）。
+  周期×業務方向ごとに、周期のASIN数を「計画済み／過去周期で投入済み(重複除外)／重複取り下げ／取り下げ済み(PLAN_WITHDRAWN)／未計画（理由: OPEN持ち越し・BROKEN未放出・終了済み未計画・方向未確定）」の重ならない区分に分け、
+  合計が一致する（恒等式）ことを確認する。形式不正のASIN件数（登録できない可能性）と、入力ファイルを読めない計画の件数も出す。DB・台帳・入力ファイルには書かない（不一致があれば終了コード1）。
+- **復活させないもの**: PLAN_WITHDRAWN・TRACKING_ABANDONED・保留中の鍵は自動で復活・再計画しない。`audit-coverage`は取り下げ済みのASINを別枠で件数表示するだけで、再計画はしない。
+  過去の周期の取りこぼしを再計画する機能は、このブランチでは作っていない（作る場合は`--dry-run`既定の別コマンドとし、`--apply`は明示指定のみ）。
+  この変更で**新しく**端数を放出するようになった周期（COMPLETE・DEPTH_LIMIT以外=BROKEN・その他のCLOSED・旧方式）では、`build_items`が、同じ出典・取得先市場・方向・一巡の取り下げ済み(PLAN_WITHDRAWN。重複取り下げを除く)の
+  計画のASINを入力から除き、`carryover`に`WITHDRAWN_NOT_REPLANNED`（reason=PLAN_WITHDRAWN）として件数だけ報告する。従来から端数を放出していた周期（COMPLETE・DEPTH_LIMIT）と、小口の再編成(#71。取り下げ→5,000件へまとめ直し)の挙動は変えていない。
+  それ以外のPLAN_WITHDRAWN（従来の規則でも計画対象の周期）は従来どおりで、この変更では何も変わらない。新しい版が過去の取りこぼし周期（BROKEN・長期OPEN）の端数を、次の`watch`（`stage_stalled_inputs`）で**新規の計画として**放出し得るため、
+  本番へ適用する前に`audit-coverage`で件数（未計画・取り下げ済み）を確認すること。
+- 本番設定の変更は不要（`flush_unfilled_batches`は無効のままでよい。BROKEN・終了済みの端数は、設定に関係なく放出される）。`totals.max_submit_asins`（1実行の予算）を超える分はHELD（見送り）になるだけで、切り捨てではない（次の実行で投入される）。
+- 旧テストの更新: `tests/integration/test_planner_depth_limit_flush.py`の「BROKEN・DEPTH_LIMIT以外のCLOSED_NO_CURSORは端数を保留」を、「放出する」に変更した（本件の要件）。
+- 実PostgreSQLでの結合テストは`tests/integration/test_split_remainder.py`、単体は`tests/unit/test_split_remainder.py`。実画面（統合ツール）への投入は確認していない。

@@ -36,7 +36,7 @@ from origin_selection.report_import import ReportImportService
 from tool_submission.evidence import ingest_one_row, link_status
 from tool_submission.ledger import SubmissionLedger
 from tool_submission.model import SubmissionError, item_from_manifest
-from tool_submission.planner import build_items, write_plan
+from tool_submission.planner import build_items, summarize_carryover, write_plan
 from tool_submission.recovery import escalate_if_stale, recover_unknown
 from tool_submission.runner import pending_others, submit_item
 from workflow.config import OPPOSITE, WorkflowConfig
@@ -854,6 +854,7 @@ class Engine:
         acq = self.st.tasks[acq_id]
         market = acq.result.get("market")
         made, skipped = [], []
+        carry: list[dict] = []  # 持ち越した・使えなかったASINの報告（黙って捨てない。#104）
         for sid, rec in acq.result.get("sources", {}).items():
             if rec["mode"] not in ("FETCHED", "REUSED", "PARTIAL_SAVED") and not (self.cfg.batch_target_asins and rec["mode"] == "EMPTY"):
                 continue
@@ -861,7 +862,7 @@ class Engine:
                 items, files = build_items(self.factory, market, rec["run_id"], out_dir=Path(self.cfg.submission_dir),
                                            max_per_input=self.cfg.tool_max_asins, ledger=self.ledger, batch_target=self.cfg.batch_target_asins,
                                            allow_saved_partial=self.cfg.skip_failures, flush_unfilled=self.cfg.flush_unfilled_batches,
-                                           flush_min_age_minutes=self.cfg.flush_min_age_minutes, now=self.now())
+                                           flush_min_age_minutes=self.cfg.flush_min_age_minutes, now=self.now(), carryover=carry)
             except SubmissionError as exc:
                 skipped.append({"run_id": rec["run_id"], "reason": str(exc)[:200]})
                 continue
@@ -898,7 +899,12 @@ class Engine:
                                         "batch_target_asins": self.cfg.batch_target_asins,
                                         "run_ids": [rec["run_id"] for rec in acq.result.get("sources", {}).values()
                                                     if rec["mode"] in ("FETCHED", "REUSED", "PARTIAL_SAVED") and rec.get("run_id")]}
-        self._set(t, "DONE", f"投入計画{len(made)}件" + buffering + (f"（見送り{len(skipped)}件）" if skipped else ""), keys=made, skipped=skipped, **extra)
+        held_total, held_text = summarize_carryover(carry)
+        if carry:
+            extra["carryover"] = carry
+            extra["carryover_asins"] = held_total
+        self._set(t, "DONE", f"投入計画{len(made)}件" + buffering + (f"（見送り{len(skipped)}件）" if skipped else "") + (f" {held_text}" if held_text else ""),
+                  keys=made, skipped=skipped, **extra)
 
     # ------------------------------------------------------------------ 投入・メモ保存・対応記録
 

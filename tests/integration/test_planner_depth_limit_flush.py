@@ -90,7 +90,8 @@ def test_open_cycle_still_holds_the_remainder(app_role_factory, registry, runs, 
     assert [i.asin_count for i in items] == [5000] and files[0].decode().split() == asins[:5000]
 
 
-def test_broken_cycle_still_holds_the_remainder_even_when_flush_is_requested(app_role_factory, registry, runs, tmp_path):
+def test_broken_cycle_releases_the_remainder(app_role_factory, registry, runs, tmp_path):
+    """BROKEN（続きのrunが来ない終了状態。#104で#78を撤回）は端数も放出する。flush_bufferの有無で変わらない。"""
     asins = pool("B2H", 5003)
     _, run_id, rep, _, _ = fetched(app_role_factory, registry, runs, tmp_path, "US",
                                    [results(asins, URL), results(asins, URL)], origin_asin=asin(5), units=5, name="broken.csv")
@@ -98,12 +99,18 @@ def test_broken_cycle_still_holds_the_remainder_even_when_flush_is_requested(app
     ledger = SubmissionLedger(tmp_path / "broken.jsonl")
     for kw in ({}, {"flush_buffer": True}):
         items, files = plan(app_role_factory, run_id, ledger, tmp_path, allow_saved_partial=True, **kw)
-        assert [i.asin_count for i in items] == [5000]
+        assert sorted(i.asin_count for i in items) == [3, 5000]
+        assert sorted(asins_of(files)) == sorted(asins)
     small = pool("B2I", 9)
     _, run2, rep2, _, _ = fetched(app_role_factory, registry, runs, tmp_path, "US", [results(small, URL), results(small, URL)],
                                   origin_asin=asin(6), units=6, name="broken2.csv")
     assert row(app_role_factory, run2).cycle_state == "BROKEN"
-    assert plan(app_role_factory, run2, ledger, tmp_path, allow_saved_partial=True, flush_buffer=True) == ([], [])
+    items2, files2 = plan(app_role_factory, run2, ledger, tmp_path, allow_saved_partial=True)
+    assert [i.asin_count for i in items2] == [9] and asins_of(files2) == small
+
+
+def asins_of(files):
+    return [a for f in files for a in f.decode().split()]
 
 
 def test_failed_cycle_still_holds_the_remainder(app_role_factory, registry, runs, tmp_path):
@@ -113,8 +120,8 @@ def test_failed_cycle_still_holds_the_remainder(app_role_factory, registry, runs
     assert plan(app_role_factory, run_id, SubmissionLedger(tmp_path / "fail.jsonl"), tmp_path, allow_saved_partial=True) == ([], [])
 
 
-def test_other_closed_no_cursor_truncation_reasons_still_hold_the_remainder(app_role_factory, superuser_url, registry, runs, tmp_path):
-    """再開位置の消失など、DEPTH_LIMIT以外の CLOSED_NO_CURSOR は末尾到達と見なさない。"""
+def test_other_closed_no_cursor_truncation_reasons_release_the_remainder(app_role_factory, superuser_url, registry, runs, tmp_path):
+    """再開位置の消失など、DEPTH_LIMIT以外の CLOSED_NO_CURSOR も続きが来ない終了状態なので端数を放出する（#104）。"""
     run_id = depth_limit_run(app_role_factory, registry, runs, tmp_path, pool("B2K", 9), tag="other", units=8)
     ledger = SubmissionLedger(tmp_path / "other.jsonl")
     assert [i.asin_count for i in plan(app_role_factory, run_id, ledger, tmp_path)[0]] == [9]
@@ -122,7 +129,7 @@ def test_other_closed_no_cursor_truncation_reasons_still_hold_the_remainder(app_
         set_run(superuser_url, run_id, truncation_reason=reason)
         r = row(app_role_factory, run_id)
         assert (r.cycle_state, r.outcome, r.truncation_reason) == ("CLOSED_NO_CURSOR", "SUCCESS_TRUNCATED", reason)
-        assert plan(app_role_factory, run_id, ledger, tmp_path, flush_buffer=True) == ([], [])
+        assert [i.asin_count for i in plan(app_role_factory, run_id, ledger, tmp_path, flush_buffer=True)[0]] == [9]
 
 
 def test_complete_cycle_still_releases_the_remainder(app_role_factory, registry, runs, tmp_path):

@@ -54,6 +54,7 @@ def build_report(factory, cfg, ledger_path: Path, *, now: datetime | None = None
                 write_plan([it for it, _ in rp.kept], [d for _, d in rp.kept], ledger)
 
         runs = plan_stalled(factory, fcfg, ledger, now=now, out_dir=out_dir, on_plan=on_plan)
+        carryover = [e for rp in runs for e in rp.carryover]
         waiting = []
         errors = []
         for rp in runs:
@@ -80,7 +81,7 @@ def build_report(factory, cfg, ledger_path: Path, *, now: datetime | None = None
                     r["inputs"] += 1
                 else:
                     r["already"] += it.asin_count
-        return {"now": now, "wait_minutes": cfg.flush_min_age_minutes, "rows": dict(rows), "waiting": waiting, "errors": errors, "applied": apply,
+        return {"now": now, "wait_minutes": cfg.flush_min_age_minutes, "rows": dict(rows), "waiting": waiting, "errors": errors, "applied": apply, "carryover": carryover,
                 "ledger_before": _ledger_summary(before_states), "ledger_after": _ledger_summary(real.all_states()) if apply else None,
                 "flag_off": not cfg.flush_unfilled_batches}
     finally:
@@ -130,6 +131,10 @@ def format_report(rep: dict) -> list[str]:
                    f"repeat保留 {tot[(d, 'repeat')]:,} / 作られる入力 {tot[(d, 'inputs')]}")
     if not rep["rows"]:
         out.append("    対象なし")
+    from tool_submission.planner import summarize_carryover
+    held_total, held_text = summarize_carryover(rep.get("carryover") or [])
+    if held_total:
+        out.append("  " + held_text)
     for rp in rep["waiting"]:
         left = timedelta(minutes=rep["wait_minutes"]) - (rep["now"] - (rp.completed_at if rp.completed_at.tzinfo else rp.completed_at.replace(tzinfo=timezone.utc)))
         out.append(f"  待機中: {rp.lane} run{rp.run_id}（あと約{max(0, int(left.total_seconds() // 60))}分）")

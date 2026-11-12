@@ -25,7 +25,7 @@ from sqlalchemy import text
 from db.session import SessionFactory
 from tool_submission.ledger import SubmissionLedger
 from tool_submission.model import (
-    BUSINESS_MARKET, MAX_ASINS_PER_INPUT, SubmissionError, SubmissionItem, asin_file_bytes, build_memo, split_asins, submission_key,
+    BUSINESS_MARKET, MAX_ASINS_PER_INPUT, SubmissionError, SubmissionItem, asin_file_bytes, build_memo, select_for_submission, split_asins, split_parent_id, submission_key,
 )
 
 USABLE_OUTCOMES = ("SUCCESS_NONEMPTY", "SUCCESS_TRUNCATED")
@@ -40,7 +40,10 @@ def _path_dict(p) -> dict:
             "origin_asin": p.origin_asin, "origin_units": p.origin_units, "via_source_id": p.via_source_id, "via_asin": p.via_asin}
 
 
-OCCUPYING = ("PLANNED", "SUBMITTING", "UNKNOWN", "ABANDONED", "AMBIGUOUS", "RUN_IDENTIFIED", "MEMO_SAVED", "LINKED")  # 追跡取り下げも送信済みの可能性を残す
+# 端数を放出してよい（続きの取得が来ない）周期の終了状態（docs/DEVIATIONS.md #104）。OPEN（続きあり・実行中・一時的な失敗）だけが持ち越し対象
+TERMINAL_CYCLE_STATES = ("COMPLETE", "BROKEN", "CLOSED_NO_CURSOR")
+
+OCCUPYING = ("PLANNED", "SUBMITTING", "UNKNOWN", "ABANDONED", "AMBIGUOUS", "RUN_IDENTIFIED", "MEMO_SAVED", "LINKED")  # 追跡取り下げも送信済みの可能性を残す。NOT_SUBMITTED（未送信と確認済み）は予約から外れ、再び対象になる（既存の設計・test_submission_delta）
 
 
 def _cycle_key(cycle_id: int | None, run_id: int) -> str:
@@ -80,11 +83,24 @@ def _occupancy(states: dict, run_id: int, source_id: int, direction: str, market
     return by_cycle, others
 
 
+def _withdrawn_asins(states: dict, source_id: int, market: str, direction: str, ckey: str, cache: dict) -> set[str]:
+    """この出典・取得先市場・方向・一巡で、人が取り下げた計画(PLAN_WITHDRAWN。重複のための取り下げを除く)のASIN。"""
+    out: set[str] = set()
+    for st in states.values():
+        m = st.manifest
+        if st.state != "WITHDRAWN" or st.duplicate_withdrawn or not m:
+            continue
+        if m.get("source_id") == source_id and m.get("fetch_market") == market and m.get("direction") == direction and \
+                (m.get("cycle_key") or f"legacy:run{m.get('collector_run_id')}") == ckey:
+            out.update(_read_asins(m.get("input_file", ""), cache))
+    return out
+
+
 def build_items(app: SessionFactory, fetch_market: str, run_id: int, *, out_dir: Path, direction_override: str | None = None,
                 max_per_input: int = MAX_ASINS_PER_INPUT, ledger: SubmissionLedger | None = None,
                 batch_target: int = 0, allow_saved_partial: bool = False,
                 flush_buffer: bool = False, flush_unfilled: bool = False, flush_min_age_minutes: int = 0,
-                now: datetime | None = None) -> tuple[list[SubmissionItem], list[bytes]]:
+                now: datetime | None = None, carryover: list | None = None) -> tuple[list[SubmissionItem], list[bytes]]:
     """計画と、各入力ファイルの内容を返す。書き込みはしない。
     ledgerを渡すと、**同じ出典・業務方向**の投入差分を管理する:
     - 同じ一巡で既に投入（送信開始済み・結果不明・未送信の投入計画への予約を含む）したASINは、この入力から除く（再送しない）。
@@ -93,7 +109,13 @@ def build_items(app: SessionFactory, fetch_market: str, run_id: int, *, out_dir:
     - 別の出典・別の業務方向は別に判定する。別の出典の入力にも同じASINがある場合は、参照情報(also_from)として残す。
     flush_unfilled=True（batch_targetが前提。docs/DEVIATIONS.md #102）: 末尾到達前でも、この取得run（同じ一巡の最新）の完了から
     flush_min_age_minutes分が過ぎていれば、batch_target未満の端数も計画に含める（切り捨てない）。続きのrunをまとめるための待ちで、
-    過ぎていなければ従来どおり端数を持ち越す。重複の除外（台帳）・repeatの扱い・方向の分離は変えない。"""
+    過ぎていなければ従来どおり端数を持ち越す。重複の除外（台帳）・repeatの扱い・方向の分離は変えない。
+    端数の放出（docs/DEVIATIONS.md #104）: batch_targetの端数は、周期が**終了している**（COMPLETE・BROKEN・CLOSED_NO_CURSOR。続きのrunが来ない）
+    ときは必ず計画に含める。持ち越すのは周期がOPEN（続きの取得がありうる）の間だけ。5,000件(max_per_input)を超える分は、常に
+    max_per_input以下に分割して全件を計画する（取りこぼさない）。
+    carryover（任意。listを渡すと追記する）: 持ち越した・投入に使えなかったASINを黙って捨てないための報告。各要素は
+    {"kind": "HELD_REMAINDER"|"UNUSED_FAILED_RUN_ASINS", "run_id", "source_id", "fetch_market", "direction", "cycle_key", "cycle_state",
+     "repeat", "asin_count", "reason"}。reasonは OPEN / FLUSH_WAITING / DEFERRED_TO_LATER_RUN / FAILED_RUN_NOT_ALLOWED。"""
     if not 0 <= batch_target <= max_per_input:
         raise SubmissionError("batch_target は0〜max_per_inputで指定してください")
     with app.get_session(fetch_market) as conn, conn.begin():
@@ -121,6 +143,16 @@ def build_items(app: SessionFactory, fetch_market: str, run_id: int, *, out_dir:
             text("SELECT ca.asin FROM collector_asin ca WHERE ca.collector_run_id = ANY(:rs) "
                  "ORDER BY array_position(CAST(:rs AS bigint[]), ca.collector_run_id), ca.id"),
             {"rs": carried_runs + [run_id]})]
+        later = []
+        if run.cycle_id is not None and run.cycle_seq is not None:
+            later = conn.execute(text(
+                "SELECT id, cycle_seq, cycle_state, status, outcome FROM collector_run WHERE marketplace=:m AND source_id=:s AND cycle_id=:c "
+                "AND cycle_seq>:q ORDER BY cycle_seq"), {"m": fetch_market, "s": run.source_id, "c": run.cycle_id, "q": run.cycle_seq}).all()
+        later_raw: list[str] = []
+        if later:
+            later_raw = [r[0] for r in conn.execute(
+                text("SELECT ca.asin FROM collector_asin ca WHERE ca.collector_run_id = ANY(:rs) ORDER BY ca.collector_run_id, ca.id"),
+                {"rs": [r.id for r in later]})]
     asins = list(dict.fromkeys(a.strip().upper() for a in raw if a and a.strip()))
     if not asins:
         raise SubmissionError(f"run={run_id} にはASINがありません")
@@ -136,9 +168,27 @@ def build_items(app: SessionFactory, fetch_market: str, run_id: int, *, out_dir:
     key_name = src.key_primary if src.source_type == "SELLER" else src.display_primary
     partial = run.outcome in ("SUCCESS_TRUNCATED", "PARTIAL") or run.completeness in PARTIAL_COMPLETENESS_REASON
     partial_reason = PARTIAL_REASON.get(run.outcome) or PARTIAL_COMPLETENESS_REASON.get(run.completeness)
-    # 検索結果の深さの限界(DEPTH_LIMIT。#80)は続きの無い確定の終了状態なので、COMPLETEと同じく端数も放出する（#81。#78の一部撤回）。
-    # OPEN・BROKEN・その他のCLOSED_NO_CURSOR（再開位置の消失など）は末尾到達ではないので従来どおり保留。
-    reached_end = run.cycle_state == "COMPLETE" or (run.cycle_state == "CLOSED_NO_CURSOR" and run.truncation_reason == "DEPTH_LIMIT")
+    # 周期が終了している（続きのrunが来ない）なら端数も放出する。COMPLETEと検索結果の深さの限界(DEPTH_LIMIT。#80・#81)は従来から放出していた。
+    # BROKEN・その他のCLOSED_NO_CURSOR（再開位置の消失など）・旧方式のrunも、続きが来ないので放出する（#104。#78の撤回）。OPENだけが持ち越し。
+    # 周期の終了状態は、このrunより後のrunも見て決める。後続runが使える入力なら、このrunの端数はそちらの計画に入る（持ち越し=DEFERRED）。
+    # 後続runが実行中なら周期は未終了。後続が失敗で使えない（BROKEN等）なら、最後のrunの状態が周期の状態（端数を放出する）。
+    def _usable_run(r) -> bool:
+        return (r.status == "COMPLETED" and (r.outcome in USABLE_OUTCOMES or bool(batch_target and r.outcome == "SUCCESS_EMPTY"))) \
+            or bool(allow_saved_partial and r.status == "FAILED" and r.outcome == "PARTIAL")
+
+    cycle_state = run.cycle_state
+    deferred_to = None
+    if later:
+        deferred_to = next((r.id for r in later if _usable_run(r)), None)
+        cycle_state = "OPEN" if any(r.status in ("RUNNING", "CAPTCHA_WAIT") for r in later) else later[-1].cycle_state
+    # 一巡の無い旧方式のrun（cycle_id無し）は続きが来ないので終了として扱う
+    reached_end = deferred_to is None and (run.cycle_id is None or cycle_state in TERMINAL_CYCLE_STATES)
+    asin_set = set(asins)
+    # 従来の規則で端数を放出した周期（COMPLETE・DEPTH_LIMIT）以外は、この変更で新しく端数を放出するようになった周期。そこでは、人が取り下げた計画
+    # (PLAN_WITHDRAWN)のASINを自動で再計画しない（過去の取り下げを勝手に復活させない。件数だけ報告し、再計画は人の判断）。従来から放出していた周期の挙動は不変。
+    legacy_end = run.cycle_state == "COMPLETE" or (run.cycle_state == "CLOSED_NO_CURSOR" and run.truncation_reason == "DEPTH_LIMIT")
+    newly_released = bool(batch_target) and reached_end and not legacy_end
+    unused_failed = sorted({a.strip().upper() for a in later_raw if a and a.strip()} - asin_set) if later and deferred_to is None else []
     ckey = _cycle_key(run.cycle_id, run_id)
     flush_ok = bool(flush_unfilled and batch_target and _aged(run.completed_at, flush_min_age_minutes, now))
     states = ledger.all_states() if ledger is not None else {}  # 台帳は計画作成ごとに読み直す（方向ごとに読み直さない）
@@ -157,6 +207,7 @@ def build_items(app: SessionFactory, fetch_market: str, run_id: int, *, out_dir:
         same_cycle = by_cycle.get(ckey, set())
         earlier = set().union(*[v for k, v in by_cycle.items() if k != ckey]) if by_cycle else set()
         remaining = [a for a in asins if a not in same_cycle]
+        withdrawn_asins = _withdrawn_asins(states, src.source_id, fetch_market, d, ckey, file_cache) if newly_released else set()
         new_part = [a for a in remaining if a not in earlier]
         repeat_part = [a for a in remaining if a in earlier]
         also_from = [{"source_id": o["source_id"], "source_key": o["source_key"], "run_id": o["run_id"], "key": o["key"], "state": o["state"],
@@ -167,20 +218,57 @@ def build_items(app: SessionFactory, fetch_market: str, run_id: int, *, out_dir:
         for is_repeat, part in ((False, new_part), (True, repeat_part)):
             if not part:
                 continue
-            if batch_target and not reached_end and not flush_ok:
-                # 失敗・停滞・再開位置の消失は末尾到達ではない（DEPTH_LIMITで閉じた一巡は末尾到達として扱う。reached_end）。
-                # flush_bufferは旧呼び出しとの互換用に受け取るだけで、端数を放出しない（端数の放出はflush_unfilled。#102）。
-                # 同じ出典・方向・一巡で満杯になるまで残りを持ち越す。
-                part = part[:len(part) // batch_target * batch_target]
+            if withdrawn_asins:
+                blocked = [a for a in part if a in withdrawn_asins]
+                if blocked and carryover is not None:
+                    carryover.append({"kind": "WITHDRAWN_NOT_REPLANNED", "run_id": run_id, "source_id": src.source_id, "fetch_market": fetch_market,
+                                      "direction": d, "cycle_key": ckey, "cycle_state": cycle_state, "repeat": is_repeat, "asin_count": len(blocked),
+                                      "reason": "PLAN_WITHDRAWN", "later_run_id": None})
+                part = [a for a in part if a not in withdrawn_asins]
                 if not part:
                     continue
-            chunks_d = split_asins(part, max_per_input)
-            items_d, files_d = _items_for(d, part, chunks_d, is_repeat, run_id, fetch_market, src, key_name, run, partial, partial_reason, asins, raw, paths,
+            # 失敗・停滞・再開位置の消失でも、続きが来ない周期は終了済み（reached_end）として端数を放出する。持ち越すのは周期がOPENの間だけ。
+            # flush_bufferは旧呼び出しとの互換用に受け取るだけで、端数を放出しない（端数の放出はflush_unfilled。#102）。
+            planned, held = select_for_submission(part, batch_target=batch_target, release_remainder=reached_end or flush_ok)
+            if held and carryover is not None:
+                carryover.append({
+                    "kind": "HELD_REMAINDER", "run_id": run_id, "source_id": src.source_id, "fetch_market": fetch_market, "direction": d,
+                    "cycle_key": ckey, "cycle_state": cycle_state, "repeat": is_repeat, "asin_count": len(held),
+                    "reason": "DEFERRED_TO_LATER_RUN" if deferred_to is not None else "FLUSH_WAITING" if flush_unfilled else "OPEN",
+                    "later_run_id": deferred_to})
+            if not planned:
+                continue
+            chunks_d = split_asins(planned, max_per_input)
+            parent = {"id": split_parent_id(run_id, d, is_repeat, part[0]), "run_id": run_id, "direction": d, "repeat": is_repeat,
+                      "parent_asin_count": len(part), "chunk_count": len(chunks_d), "held_asin_count": len(held)}
+            items_d, files_d = _items_for(d, planned, chunks_d, is_repeat, run_id, fetch_market, src, key_name, run, partial, partial_reason, asins, raw, paths,
                                           dpaths, best, directions, prior, out_dir, ckey, len(asins) - len(remaining), fetched_from, also_from,
-                                          carried_runs)
+                                          carried_runs, parent)
             items += items_d
             files += files_d
+        if unused_failed and carryover is not None:
+            carryover.append({"kind": "UNUSED_FAILED_RUN_ASINS", "run_id": run_id, "source_id": src.source_id, "fetch_market": fetch_market,
+                              "direction": d, "cycle_key": ckey, "cycle_state": cycle_state, "repeat": False, "asin_count": len(unused_failed),
+                              "reason": "FAILED_RUN_NOT_ALLOWED", "later_run_id": None})
     return items, files
+
+
+CARRYOVER_REASON_TEXT = {
+    "OPEN": "周期が未終了(OPEN)で、続きの取得を待つ", "FLUSH_WAITING": "続きの取得を待つ時間の途中", "DEFERRED_TO_LATER_RUN": "後続runの入力に含まれる",
+    "FAILED_RUN_NOT_ALLOWED": "失敗runの保存分で、設定(skip_failures)が許さないため入力にしない",
+    "PLAN_WITHDRAWN": "取り下げ済みの計画のASIN。自動では再計画しない",
+}
+
+
+def summarize_carryover(entries: list[dict]) -> tuple[int, str]:
+    """build_itemsのcarryover報告を「持ち越し N件（理由 件数, …）」の文にまとめる（無ければ(0, "")）。件数は方向・new/repeatごとの合計。"""
+    by: dict[str, int] = {}
+    for e in entries:
+        by[e["reason"]] = by.get(e["reason"], 0) + int(e["asin_count"])
+    total = sum(by.values())
+    if not total:
+        return 0, ""
+    return total, f"持ち越し{total:,}件（" + "、".join(f"{CARRYOVER_REASON_TEXT.get(r, r)} {n:,}件" for r, n in sorted(by.items())) + "）"
 
 
 def _aged(completed_at, minutes: int, now: datetime | None) -> bool:
@@ -193,7 +281,7 @@ def _aged(completed_at, minutes: int, now: datetime | None) -> bool:
 
 
 def _items_for(d, part, chunks, is_repeat, run_id, fetch_market, src, key_name, run, partial, partial_reason, asins, raw, paths, dpaths, best, directions,
-               prior, out_dir, ckey, excluded, fetched_from, also_from, carried_runs):
+               prior, out_dir, ckey, excluded, fetched_from, also_from, carried_runs, parent=None):
     items, files = [], []
     for idx, chunk in enumerate(chunks, start=1):
         content = asin_file_bytes(chunk)
@@ -212,7 +300,7 @@ def _items_for(d, part, chunks, is_repeat, run_id, fetch_market, src, key_name, 
             paths=[_path_dict(p) for p in dpaths], other_directions=[x for x in directions if x != d],
             chunk_index=idx, chunk_count=len(chunks), run_asin_total=len(asins), prior_tool_runs=prior[d],
             cycle_key=ckey, repeat_of_earlier_cycle=is_repeat, same_cycle_excluded=excluded, fetched_from=fetched_from, also_from=also_from,
-            carried_from_runs=list(carried_runs),
+            carried_from_runs=list(carried_runs), split_parent=parent,
         ))
         files.append(content)
     return items, files
@@ -237,6 +325,15 @@ def _carried_runs(conn, run) -> list[int]:
     return list(reversed(carried))
 
 
+def _manifest_changed(old: dict | None, new: dict) -> bool:
+    """計画の内容が変わったか。旧マニフェストに無い新項目（split_parent）だけの違いは、変更として台帳に追記しない（既存の計画を増やさない）。"""
+    if old is None:
+        return True
+    if "split_parent" not in old:
+        new = {k: v for k, v in new.items() if k != "split_parent"}
+    return old != new
+
+
 def write_plan(items: list[SubmissionItem], files: list[bytes], ledger: SubmissionLedger) -> list[tuple[SubmissionItem, str]]:
     """入力ファイルとマニフェストを書き、台帳にPLANNEDを残す（冪等: 同じ内容の再実行は何も増やさない。既存の状態は消さない）。"""
     results = []
@@ -259,7 +356,7 @@ def write_plan(items: list[SubmissionItem], files: list[bytes], ledger: Submissi
             continue
         if st.state in ("NONE", "PLANNED", "WITHDRAWN"):
             mpath.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
-        if st.state in ("NONE", "PLANNED", "WITHDRAWN") and (st.state == "WITHDRAWN" or st.manifest != manifest):
+        if st.state in ("NONE", "PLANNED", "WITHDRAWN") and (st.state == "WITHDRAWN" or _manifest_changed(st.manifest, manifest)):
             ledger.append(item.key, "PLANNED", manifest=manifest)
             results.append((item, "新規" if st.state == "NONE" else "更新"))
         else:
