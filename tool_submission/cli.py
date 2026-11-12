@@ -3,6 +3,8 @@
     python -m tool_submission.cli plan --fetch-market US --run-id 82 [--dry-run]
     python -m tool_submission.cli ledger
     python -m tool_submission.cli audit-coverage [--market US|JP|both] [--only-gaps] [--min-asins 5001] [--detail] [--json]   # 取得ASINの投入計画への反映を確認（読み取り専用）
+    python -m tool_submission.cli backfill-remainders [--config config/workflow.json] [--direction IMPORT|EXPORT] [--market US|JP|both] [--state OPEN,BROKEN] [--min-asins N] [--source ID] [--cycle c123] [--include-overlap] [--ignore-grace] [--report-dir DIR] [--apply]
+                                                      # 過去の周期に取り残された保存済みASINを投入計画へ回収（既定はdry-run。--applyだけ台帳へPLANNEDを追記。出典の保留状態・DBは変更しない）
     # 手動で投入する場合（画面の手順は docs/DEVIATIONS.md #60）
     python -m tool_submission.cli begin     --key <投入キー> --log-json <送信直前のログ一覧> --options-json <画面の設定値>   # 送信権の確保・送信開始の記録（SAVEの前）
     python -m tool_submission.cli reconcile --key <投入キー> --log-html <送信後に保存したログ画面.html>
@@ -624,6 +626,76 @@ def _cmd_audit_coverage(a: argparse.Namespace) -> int:
     return 0 if rep["identity_ok"] else 1
 
 
+def _cmd_backfill_remainders(a: argparse.Namespace, factory=None, confirm=None) -> int:
+    """過去の周期に取り残された保存済みASINを、投入計画（台帳のPLANNED）へ回収する。既定はdry-run（DB・台帳・入力ファイルに書かない。レポートだけ書く）。
+    --applyだけ、台帳へPLANNEDを追記し入力CSV・マニフェストを書く（y/n確認）。出典の状態（保留・除外）とDBには書かない。送信はしない。"""
+    import sys
+    from datetime import datetime
+
+    from tool_submission import backfill
+    from workflow.config import ConfigError, load_config
+
+    try:
+        cfg = load_config(a.config)
+    except ConfigError as exc:
+        print(f"[中止] {exc}")
+        return 2
+    if factory is None:
+        from workflow.dbconn import readonly_factory, resolve_app_url
+
+        print(f"[接続] app_role（読み取り専用）: {resolve_app_url()[1]}")
+        factory = readonly_factory()
+    out_dir = Path(a.out_dir) if a.out_dir else Path(cfg.submission_dir)
+    ledger = SubmissionLedger(Path(a.ledger) if a.ledger else out_dir / "ledger.jsonl")
+    markets = None if a.market == "both" else [a.market]
+    cycles = {(f"c{x}" if x.isdigit() else x) for x in (a.cycle or [])} or None
+    sources = {int(x) for v in (a.source or []) for x in str(v).split(",") if x.strip()} or None
+    states = {x.strip().upper() for x in a.state.split(",") if x.strip()} if a.state else None
+    try:
+        result = backfill.compute(factory, cfg, ledger, markets=markets, directions={a.direction} if a.direction else None, sources=sources, cycles=cycles,
+                                  states=states, min_asins=a.min_asins, include_overlap=a.include_overlap, ignore_grace=a.ignore_grace,
+                                  grace_minutes=a.grace_minutes, out_dir=out_dir, base_dirs=[Path(x) for x in (a.input_base or [])])
+    except backfill.BackfillError as exc:
+        print(f"[中止] {exc}")
+        return 2
+    before = backfill.ledger_summary(ledger)
+    report_dir = Path(a.report_dir) if a.report_dir else backfill.default_report_dir(datetime.now())
+    lines = backfill.format_summary(result)
+    print("\n".join(lines))
+    n_inputs = len(result["items"])
+    n_asins = sum(e["item"].asin_count for e in result["items"])
+    if not a.apply:
+        files = backfill.write_reports(report_dir, result, before_ledger=before, applied=None, after_ledger=None, diff=None, summary_lines=lines)
+        print(f"（dry-runです。台帳・入力ファイル・DBには何も書いていません。レポート: {report_dir}）")
+        return 0 if result["identity_ok"] and not result["errors"] else 1
+    if not result["identity_ok"] or any(e.get("fatal") for e in result["errors"]):
+        backfill.write_reports(report_dir, result, before_ledger=before, applied=None, after_ledger=None, diff=None, summary_lines=lines)
+        print(f"[中止] 件数の恒等式が成立しない、または計画に不整合があるため、何も書き込みません（レポート: {report_dir}）")
+        return 1
+    if n_inputs == 0:
+        backfill.write_reports(report_dir, result, before_ledger=before, applied={"written": [], "errors": []}, after_ledger=before,
+                               diff=backfill.ledger_diff(before, before), summary_lines=lines)
+        print(f"追記する新しい入力はありません（レポート: {report_dir}）")
+        return 0
+    if confirm is None:
+        if not sys.stdin.isatty():
+            print("[中止] --apply は対話端末でのy/n確認が必要です（何も書いていません）")
+            return 2
+        confirm = lambda q: input(q).strip().lower() == "y"  # noqa: E731
+    print("【注意】稼働中のwatch・登録ループが同じASINを計画しないよう、必要なら先に止めてください（二重計画を避けるため）。")
+    if not confirm(f"台帳へ新しい入力{n_inputs}件（{n_asins:,} ASIN）をPLANNEDとして追記します（送信・出典の状態変更はしません）。よろしいですか [y/N] "):
+        print("確認が取れなかったので何も変更していません")
+        return 2
+    applied = backfill.apply(result, ledger, out_dir)
+    after = backfill.ledger_summary(ledger)
+    diff = backfill.ledger_diff(before, after)
+    lines = backfill.format_summary(result, applied=applied, diff=diff)
+    backfill.write_reports(report_dir, result, before_ledger=before, applied=applied, after_ledger=after, diff=diff, summary_lines=lines)
+    print("\n".join(lines[-(2 + len(diff["by_direction_state"])):]))
+    print(f"レポート: {report_dir}（before.json / plan.json / after.json / summary.txt）")
+    return 0 if not applied["errors"] and not result["errors"] else 1
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="python -m tool_submission.cli")
     sub = p.add_subparsers(dest="command", required=True)
@@ -646,6 +718,22 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--skip-failures", action="store_true", help="ドライラン計算の前提: 本番設定のskip_failures=true（失敗runの保存分も入力にする）")
     sp.add_argument("--input-base", action="append", default=None, help="入力ファイルの相対パスを探す基準フォルダー（複数可。既定は台帳のフォルダーとその親・カレント）")
 
+    sp = add("backfill-remainders", _cmd_backfill_remainders,
+             "過去の周期に取り残された保存済みASINを投入計画へ回収する（既定はdry-run。--applyだけ台帳へPLANNEDを追記・y/n確認。出典の保留状態・DBは変更しない）")
+    sp.add_argument("--config", default="config/workflow.json", help="レーン（起点import・取得先市場）・batch_target・skip_failures・猶予・出力先を読む設定")
+    sp.add_argument("--direction", default=None, choices=["IMPORT", "EXPORT"], help="この方向だけ（IMPORTとEXPORTは混ぜず、方向ごとに別の入力にする）")
+    sp.add_argument("--market", default="both", choices=["US", "JP", "both"], help="取得先市場（collector_runの市場）")
+    sp.add_argument("--state", default=None, help="周期の状態で絞る（カンマ区切り。例: OPEN,BROKEN。旧方式はLEGACY）")
+    sp.add_argument("--min-asins", type=int, default=0, help="周期のASIN数がこの件数以上の周期だけ（例: 5001）")
+    sp.add_argument("--source", action="append", default=None, help="出典ID（複数可。カンマ区切りも可）")
+    sp.add_argument("--cycle", action="append", default=None, help="周期（例: c5890 または 5890。複数可。旧方式は legacy:run12）")
+    sp.add_argument("--include-overlap", action="store_true", help="他の出典（同じ方向）で計画済みのASINも含める（既定は除外。同じ出典の他の周期のASINは常に計画しない）")
+    sp.add_argument("--ignore-grace", action="store_true", help="猶予（flush_min_age_minutes）が過ぎていない周期も含める（取得中のrunは含めない）")
+    sp.add_argument("--grace-minutes", type=int, default=None, help="猶予を設定の値から変える")
+    sp.add_argument("--report-dir", default=None, help="レポートの保存先（既定: exports/backfill_reports/<日時>/）。dry-runでも書く（台帳・DBには書かない）")
+    sp.add_argument("--out-dir", default=None, help="入力CSV・マニフェスト・台帳のフォルダー（既定: 設定の submission_dir）")
+    sp.add_argument("--input-base", action="append", default=None, help="台帳の入力ファイルの相対パスを探す基準フォルダー（複数可）")
+    sp.add_argument("--apply", action="store_true", help="台帳へPLANNEDを追記し、入力CSV・マニフェストを書く（y/n確認。送信はしない）")
     sp = add("abandon", _cmd_abandon, "結果不明の投入の追跡を取り下げる（外部ジョブの取消ではない）")
     sp.add_argument("--key", required=True)
     sp.add_argument("--reason", required=True)
@@ -721,10 +809,12 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
-def main(argv: list[str] | None = None, *, confirm=None) -> int:
+def main(argv: list[str] | None = None, *, confirm=None, factory=None) -> int:
     a = build_parser().parse_args(argv)
     if a.func is _cmd_withdraw_duplicate:
         return a.func(a, confirm=confirm)
+    if a.func is _cmd_backfill_remainders:
+        return a.func(a, factory=factory, confirm=confirm)
     return a.func(a)
 
 

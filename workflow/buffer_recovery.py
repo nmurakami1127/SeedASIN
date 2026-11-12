@@ -39,14 +39,26 @@ class RunPlan:
     error: str | None = None
 
 
-def candidate_runs(factory, cfg, lane, *, now=None):
-    """レーンの取得先市場で、一巡の最新の使えるrun（取得は行わない）。待ち時間が過ぎたかどうかは呼び出し側が見る。"""
+# 保存済みの取得結果から投入計画を作ってよい出典（docs/DEVIATIONS.md #105）。取得制御（保留・除外）と、保存済みASINの登録計画は別。
+# ACTIVE（従来どおり）に加え、**ON_HOLD**（AUTO_FAILURES・AUTO_CYCLE_RESTARTS・MANUAL）も対象にする。保留は「これ以上取りに行かない」判断であって、
+# すでに保存済みのASINを登録しない理由ではない（保留の状態は変更しない・取得側の判定には触れない）。
+# 対象外のまま: EXCLUDED（今後も取得しない）、および storefront_blocked_seller が PERMANENTLY_EXCLUDED のセラーの保留出典。
+# ACTIVEの出典の扱いは変えない（storefront_blocked_sellerの有無を新たに見ない）。
+PLANNABLE_SOURCE_SQL = """(s.status='ACTIVE' OR (s.status='ON_HOLD' AND NOT EXISTS (
+    SELECT 1 FROM storefront_blocked_seller b
+    WHERE s.source_type='SELLER' AND upper(btrim(b.seller_id))=upper(s.key_primary) AND b.reason='PERMANENTLY_EXCLUDED')))"""
+
+
+def candidate_runs(factory, cfg, lane, *, now=None, any_source: bool = False):
+    """レーンの取得先市場で、一巡の最新の使えるrun（取得は行わない）。待ち時間が過ぎたかどうかは呼び出し側が見る。
+    出典の状態は `PLANNABLE_SOURCE_SQL`（ACTIVE＋ON_HOLD。EXCLUDEDは除く）。any_source=Trueは出典の状態を見ない（backfill-remaindersが
+    除外の理由を自分で数えるため。通常の計画では使わない）。"""
     market = cfg.page_market(lane)
     with factory.get_session(market) as conn:
-        rows = conn.execute(text("""
+        rows = conn.execute(text(f"""
             SELECT r.id, r.source_id, r.completed_at FROM collector_run r
             JOIN acquisition_source s ON s.source_id=r.source_id
-            WHERE s.status='ACTIVE' AND r.source_id IS NOT NULL
+            WHERE {'TRUE' if any_source else PLANNABLE_SOURCE_SQL} AND r.source_id IS NOT NULL
               AND r.completed_at IS NOT NULL
               AND (r.outcome IN ('SUCCESS_NONEMPTY','SUCCESS_TRUNCATED')
                    OR (:partial AND r.outcome='PARTIAL' AND r.status='FAILED'))

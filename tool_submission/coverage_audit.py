@@ -66,7 +66,7 @@ def gather(app, markets: list[str]) -> dict:
     for m in markets:
         with app.get_session(m) as conn, conn.begin():
             runs = conn.execute(text(
-                "SELECT id, source_id, cycle_id, cycle_seq, cycle_state, status, outcome FROM collector_run "
+                "SELECT id, source_id, cycle_id, cycle_seq, cycle_state, status, outcome, completed_at FROM collector_run "
                 "WHERE source_id IS NOT NULL ORDER BY id")).all()
             asins: dict[int, list[str]] = defaultdict(list)
             for rid, a in conn.execute(text(
@@ -74,9 +74,14 @@ def gather(app, markets: list[str]) -> dict:
                     "WHERE r.source_id IS NOT NULL ORDER BY ca.collector_run_id, ca.id")):
                 asins[rid].append(a)
             dirs: dict[int, set[str]] = defaultdict(set)
-            for sid, d in conn.execute(text("SELECT source_id, direction FROM acquisition_path WHERE direction IS NOT NULL")):
+            paths: dict[int, set[tuple]] = defaultdict(set)  # 出典 -> {(方向, 起点のimport_id)}（レーンの経路の判定に使う。backfill）
+            for sid, d, iid in conn.execute(text("SELECT source_id, direction, origin_import_id FROM acquisition_path WHERE direction IS NOT NULL")):
                 dirs[sid].add(d)
-        out[m] = {"runs": runs, "asins": asins, "dirs": dirs}
+                paths[sid].add((d, iid))
+            sources = {r.source_id: {"status": r.status, "hold_reason": r.hold_reason, "source_type": r.source_type, "key_primary": r.key_primary}
+                       for r in conn.execute(text("SELECT source_id, status, hold_reason, source_type, key_primary FROM acquisition_source"))}
+            blocked = {str(r.seller_id).strip().upper(): r.reason for r in conn.execute(text("SELECT seller_id, reason FROM storefront_blocked_seller"))}
+        out[m] = {"runs": runs, "asins": asins, "dirs": dirs, "paths": paths, "sources": sources, "blocked": blocked}
     return out
 
 
@@ -121,24 +126,14 @@ def _read_input(raw: str, bases: list[Path], cache: dict) -> list[str]:
     return out
 
 
-def audit(app, ledger: SubmissionLedger, markets: list[str] | None = None, *, batch_target: int = 5000, flush: bool = False,
-          skip_failures: bool = False, base_dirs: list[Path] | None = None) -> dict:
-    """周期×方向ごとの照合結果。{"rows": [...], "unreadable_plans": [...], "totals": {...}}。**書き込みはしない**（DBはSELECTのみ）。
-    各行の追加項目（ドライラン計算。何も書かない）:
-      unplanned(a)未計画 / overlap_other・net_unregistered(b)同じ方向の他の周期・出典で計画済みのASINを除いた正味の未登録 /
-      held_withdrawn(c)取り下げ・保留（withdrawn+dup_withdrawn）・plan_asins_by_state（状態別の計画ASIN数）/
-      would_plan(d)この修正を適用した場合に新たに計画されるASIN数（周期が終了=未計画の全件。OPEN=batch_targetの満杯分のみ。flush有効・猶予経過を仮定する場合はwould_plan_flush）。
-      失敗runだけが保存したASINは、skip_failures=falseなら入力にならないのでexcluded_failed_runとして除く。"""
-    markets = markets or ["US", "JP"]
-    ledger_dir = Path(ledger.path).resolve().parent
-    bases = [ledger_dir, ledger_dir.parent, *(base_dirs or [])]
-    data = gather(app, markets)
-    states = ledger.all_states()
-    cache: dict = {}
-    plans: dict[tuple, list[dict]] = defaultdict(list)
-    owners: dict = defaultdict(lambda: defaultdict(set))  # 方向 -> ASIN -> 計画済みの(市場,出典,周期)（取り下げ以外）
-    unreadable = []
-    for key, st in states.items():
+def ledger_plan_records(ledger: SubmissionLedger, bases: list[Path], cache: dict | None = None) -> tuple[list[dict], list[dict]]:
+    """台帳の計画（マニフェストのあるキー）を平らな記録にする（読み取りのみ。auditとbackfillで共通）。
+    各記録: {key, state, kind(planned|repeat|withdrawn|dup_withdrawn), market(取得先), source_id, direction, cycle_key, asins(set), asin_count,
+    run_id, split_parent, chunk}。戻り値の2つ目は、入力ファイルを読めない計画（件数が1以上なのに読めない）。"""
+    cache = {} if cache is None else cache
+    records: list[dict] = []
+    unreadable: list[dict] = []
+    for key, st in ledger.all_states().items():
         m = st.manifest
         if not m:
             continue
@@ -152,12 +147,33 @@ def audit(app, ledger: SubmissionLedger, markets: list[str] | None = None, *, ba
             kind = "repeat"
         else:
             kind = "planned"
-        if kind in ("planned", "repeat"):
-            for a in asins:
-                owners[m.get("direction")][a].add((m.get("fetch_market"), m.get("source_id"), ck_))
-        plans[(m.get("fetch_market"), m.get("source_id"), m.get("direction"))].append(
-            {"key": key, "kind": kind, "state": st.state, "cycle_key": ck_, "asins": asins, "asin_count": m.get("asin_count"),
-             "run_id": m.get("collector_run_id"), "split_parent": m.get("split_parent"), "chunk": (m.get("chunk_index"), m.get("chunk_count"))})
+        records.append({"key": key, "kind": kind, "state": st.state, "market": m.get("fetch_market"), "source_id": m.get("source_id"),
+                        "direction": m.get("direction"), "cycle_key": ck_, "asins": asins, "asin_count": m.get("asin_count"),
+                        "run_id": m.get("collector_run_id"), "split_parent": m.get("split_parent"),
+                        "chunk": (m.get("chunk_index"), m.get("chunk_count"))})
+    return records, unreadable
+
+
+def audit(app, ledger: SubmissionLedger, markets: list[str] | None = None, *, batch_target: int = 5000, flush: bool = False,
+          skip_failures: bool = False, base_dirs: list[Path] | None = None) -> dict:
+    """周期×方向ごとの照合結果。{"rows": [...], "unreadable_plans": [...], "totals": {...}}。**書き込みはしない**（DBはSELECTのみ）。
+    各行の追加項目（ドライラン計算。何も書かない）:
+      unplanned(a)未計画 / overlap_other・net_unregistered(b)同じ方向の他の周期・出典で計画済みのASINを除いた正味の未登録 /
+      held_withdrawn(c)取り下げ・保留（withdrawn+dup_withdrawn）・plan_asins_by_state（状態別の計画ASIN数）/
+      would_plan(d)この修正を適用した場合に新たに計画されるASIN数（周期が終了=未計画の全件。OPEN=batch_targetの満杯分のみ。flush有効・猶予経過を仮定する場合はwould_plan_flush）。
+      失敗runだけが保存したASINは、skip_failures=falseなら入力にならないのでexcluded_failed_runとして除く。"""
+    markets = markets or ["US", "JP"]
+    ledger_dir = Path(ledger.path).resolve().parent
+    bases = [ledger_dir, ledger_dir.parent, *(base_dirs or [])]
+    data = gather(app, markets)
+    records, unreadable = ledger_plan_records(ledger, bases)
+    plans: dict[tuple, list[dict]] = defaultdict(list)
+    owners: dict = defaultdict(lambda: defaultdict(set))  # 方向 -> ASIN -> 計画済みの(市場,出典,周期)（取り下げ以外）
+    for r in records:
+        if r["kind"] in ("planned", "repeat"):
+            for a in r["asins"]:
+                owners[r["direction"]][a].add((r["market"], r["source_id"], r["cycle_key"]))
+        plans[(r["market"], r["source_id"], r["direction"])].append(r)
     rows = []
     for market, d in data.items():
         cycles: dict[tuple, list] = defaultdict(list)

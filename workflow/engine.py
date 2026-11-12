@@ -634,7 +634,17 @@ class Engine:
                 until = max((b.until for b in d.blockers if b.until), default=None)
                 # 取り直しの上限（CYCLE_RESTART_LIMIT）は、時間では解けない: 人が原因を確認して release で解除するまで止まる（要対応として表示）
                 needs_release = "CYCLE_RESTART_LIMIT" in codes or "ON_HOLD" in codes
+                # 取得制御（保留）と、保存済みASINの登録計画は別（#105）。保留（ON_HOLD。AUTO_FAILURES・AUTO_CYCLE_RESTARTS・MANUAL）の出典でも、
+                # 取得・保存済みの結果があれば投入計画（expand）の入力にする。ここでは枝の状態（mode・codes・要解除）は変えず、保存済みのrunを記録するだけ。
+                # 除外(EXCLUDED。PERMANENTLY_EXCLUDED含む)は対象外のまま。取得の対象選定・再開・自動保留・上限には触れない。
+                saved = None
+                if "ON_HOLD" in codes and "EXCLUDED" not in codes:
+                    try:
+                        saved = reusable_run(self.factory, market, sid, 10 ** 9)  # 鮮度は問わない（登録計画の入力。watchのcandidate_runsも鮮度を見ない）
+                    except Exception:  # noqa: BLE001 - 計画の入力を探せなくても、枝の記録（保留）は変えない
+                        saved = None
                 recs[str(sid)] = {"mode": "SKIPPED_POLICY", "codes": codes, "permanent": "EXCLUDED" in codes,
+                                  **({"saved_run_id": saved["run_id"]} if saved else {}),
                                   "needs_release": needs_release,
                                   "release_cmd": f"python -m acquisition.cli release --market {market} --source-id {sid} --reason ..." if needs_release else None,
                                   "reeval_at": until.strftime("%Y-%m-%dT%H:%M:%SZ") if until and "EXCLUDED" not in codes and not needs_release else None,
@@ -857,14 +867,18 @@ class Engine:
         carry: list[dict] = []  # 持ち越した・使えなかったASINの報告（黙って捨てない。#104）
         for sid, rec in acq.result.get("sources", {}).items():
             if rec["mode"] not in ("FETCHED", "REUSED", "PARTIAL_SAVED") and not (self.cfg.batch_target_asins and rec["mode"] == "EMPTY"):
-                continue
+                if not (rec["mode"] == "SKIPPED_POLICY" and rec.get("saved_run_id")):  # 保留(ON_HOLD)の出典の保存済みの結果は投入計画に回す（#105）
+                    continue
+                run_id_ = rec["saved_run_id"]
+            else:
+                run_id_ = rec["run_id"]
             try:
-                items, files = build_items(self.factory, market, rec["run_id"], out_dir=Path(self.cfg.submission_dir),
+                items, files = build_items(self.factory, market, run_id_, out_dir=Path(self.cfg.submission_dir),
                                            max_per_input=self.cfg.tool_max_asins, ledger=self.ledger, batch_target=self.cfg.batch_target_asins,
                                            allow_saved_partial=self.cfg.skip_failures, flush_unfilled=self.cfg.flush_unfilled_batches,
                                            flush_min_age_minutes=self.cfg.flush_min_age_minutes, now=self.now(), carryover=carry)
             except SubmissionError as exc:
-                skipped.append({"run_id": rec["run_id"], "reason": str(exc)[:200]})
+                skipped.append({"run_id": run_id_, "reason": str(exc)[:200]})
                 continue
             keep = []
             # extraは「既存の出典の取得」(acquire)の結果にだけ使う。crossで発見した反対側の出典(acquire_x)は従来どおり origin_import だけ
@@ -873,7 +887,7 @@ class Engine:
                 if has_lane_path(i.paths, i.direction, lane_imports):
                     keep.append((i, f))
                 else:
-                    skipped.append({"run_id": rec["run_id"], "direction": i.direction,
+                    skipped.append({"run_id": run_id_, "direction": i.direction,
                                     "reason": "このレポート(import)の経路が無い方向のため投入しません"})
             if not keep:
                 continue

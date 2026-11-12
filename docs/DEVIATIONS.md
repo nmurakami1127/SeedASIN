@@ -1711,3 +1711,56 @@ Amazonのナビゲーションはdomcontentloadedで待機し、第三者リソ�
     `--state OPEN,BROKEN`・`--min-asins`・`--batch-target`・`--skip-failures`・`--input-base`・`--json`。入力ファイルのパスは、Windowsのバックスラッシュ区切り・Linuxのスラッシュ区切り、相対・別環境の絶対パスのどちらも、台帳のフォルダー・その親・カレント・`--input-base`の下から探して読む（BOM付きも可。`resolve_input_path`）。
     ドライラン計算は planner の規則の近似（run単位の候補選定・実時刻は見ない）。実際の計画は`flush-plan`（見積もりは書き込まない）で確認できる。
   - 気づいた点: 周期の最初のrun自体が失敗(BROKEN)で、使える取得が1つも無い周期は、`skip_failures=false`では入力にできない（`build_items`が「入力に使えません」）。`skip_failures=true`（#70で実運用に有効化とある）なら端数を含めて全件計画される。
+
+## 105. 過去の周期に取り残された保存済みASINの回収 `backfill-remainders` と、保留(ON_HOLD)出典の保存済みASINの投入計画（2026-11-12）
+
+- 背景（実データ）: `audit-coverage`で、5,000件超の周期のうちIMPORT側13周期に未計画35,680 ASIN（BROKEN 8周期 21,243・OPEN 5周期 14,437）が残っていた。他の周期・出典（同じ方向）で計画済みの重なり2,143件を除いた正味は33,537件。
+  保留出典の例: source 239・279・280・303・323・333。原因は、watchの自動計画（`workflow/buffer_recovery.py::candidate_runs`）が `acquisition_source.status='ACTIVE'` の出典しか対象にしていなかったこと。
+  **取得を止める判断（保留・除外＝取得制御）と、すでに保存したASINの登録計画は別**。この件は後者だけを直す（取得側には触れない）。
+- 出典の`status`は `ACTIVE` / `ON_HOLD` / `EXCLUDED`（0016の`ck_as_status`）。ON_HOLDの`hold_reason`は `AUTO_FAILURES`・`AUTO_CYCLE_RESTARTS`・`MANUAL`。EXCLUDED（今後も取得しない）と、`storefront_blocked_seller`が
+  `PERMANENTLY_EXCLUDED`のセラーは「取得しない」の意味なので対象外のまま。`COMPETITOR_SAME_SERVICE`・`RETRY_LATER`（保留相当）のセラーの出典がACTIVEなら従来から対象（変更なし）。
+
+### 依頼A: `python -m tool_submission.cli backfill-remainders`（新規）
+
+- 既定は**dry-run**（DB・台帳・入力ファイルに書かない）。`--apply`のときだけ、台帳へPLANNEDを追記し、入力CSV・マニフェストを書く（y/n確認。非対話端末では拒否）。**出典の状態（保留・除外）・DBには一切書かない**。送信もしない。
+  レポートは dry-runでも書く（`--report-dir`。既定 `exports/backfill_reports/<日時>/`）: `before.json`（台帳の件数・周期×方向ごとの分類・恒等式）／`plan.json`（作る入力・投入鍵・件数・分割）／`summary.txt`、
+  `--apply`では実行前後の台帳件数・状態別件数の差分を`after.json`にも保存する。
+- 計画は既存の`planner.build_items`（分割・投入鍵・マニフェスト・端数の放出）と`write_plan`をそのまま使う。1入力5,000件以下に分割し端数も含める。方向ごとに別入力（IMPORT/EXPORTを混ぜない）。
+  レーンの経路規則は`workflow/lane_imports.py::has_lane_path`（レーンの`origin_import`＋`extra_origin_imports`）。レーンに経路の無い方向（例: JP source303 c5890 のEXPORT 17,788件）は計画せず、「レーン経路なし」で件数だけ集計する。`--direction IMPORT|EXPORT`で絞れる。
+- 周期（取得先市場・出典・一巡）×方向ごとに、周期のASINを**重ならない理由**に分け、合計が周期のASIN数に一致することを確認する（崩れていれば終了コード1。`--apply`は何も書かずに中止）。理由（先に当たったものが優先）:
+  同じ周期で計画済み／結果不明(UNKNOWN・AMBIGUOUS)／追跡取り下げ(ABANDONED)／重複取り下げ／取り下げ済み(PLAN_WITHDRAWN)／未送信確認済みの鍵で再試行／同じ出典の他の周期で計画済み(repeat)／他の出典（同じ方向）で計画済み／
+  出典除外／方向未確定／レーン経路なし／台帳の入力ファイルを読めない(二重計画を避けて対象外)／取得中(RUNNING・CAPTCHA_WAIT)／使える取得runなし／猶予待ち／最後の使えるrunより後の失敗runの保存分／形式不正／既存の投入鍵／計画の見送り・失敗。残りが登録対象。
+- 入力にする取得run: watchの`candidate_runs`（一巡の最新の使えるrun。出典の状態は見ない）。**それが無い周期**（使えるrunの後に続きの取得がCAPTCHA等で失敗して保留になり、周期がBROKENではなくOPENのまま止まっている出典、旧方式のrun）は、
+  周期の最新の使えるrun（COMPLETEDでSUCCESS_NONEMPTY/TRUNCATED、`skip_failures=true`ならPARTIAL/FAILEDも）を入力にする。それより後の失敗runの保存分は入力にせず、「失敗runの保存分」として件数だけ集計する（`build_items`の規則と同じ）。使えるrunが無ければ「使える取得runなし」。
+- **復活させない**: PLAN_WITHDRAWN・重複取り下げ・TRACKING_ABANDONED・結果不明のASINは、他の周期・出典での重複や`--include-overlap`より優先して対象外にする。取り下げ済みの投入鍵（状態がNONE以外の鍵）は再計画しない・上書きしない。
+- **他の周期・出典での重複**: 既定は除外（ユーザー方針）。`--include-overlap`で**他の出典**（同じ方向）の重複だけを含める。同じ出典の他の周期のASINは、通常の計画でもrepeat（`--allow-duplicate`が要る再投入）なので、このコマンドでは常に計画しない（`flush-plan`と同じ方針）。
+  複数の周期を同時に確定するため、古い取得（runのid順）から順に確定し、先に確定した周期のASINを後の周期では重複として除く（dry-runも同じ順で、台帳のコピーの上で再現する）。
+- **冪等**: 2回目の`--apply`は0件（計画したASINは「同じ周期で計画済み」になる。テストで確認）。`write_plan`も同じ内容・同じ鍵なら追記しない。
+- OPEN周期は猶予（`flush_min_age_minutes`。設定値。`--grace-minutes`で変更・`--ignore-grace`で無視）を考慮する。猶予内は「猶予待ち」として集計し計画しない。実行中のrun（RUNNING・CAPTCHA_WAIT）がある周期は`--ignore-grace`でも計画しない。
+  OPENでも猶予後は端数まで全件を計画する（取得側の周期・再開位置には影響しない。計画は台帳に積むだけ）。
+- 絞り込み: `--market`（取得先市場）・`--min-asins`・`--state OPEN,BROKEN`（旧方式はLEGACY）・`--source`・`--cycle`・`--direction`。入力ファイルの相対パスは`audit-coverage`と同じ`resolve_input_path`（Windows/Linux両方）。`--config`でレーン・batch_target・skip_failures・猶予・出力先を読む。
+  DBへの接続は`flush-plan`と同じ`workflow.dbconn.readonly_factory`（`SEEDASIN_APP_DATABASE_URL`、無ければローカル開発DBのapp_role。読み取りのみ）。
+- 共通化した部分（既存の呼び出し元は互換）: `coverage_audit.ledger_plan_records`（台帳の計画の読み込み。`audit`もこれを使う）、`coverage_audit.gather`の項目追加（completed_at・経路のimport_id・出典の状態・storefrontのブロック。既存の項目は不変）、
+  `planner.build_items(exclude_asins=)`（任意引数。既定Noneは従来どおり。`{方向: ASIN集合}`を入力から除き、件数を`carryover`にreason=EXCLUDED_BY_CALLERで報告）、`buffer_recovery.candidate_runs(any_source=)`（任意引数）。
+- 注意: 稼働中のwatch・登録ループが同じASINを別の鍵で計画しないよう、`--apply`の前に止めることを勧める（二重計画の回避。実行前にコマンドも注意を表示する）。
+
+### 依頼B: 保留(ON_HOLD)出典の保存済みASINを通常の計画に入れる（取得側は変更しない）
+
+- `workflow/buffer_recovery.py::candidate_runs`（watchの`stage_stalled_inputs`・登録ループの`_plan_flush`・`flush-plan`が共通で使う）: 出典の状態を `ACTIVE` から **`ACTIVE` または `ON_HOLD`**（`PLANNABLE_SOURCE_SQL`）に広げた。
+  対象外のまま: `EXCLUDED`、および`storefront_blocked_seller`が`PERMANENTLY_EXCLUDED`のセラーの**保留**出典。ACTIVEの出典の扱いは変えていない（storefront_blocked_sellerを新たに見ない）。
+  根拠: ON_HOLD（AUTO_FAILURES・AUTO_CYCLE_RESTARTS・MANUAL）は「これ以上取りに行かない」判断であって、すでに保存済みのASINを登録しない理由ではない。EXCLUDED・PERMANENTLY_EXCLUDEDは「今後も取得しない・使わない」の意味。
+  **MANUALの保留**も含まれる（人が保留にした理由は読めない）。登録してほしくないものは、保留ではなく除外（`acquisition.cli exclude-source`）にするか、`--source`単位で`backfill-remainders`の対象から外す。
+- `workflow/engine.py`（engineの通常計画）: 取得しない枝（`_acquire_sources`）の判定は**一切変えず**（`mode=SKIPPED_POLICY`・`codes`・`needs_release`・要解除の表示はそのまま）、`ON_HOLD`で`EXCLUDED`を含まない枝に、保存済みの最新の使えるrunを`saved_run_id`として**記録するだけ**にした。
+  `_run_expand`は、この`saved_run_id`がある保留の枝の保存済み結果も`build_items`の入力にする。取得の対象選定・再開・自動保留・CAPTCHA・ページ上限・日次上限・`usable`の数え方には触れない。実際には、保留の出典がengineの`todo`に入るのは、発見で登録された出典・持ち越しの出典に限られる（通常の候補選択は保留を選ばない）ので、主に効くのはwatchの`candidate_runs`側。
+- 影響範囲: watchに反映するには `workflow/buffer_recovery.py`（候補の選び方）が変わった版で`watch`を再起動する（`workflow/engine.py`・`tool_submission/planner.py`・`tool_submission/coverage_audit.py`は同じブランチの変更）。**本番設定の変更は不要**
+  （`flush_unfilled_batches`・`skip_failures`・`batch_target_asins`は今のまま）。新しい版に切り替えると、watchの次の15分周期で、保留出典の保存済みASINが計画に入る（件数はまず`backfill-remainders`のdry-runで確認すること。通常の計画は`--apply`と違い確認なしで台帳へ追記される）。
+- 旧テストの変更: なし（既存テストの期待は変えていない）。
+
+### テスト
+
+- `tests/unit/test_backfill_remainders.py`（理由の分類・恒等式・復活させない優先順位・`--include-overlap`・各ゲート・台帳の前後差分。DB不要）。
+- `tests/integration/test_backfill_remainders.py`（実PostgreSQL・疑似ページ）: dry-runで何も書かない／`--apply`で期待どおり（6入力・状態PLANNED・マニフェスト・CSV）／確認拒否で何も書かない／2回目は0件／ON_HOLD出典の回収と保留状態の不変／
+  5,001・12,300・20,000件の分割／PLAN_WITHDRAWN・結果不明・TRACKING_ABANDONEDの不復活／IMPORT・EXPORT分離とレーン経路なし／他の出典との重複除外と`--include-overlap`／EXCLUDED・猶予・絞り込み／
+  OPEN周期の猶予・実行中の周期／依頼B: watchの計画にON_HOLDが入りEXCLUDED・永久除外は入らない・保留状態と取得側の判定は不変／engineの保留の枝（SKIPPED_POLICYのまま保存済みを計画）。
+- 既知の失敗2件（`tests/unit/test_shared_browser_runtime.py::test_tool_session_and_market_browsers_share_runtime_but_not_profiles`、`tests/unit/test_workflow.py::test_skip_failures_keeps_evidence_and_does_not_skip_human_waits`）は、この変更前から出ているもので、この変更の対象外。
+- 実PostgreSQLでの結合テストはWorker環境の一時PG（5433）で実行。実データ（本番DB・台帳の実ファイル）には対して実行していない。PCでの`--apply`は未実施・未確認。

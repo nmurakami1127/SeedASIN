@@ -114,7 +114,8 @@ def build_items(app: SessionFactory, fetch_market: str, run_id: int, *, out_dir:
                 max_per_input: int = MAX_ASINS_PER_INPUT, ledger: SubmissionLedger | None = None,
                 batch_target: int = 0, allow_saved_partial: bool = False,
                 flush_buffer: bool = False, flush_unfilled: bool = False, flush_min_age_minutes: int = 0,
-                now: datetime | None = None, carryover: list | None = None) -> tuple[list[SubmissionItem], list[bytes]]:
+                now: datetime | None = None, carryover: list | None = None,
+                exclude_asins: dict[str, set[str]] | None = None) -> tuple[list[SubmissionItem], list[bytes]]:
     """計画と、各入力ファイルの内容を返す。書き込みはしない。
     ledgerを渡すと、**同じ出典・業務方向**の投入差分を管理する:
     - 同じ一巡で既に投入（送信開始済み・結果不明・未送信の投入計画への予約を含む）したASINは、この入力から除く（再送しない）。
@@ -129,7 +130,9 @@ def build_items(app: SessionFactory, fetch_market: str, run_id: int, *, out_dir:
     max_per_input以下に分割して全件を計画する（取りこぼさない）。
     carryover（任意。listを渡すと追記する）: 持ち越した・投入に使えなかったASINを黙って捨てないための報告。各要素は
     {"kind": "HELD_REMAINDER"|"UNUSED_FAILED_RUN_ASINS", "run_id", "source_id", "fetch_market", "direction", "cycle_key", "cycle_state",
-     "repeat", "asin_count", "reason"}。reasonは OPEN / FLUSH_WAITING / DEFERRED_TO_LATER_RUN / FAILED_RUN_NOT_ALLOWED。"""
+     "repeat", "asin_count", "reason"}。reasonは OPEN / FLUSH_WAITING / DEFERRED_TO_LATER_RUN / FAILED_RUN_NOT_ALLOWED。
+    exclude_asins（任意。{方向: ASINの集合}。docs/DEVIATIONS.md #105）: 呼び出し側が「この方向では入力に入れない」と決めたASIN（`backfill-remainders`が、他の周期・出典で計画済み・
+    取り下げ済み等と照合して決める）。同じ周期の占有・未送信確認済みの除外と同じ位置で入力から除き、件数をcarryover(reason=EXCLUDED_BY_CALLER)に報告する。既定（None）は従来と同じ。"""
     if not 0 <= batch_target <= max_per_input:
         raise SubmissionError("batch_target は0〜max_per_inputで指定してください")
     with app.get_session(fetch_market) as conn, conn.begin():
@@ -230,6 +233,14 @@ def build_items(app: SessionFactory, fetch_market: str, run_id: int, *, out_dir:
                 carryover.append({"kind": "RETRY_PENDING_NOT_SUBMITTED", "run_id": run_id, "source_id": src.source_id, "fetch_market": fetch_market,
                                   "direction": d, "cycle_key": ckey, "cycle_state": cycle_state, "repeat": False, "asin_count": n_before - len(remaining),
                                   "reason": "NOT_SUBMITTED_RETRY", "later_run_id": None})
+        forced = (exclude_asins or {}).get(d)
+        if forced:  # 呼び出し側の指定による除外（backfill-remainders。#105）
+            n_before = len(remaining)
+            remaining = [a for a in remaining if a not in forced]
+            if n_before != len(remaining) and carryover is not None:
+                carryover.append({"kind": "EXCLUDED_BY_CALLER", "run_id": run_id, "source_id": src.source_id, "fetch_market": fetch_market,
+                                  "direction": d, "cycle_key": ckey, "cycle_state": cycle_state, "repeat": False, "asin_count": n_before - len(remaining),
+                                  "reason": "EXCLUDED_BY_CALLER", "later_run_id": None})
         withdrawn_asins = _withdrawn_asins(states, src.source_id, fetch_market, d, ckey, file_cache) if newly_released else set()
         new_part = [a for a in remaining if a not in earlier]
         repeat_part = [a for a in remaining if a in earlier]
@@ -281,6 +292,7 @@ CARRYOVER_REASON_TEXT = {
     "FAILED_RUN_NOT_ALLOWED": "失敗runの保存分で、設定(skip_failures)が許さないため入力にしない",
     "PLAN_WITHDRAWN": "取り下げ済みの計画のASIN。自動では再計画しない",
     "NOT_SUBMITTED_RETRY": "未送信と確認済みの投入鍵のASIN。既存の鍵で再試行する（別キーで再計画しない）",
+    "EXCLUDED_BY_CALLER": "呼び出し側の指定で除外（他の周期・出典で計画済み等。backfill-remainders）",
 }
 
 
