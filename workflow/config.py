@@ -172,6 +172,10 @@ class WorkflowConfig:
     flush_unfilled_batches: bool = False
     flush_min_age_minutes: int = 30  # 同じ一巡の最新の取得runからこの分数が過ぎるまで、端数を計画に回さない（続きのrunをまとめるための待ち）。0〜1440
     auto_registration: AutoRegistration = field(default_factory=AutoRegistration)  # 登録の自動復旧（既定は無効）。docs/DEVIATIONS.md #102
+    # 保存済みASINのプール登録（tool_submission/pool.py。docs/DEVIATIONS.md #106）。出典・方向ごとに、未登録ASINのうち最新の保存から
+    # pool_quiet_minutes分が過ぎた（追加が落ち着いた）か、最古の保存から pool_max_wait_minutes分が過ぎたら計画する。0=その待ちを使わない（quietが0なら待たない）
+    pool_quiet_minutes: int = 30
+    pool_max_wait_minutes: int = 360
 
     def to_dict(self) -> dict:
         d = asdict(self)
@@ -183,6 +187,10 @@ class WorkflowConfig:
             d.pop("flush_unfilled_batches", None)
         if d.get("flush_min_age_minutes") == 30:
             d.pop("flush_min_age_minutes", None)
+        if d.get("pool_quiet_minutes") == 30:
+            d.pop("pool_quiet_minutes", None)
+        if d.get("pool_max_wait_minutes") == 360:
+            d.pop("pool_max_wait_minutes", None)
         if d.get("auto_registration") == asdict(AutoRegistration()):
             d.pop("auto_registration", None)
         return d
@@ -313,6 +321,12 @@ class WorkflowConfig:
             raise ConfigError(f"flush_min_age_minutes は0〜1440（分）の整数で指定してください（指定: {self.flush_min_age_minutes!r}）")
         if self.flush_unfilled_batches and not self.batch_target_asins:
             raise ConfigError("flush_unfilled_batches=true には batch_target_asins>0 が必要です（端数は蓄積方式の中でだけ扱います）")
+        for name in ("pool_quiet_minutes", "pool_max_wait_minutes"):
+            v = getattr(self, name)
+            if isinstance(v, bool) or not isinstance(v, int) or not 0 <= v <= 10080:
+                raise ConfigError(f"{name} は0〜10080（分）の整数で指定してください（0=その待ちを使わない。指定: {v!r}）")
+        if self.pool_quiet_minutes and self.pool_max_wait_minutes and self.pool_max_wait_minutes < self.pool_quiet_minutes:
+            raise ConfigError("pool_max_wait_minutes は pool_quiet_minutes 以上で指定してください")
         self._validate_auto_registration()
         return self
 
@@ -372,7 +386,7 @@ def config_from_dict(d: dict) -> WorkflowConfig:
             **{k: d[k] for k in ("brand_enabled", "tool_max_asins", "result_max_age_days", "state_dir", "submission_dir",
                                  "page_revisit_days", "profile", "listing_feedback", "skip_failures", "batch_target_asins",
                                  "submission_enabled", "tool_session_monitor", "close_on_repeated_page", "flush_unfilled_batches",
-                                 "flush_min_age_minutes") if k in d},
+                                 "flush_min_age_minutes", "pool_quiet_minutes", "pool_max_wait_minutes") if k in d},
         )
     except TypeError as exc:
         raise ConfigError(f"設定に未知の項目があります: {exc}") from exc

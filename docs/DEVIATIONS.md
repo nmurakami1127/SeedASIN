@@ -1711,3 +1711,30 @@ Amazonのナビゲーションはdomcontentloadedで待機し、第三者リソ�
     `--state OPEN,BROKEN`・`--min-asins`・`--batch-target`・`--skip-failures`・`--input-base`・`--json`。入力ファイルのパスは、Windowsのバックスラッシュ区切り・Linuxのスラッシュ区切り、相対・別環境の絶対パスのどちらも、台帳のフォルダー・その親・カレント・`--input-base`の下から探して読む（BOM付きも可。`resolve_input_path`）。
     ドライラン計算は planner の規則の近似（run単位の候補選定・実時刻は見ない）。実際の計画は`flush-plan`（見積もりは書き込まない）で確認できる。
   - 気づいた点: 周期の最初のrun自体が失敗(BROKEN)で、使える取得が1つも無い周期は、`skip_failures=false`では入力にできない（`build_items`が「入力に使えません」）。`skip_failures=true`（#70で実運用に有効化とある）なら端数を含めて全件計画される。
+
+## 106. 登録を「保存済みの未登録ASINのプール」方式に簡素化: 出典×方向ごとに最大5,000件ずつ計画（2026-11-13）
+
+背景: 周期（OPEN/BROKEN/COMPLETE）・端数の持ち越し・猶予・repeat・候補runの選び方に依存した登録計画（#102・#104）は、取りこぼしと説明の難しさの原因だった。
+DB（`collector_asin`）に保存済みの未登録ASINを、周期に関係なく出典×業務方向ごとに5,000件(`tool_max_asins`)以下で計画する形に一本化した。**DBスキーマ変更なし。取得側（探索・取得制御・CAPTCHA・保留判定）・出典の状態・保留はDBに書かない・触らない。**
+
+- 新規`tool_submission/pool.py`（共通処理）: 取得先市場×出典×方向ごとに、その出典の全run（status/outcome/周期は見ない。RUNNING・FAILEDのrunのASINも対象）のASINを、
+  collector_asin.id順・重複除去・大文字化して集め、次を除く（重ならない理由に分類し、保存ASIN数＝各理由の合計＋登録対象の恒等式を確認する）:
+  台帳の**同じ出典・同じ方向**で既に計画・登録されたもの（PLANNED/SUBMITTING/UNKNOWN/AMBIGUOUS/ABANDONED/RUN_IDENTIFIED/MEMO_SAVED/LINKED。周期不問・repeat鍵のASINも占有）／
+  NOT_SUBMITTEDの鍵のASIN（既存の鍵で再試行。別キーに入れない）／取り下げ済み（PLAN_WITHDRAWN・DUPLICATE_WITHDRAWN。復活させない）／形式不正（10桁英数字でない）／
+  除外出典（`acquisition_source.status='EXCLUDED'`・`storefront_blocked_seller`がPERMANENTLY_EXCLUDED）／方向なし／その方向のレーン経路なし（`has_lane_path`・レーンimport集合。IMPORT出典をEXPORTに出さない）。
+  **ON_HOLD（手動保留含む）は対象**。**他の出典で登録済みでも除外しない**（重なる件数を情報として出すだけ）。
+- 分割: 保存順のまま5,000件以下ごと。端数も計画（5,000件到達を条件にしない）。IMPORT/EXPORTは混ぜない。計画は既存の`planner._items_for`/`write_plan`/`SubmissionLedger`を再利用
+  （manifestの`cycle_key`は`"pool"`、`fetched_from.basis`は`collector_asin_pool`）。投入鍵は(入力に寄与した最新のrun id, 方向, 入力ASIN集合の内容)で決まり、再実行は2回目0件。台帳は追記のみ（既にある鍵は書かない）。
+  出典・方向ごとに独立して処理し、1つの失敗（例: 台帳の計画の入力ファイルを読めない＝二重計画を避けて見送る）は他を止めず、その出典・方向を報告に残す。
+- 時間ルール（設定`pool_quiet_minutes`=30・`pool_max_wait_minutes`=360。既定値は`to_dict`に出さず従来のsha256を変えない。0=その待ちを使わない。quiet=0なら待たない）:
+  collector_asinにはASIN時刻が無いので、**そのASINを（最初に）保存したrunの時刻**（completed_at、無ければstarted_at。RUNNING/CAPTCHA_WAITは現在）をASINの時刻とする。
+  出典・方向ごとに、未登録ASINのうち最新の時刻からquiet分以上、または最古の時刻からmax_wait分以上で、見えている未登録ASINを全件計画する。
+- 呼び出し: `workflow/watch.py`の15分ごとの計画は`pool.stage_pool_inputs`（`stage_stalled_inputs`の置換。`batch_target_asins>0`の条件を外した）、`workflow/registration_loop.py`は`_plan_pool`（`_plan_flush`の置換。`flush_unfilled_batches`の条件を外し、`--only-keys`時は従来どおり計画しない）、
+  CLIは`python -m tool_submission.cli plan-pool`（既定dry-run・`--apply`でy/n確認の上で台帳へPLANNED追記・`--report-dir`・`--market`・`--direction`・`--source`・`--now`・`--input-base`。DBはreadonly_factory）。
+  `pool-history-check`（読み取り専用・登録経路には入れない）: 登録対象のうち、既に`tool_output_asin`（同じ出典キー=seller_idの実行の出力／どの実行の出力にも）に出ているASINと、出典キーの`tool_execution_link`の件数を出典×方向別に数える。
+- 維持: AMBIGUOUS鍵（例: e085ab161e1bfcc8）は状態を変えず、占有として扱うので再送・再計画しない。repeat（repeat_of_earlier_cycle=true）のPLANNED鍵は自動復活・自動送信しない（plan-poolは変更せず、そのASINを占有として扱う。`register_saved`がrepeatをスキップする既存挙動は不変）。
+- **登録経路から外したもの**（コードは削除していない＝呼ばれなくなった）: `buffer_recovery.stage_stalled_inputs`/`plan_stalled`/`candidate_runs`（watch・登録ループからは呼ばれない。`workflow.cli flush-plan`と既存テストだけが使う）、
+  `planner.build_items`の`batch_target`/`flush_unfilled`/`carryover`（HELD_REMAINDER等）/repeat分離（`engine._run_expand`・`selection`の候補判定は従来どおり呼ぶ。下記）、`workflow/flush_plan.py`（`flush-plan`コマンド。旧方式の見積もり用）。
+  `engine._run_expand`（取得直後の同じworkflow内の計画）は今回変えていない。`batch_target_asins=0`（既定）では、その取得runの全ASINを従来どおり計画する。プールはその占有（同じ出典・方向）を除いて計画するので二重登録にはならない。
+- 既存テストの変更（期待値は変えていない）: `tests/unit/test_auto_registration.py`・`tests/integration/test_auto_registration_flow.py`の4件が、登録ループの計画関数を差し替える`monkeypatch`の名前`_plan_flush`を新しい`_plan_pool`に変えた（関数名の置換のみ。旧関数・旧CLIは残したため、他の既存テストは無変更）。
+- テスト: `tests/integration/test_pool_registration.py`（実PostgreSQL）、`tests/unit/test_pool.py`。実画面（統合ツール）への投入は確認していない。

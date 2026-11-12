@@ -1,8 +1,8 @@
-"""常駐の登録ループ（docs/DEVIATIONS.md #102）。一定間隔で「付与・UNKNOWN自動照合 → 計画の追加(flush) → 登録の一回分」を繰り返す。
+"""常駐の登録ループ（docs/DEVIATIONS.md #102）。一定間隔で「付与・UNKNOWN自動照合 → 保存済みASINのプール計画 → 登録の一回分」を繰り返す。
 
 起動は利用者が行う（exportsは触らない。K8sのCronJobにはしない）。探索（Amazonへのアクセス）はしない。
-- 1回分の中身: ①SAVE前の一時的な失敗への再試行権の自動付与 ②（flush_unfilled_batches=trueなら）待ち時間が過ぎた端数の計画の追加（台帳へPLANNEDを
-  追記するだけ） ③`register_saved`（UNKNOWNの自動照合を最初に行い、続けて新規の投入）。結果不明の再送はしない。
+- 1回分の中身: ①SAVE前の一時的な失敗への再試行権の自動付与 ②保存済みの未登録ASINのプール計画（tool_submission/pool.py。時間ルールを満たした出典・方向を台帳へPLANNEDで
+  追記するだけ。周期に依存しない。#106） ③`register_saved`（UNKNOWNの自動照合を最初に行い、続けて新規の投入）。結果不明の再送はしない。
 - 人手待ち（ログイン・CAPTCHA等）は通知のみ。ブラウザは開いたままにして次の周期で自動続行する（Enter不要。RealPortsのkeep_tool_open）。
 - 日次上限・送信前の保全チェック（retention_gate）・同時1件（GLOBAL_LOCK）は`register_saved`/`submit_item`のまま維持する。
 - 解決できない結果不明は、台帳のNEEDS_HUMANと`needs_human.jsonl`に記録して通知する（自動解決しない）。
@@ -22,21 +22,15 @@ from workflow.store import WorkflowBusy, WorkflowStore
 
 def run_cycle(cfg, factory, ports, *, now: datetime | None = None, say: Callable[[str], None] = print, allow_keys=(), only_keys=None) -> dict:
     """1周期。戻り値は集計（planned: 計画に追加した入力数・ASIN数 / states: 各工程の状態の件数 / needs_human: 新しく記録した件数）。
-    only_keys（#103）: 指定した投入鍵だけを処理する。新規の投入計画は作らない（flush_unfilled_batches=trueでも_plan_flushを呼ばない）。"""
+    only_keys（#103）: 指定した投入鍵だけを処理する。新規の投入計画は作らない（_plan_poolを呼ばない）。"""
     now = now or datetime.now(timezone.utc)
     ledger = SubmissionLedger(Path(cfg.submission_dir) / "ledger.jsonl")
     res: dict = {"planned": (0, 0), "states": {}, "needs_human": 0, "error": None}
-    if cfg.flush_unfilled_batches and only_keys is None:
+    if only_keys is None:  # 保存済みの未登録ASINのプール登録の計画（tool_submission/pool.py。周期に依存しない。#106）
         try:
-            carry: list = []
-            res["planned"] = _plan_flush(cfg, factory, ledger, now, carry)
-            res["carryover"] = carry
-            from tool_submission.planner import summarize_carryover
-            held_total, held_text = summarize_carryover(carry)
-            if held_total:
-                say(held_text)  # 持ち越した端数の件数と理由（黙って切り捨てない）
+            res["planned"] = _plan_pool(cfg, factory, ledger, now, say)
             if res["planned"][0]:
-                say(f"端数を投入計画へ回しました: {res['planned'][0]}件・{res['planned'][1]:,} ASIN（台帳へPLANNEDを追記しただけで、送信は登録の一回分が行います）")
+                say(f"保存済みの未登録ASINを投入計画へ回しました: {res['planned'][0]}件・{res['planned'][1]:,} ASIN（台帳へPLANNEDを追記しただけで、送信は登録の一回分が行います）")
         except Exception as exc:  # noqa: BLE001 - 計画の追加の失敗で登録を止めない
             res["error"] = f"計画の追加に失敗: {type(exc).__name__}: {exc}"
             say(res["error"])
@@ -50,23 +44,16 @@ def run_cycle(cfg, factory, ports, *, now: datetime | None = None, say: Callable
     return res
 
 
-def _plan_flush(cfg, factory, ledger, now, carryover_out: list | None = None) -> tuple[int, int]:
-    """待ち時間が過ぎた端数を台帳へPLANNEDとして追記する（stage_stalled_inputsと同じ計画。workflowの状態は作らない）。"""
-    from tool_submission.planner import write_plan
-    from workflow.buffer_recovery import plan_stalled
+def _plan_pool(cfg, factory, ledger, now, say=print) -> tuple[int, int]:
+    """保存済みの未登録ASINを台帳へPLANNEDとして追記する（workflowの状態は作らない）。出典・方向ごとの失敗は他を止めず、通知する。"""
+    from tool_submission.pool import plan_pool
 
-    tally = [0, 0]
-
-    def on_plan(rp):
-        if carryover_out is not None:
-            carryover_out.extend(rp.carryover)
-        if rp.kept:
-            write_plan([it for it, _ in rp.kept], [d for _, d in rp.kept], ledger)
-            tally[0] += len(rp.kept)
-            tally[1] += sum(it.asin_count for it, _ in rp.kept)
-
-    plan_stalled(factory, cfg, ledger, now=now, on_plan=on_plan)
-    return tally[0], tally[1]
+    res = plan_pool(factory, cfg, ledger, now=now)
+    for r in res["report"]["errors"]:
+        say(f"プール登録の計画を見送り: {r['market']} 出典{r['source_id']} {r['direction']}: {r['error']}")
+    for s_ in res["skipped"]:
+        say(f"プール登録の計画を書けませんでした: {s_['key']}: {s_['reason']}")
+    return len(res["written"]), sum(e["item"].asin_count for e in res["written"])
 
 
 def _note_needs_human(cfg, ledger, now, say, only=None) -> int:

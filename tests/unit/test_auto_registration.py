@@ -416,7 +416,7 @@ def test_loop_cycle_plans_flush_registers_and_notes_needs_human_once(tmp_path, m
     make_unknown(lg)
     lg.append("k1", "NEEDS_HUMAN", reason="自動照合で180分以上解決しません")
     calls = []
-    monkeypatch.setattr(L, "_plan_flush", lambda *a: (2, 7))
+    monkeypatch.setattr(L, "_plan_pool", lambda *a: (2, 7))
     monkeypatch.setattr(L, "register_saved", lambda *a, **k: (calls.append("register"), SimpleNamespace(tasks={
         "submit:k1": SimpleNamespace(status="UNKNOWN", detail="結果不明", id="submit:k1")}))[1])
     said = []
@@ -678,7 +678,7 @@ def test_only_keys_busy_lock_is_reported_without_sending(tmp_path, monkeypatch):
     assert code == 3 and any("他の処理が実行中" in x for x in out) and any("未実行" in x for x in out)
 
 
-def test_cycle_with_only_keys_never_calls_plan_flush_and_limits_needs_human(tmp_path, monkeypatch):
+def test_cycle_with_only_keys_never_calls_plan_pool_and_limits_needs_human(tmp_path, monkeypatch):
     from workflow import registration_loop as L
     cfg = config_from_dict({"lanes": {"US": {"origin_import": 1}}, "state_dir": str(tmp_path / "wf"), "submission_dir": str(tmp_path / "sub"),
                             "batch_target_asins": 5000, "flush_unfilled_batches": True, "auto_registration": {"enabled": True}})
@@ -687,7 +687,7 @@ def test_cycle_with_only_keys_never_calls_plan_flush_and_limits_needs_human(tmp_
         lg.append(k, "PLANNED", manifest={})
         make_unknown(lg, k)
         lg.append(k, "NEEDS_HUMAN", reason="解決しません")
-    monkeypatch.setattr(L, "_plan_flush", lambda *a: pytest.fail("--only-keysでは計画を追加しない"))
+    monkeypatch.setattr(L, "_plan_pool", lambda *a: pytest.fail("--only-keysでは計画を追加しない"))
     got = {}
     monkeypatch.setattr(L, "register_saved", lambda *a, **k: (got.update(k), SimpleNamespace(tasks={}))[1])
     res = L.run_cycle(cfg, None, object(), now=datetime(2026, 11, 6, tzinfo=timezone.utc), say=lambda s: None, only_keys={"k1"})

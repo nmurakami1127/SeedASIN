@@ -179,9 +179,9 @@ def test_only_keys_creates_no_new_plans_even_when_flush_is_enabled(app_role_fact
     n_events = len(led.events())
 
     def boom(*a, **k):
-        raise AssertionError("--only-keysでは計画の追加(_plan_flush)を呼んではいけない")
+        raise AssertionError("--only-keysでは計画の追加(_plan_pool)を呼んではいけない")
 
-    monkeypatch.setattr(L, "_plan_flush", boom)
+    monkeypatch.setattr(L, "_plan_pool", boom)
     code, out = _only(w, app_role_factory, [k1])
     assert code == 0, out
     assert set(led.all_states()) == {k1, k2}  # 新しい投入鍵は作られない

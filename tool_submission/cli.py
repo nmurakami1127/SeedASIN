@@ -2,6 +2,8 @@
 
     python -m tool_submission.cli plan --fetch-market US --run-id 82 [--dry-run]
     python -m tool_submission.cli ledger
+    python -m tool_submission.cli plan-pool [--apply] [--report-dir DIR] [--market US|JP|both] [--direction EXPORT|IMPORT] [--source ID]   # 保存済みの未登録ASINを出典×方向ごとに5,000件以下で計画（既定は読み取りのみ）
+    python -m tool_submission.cli pool-history-check [--market ...]   # plan-poolの登録対象が統合ツールの履歴(tool_output_asin等)に既にあるか（読み取り専用）
     python -m tool_submission.cli audit-coverage [--market US|JP|both] [--only-gaps] [--min-asins 5001] [--detail] [--json]   # 取得ASINの投入計画への反映を確認（読み取り専用）
     # 手動で投入する場合（画面の手順は docs/DEVIATIONS.md #60）
     python -m tool_submission.cli begin     --key <投入キー> --log-json <送信直前のログ一覧> --options-json <画面の設定値>   # 送信権の確保・送信開始の記録（SAVEの前）
@@ -624,6 +626,82 @@ def _cmd_audit_coverage(a: argparse.Namespace) -> int:
     return 0 if rep["identity_ok"] else 1
 
 
+def _pool_args(a, factory):
+    """plan-pool / pool-history-checkの共通: 設定・台帳・読み取り専用の接続・計算結果。"""
+    from datetime import datetime, timezone
+
+    from tool_submission import pool
+    from workflow.config import load_config
+
+    cfg = load_config(a.config)
+    ledger = SubmissionLedger(Path(a.ledger) if a.ledger else Path(cfg.submission_dir) / "ledger.jsonl")
+    if factory is None:
+        from workflow.dbconn import readonly_factory, resolve_app_url
+
+        print(f"[接続] app_role（読み取り専用）: {resolve_app_url()[1]}")
+        factory = readonly_factory()
+    now = datetime.fromisoformat(a.now) if a.now else datetime.now(timezone.utc)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    markets = ["US", "JP"] if a.market == "both" else [a.market]
+    rep = pool.compute(factory, cfg, ledger, now=now, out_dir=Path(a.out_dir) if a.out_dir else None, markets=markets,
+                       directions={a.direction} if a.direction else None, sources=set(a.source) if a.source else None,
+                       base_dirs=[Path(x) for x in (a.input_base or [])])
+    return pool, cfg, ledger, factory, rep
+
+
+def _cmd_plan_pool(a: argparse.Namespace, factory=None, confirm=None) -> int:
+    """保存済みの未登録ASINを出典×方向ごとに5,000件以下で計画する。既定は読み取りのみ。--applyだけ、y/n確認の上で台帳へPLANNEDを追記する（送信はしない）。"""
+    import sys
+
+    pool, cfg, ledger, factory, rep = _pool_args(a, factory)
+    print("\n".join(pool.format_report(rep)))
+    if a.report_dir:
+        print(f"レポート: {pool.write_report(rep, Path(a.report_dir))}")
+    code = 0 if rep["identity_ok"] and not rep["errors"] else 1
+    if not a.apply:
+        print("（読み取りのみです。何も書いていません。台帳へ追記するなら --apply）")
+        return code
+    n = len(rep["items"])
+    if n == 0:
+        print("追記する新しい入力はありません")
+        return code
+    if confirm is None:
+        if not sys.stdin.isatty():
+            print("[中止] --apply は対話端末でのy/n確認が必要です")
+            return 2
+        confirm = lambda q: input(q).strip().lower() == "y"  # noqa: E731
+    if not confirm(f"台帳へ新しい入力{n}件（{sum(e['item'].asin_count for e in rep['items']):,} ASIN）をPLANNEDとして追記します（送信はしません）。よろしいですか [y/N] "):
+        print("確認が取れなかったので何も変更していません")
+        return 2
+    rep = pool.compute(factory, cfg, ledger, now=rep["now"], out_dir=Path(a.out_dir) if a.out_dir else None, markets=rep["params"]["markets"],
+                       directions=set(rep["params"]["directions"] or []) or None, sources=set(rep["params"]["sources"] or []) or None,
+                       base_dirs=[Path(x) for x in (a.input_base or [])])  # 確認の間に台帳が変わっていても、最新の状態で計画する
+    done, skipped = pool.write_items(rep["items"], ledger)
+    print(f"台帳へ追記しました: 入力{len(done)}件・{sum(e['item'].asin_count for e in done):,} ASIN（送信はしていません）")
+    for s_ in skipped:
+        print(f"  書かなかった: {s_['key']}: {s_['reason']}")
+    if a.report_dir:
+        print(f"レポート: {pool.write_report(rep, Path(a.report_dir), applied=True, extra={'written': [e['item'].key for e in done], 'skipped': skipped})}")
+    return code if not skipped else 1
+
+
+def _cmd_pool_history_check(a: argparse.Namespace, factory=None) -> int:
+    """plan-poolの登録対象が、統合ツールの履歴（tool_output_asin・tool_execution_link）に既にあるかを数える（DBはSELECTのみ。台帳・入力ファイルには書かない）。"""
+    pool, cfg, ledger, factory, rep = _pool_args(a, factory)
+    rows = pool.history_check(factory, rep)
+    print("pool-history-check: 登録対象ASINと統合ツール履歴の重なり（読み取り専用。登録経路には使いません）")
+    for r in rows:
+        print(f"  {r['market']} 出典{r['source_id']}({str(r['source_key'])[:24]}) {r['direction']}（業務市場{r['business_market']}）: 登録対象{r['targets']:,}"
+              f" ／同じ出典キーの実行の出力に既にある{r['in_output_same_source']:,} ／どの実行の出力にも既にある{r['in_output_any_source']:,}"
+              f" ／この出典キーの対応記録（実行）{r['source_link_count']}件")
+    if not rows:
+        print("  登録対象なし")
+    else:
+        print(f"  合計: 登録対象{sum(r['targets'] for r in rows):,} ／同じ出典キーで既に{sum(r['in_output_same_source'] for r in rows):,} ／どの実行にも既に{sum(r['in_output_any_source'] for r in rows):,}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="python -m tool_submission.cli")
     sub = p.add_subparsers(dest="command", required=True)
@@ -645,6 +723,20 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--flush", action="store_true", help="（前提の記録用）flush有効・猶予経過を仮定した場合の数は would_plan_flush に常に出る")
     sp.add_argument("--skip-failures", action="store_true", help="ドライラン計算の前提: 本番設定のskip_failures=true（失敗runの保存分も入力にする）")
     sp.add_argument("--input-base", action="append", default=None, help="入力ファイルの相対パスを探す基準フォルダー（複数可。既定は台帳のフォルダーとその親・カレント）")
+
+    for name, fn, help_ in (("plan-pool", _cmd_plan_pool, "保存済みの未登録ASINを出典×方向ごとに5,000件以下で投入計画にする（既定は読み取りのみ。--applyで台帳へ追記）"),
+                            ("pool-history-check", _cmd_pool_history_check, "plan-poolの登録対象が統合ツールの履歴に既にあるか確認する（読み取り専用）")):
+        sp = add(name, fn, help_)
+        sp.add_argument("--config", default="config/workflow.json")
+        sp.add_argument("--market", default="both", choices=["US", "JP", "both"], help="取得先市場（collector_runの市場）")
+        sp.add_argument("--direction", default=None, choices=["EXPORT", "IMPORT"])
+        sp.add_argument("--source", type=int, action="append", default=None, help="出典ID（複数可）")
+        sp.add_argument("--now", default=None, help="基準時刻（ISO形式。テスト・検証用。既定は現在）")
+        sp.add_argument("--out-dir", default=None, help="入力ファイルの出力先（既定は設定のsubmission_dir）")
+        sp.add_argument("--input-base", action="append", default=None, help="台帳の入力ファイルの相対パスを探す基準フォルダー（複数可）")
+        if name == "plan-pool":
+            sp.add_argument("--apply", action="store_true", help="y/n確認の上で台帳へPLANNEDを追記する（送信はしない）")
+            sp.add_argument("--report-dir", default=None, help="レポート（JSONとテキスト）の出力先")
 
     sp = add("abandon", _cmd_abandon, "結果不明の投入の追跡を取り下げる（外部ジョブの取消ではない）")
     sp.add_argument("--key", required=True)
@@ -721,8 +813,12 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
-def main(argv: list[str] | None = None, *, confirm=None) -> int:
+def main(argv: list[str] | None = None, *, confirm=None, factory=None) -> int:
     a = build_parser().parse_args(argv)
+    if a.func is _cmd_plan_pool:
+        return a.func(a, factory=factory, confirm=confirm)
+    if a.func is _cmd_pool_history_check:
+        return a.func(a, factory=factory)
     if a.func is _cmd_withdraw_duplicate:
         return a.func(a, confirm=confirm)
     return a.func(a)
