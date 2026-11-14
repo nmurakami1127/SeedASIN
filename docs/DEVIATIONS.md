@@ -1773,3 +1773,12 @@ DB（`collector_asin`）に保存済みの未登録ASINを、周期に関係な�
 - **統合ツールのIDの自動削除は実装しない**: 外部の状態を変える取り消せない操作で、「今回の送信で作られた行であり内容が同一」を、ログ画面のメタ情報（seq・種別・メモ・設定値）だけでは断定できない（別の手動投入の行を消す危険）。ページアダプターに削除の手段も無い。人が削除し、システムは削除を確認して続ける。
 - 既存のTRACKING_ABANDONED・AMBIGUOUS鍵は**自動では取り込まない・触らない**（占有のまま）。取り込みは人が`duplicate-hold`（AMBIGUOUSのみ）で行う。TRACKING_ABANDONEDは候補の記録が無い・状態が終端のため自動では戻さない（提案は報告参照）。
 - テスト: `tests/unit/test_duplicate_wait.py`（重複→待ち→他の投入は進む／削除確認なしに再送しない／1件残り→メモ付け／全削除→再送／未割当の新規行・送信中の別投入・別のメモ・根拠なしでは進めない／冪等／engine／register_saved／通知／CLI）。実画面（統合ツール）は未確認。
+
+## 108. 追跡取り下げ済みの重複行を削除待ちへ取り込む `duplicate-adopt`（2026-11-15）
+
+- `python -m tool_submission.cli duplicate-adopt --key K [--key K2 ...] [--apply]`（既定dry-run。`--apply`はy/n確認）。最新状態がTRACKING_ABANDONED・マニフェストあり・台帳のAMBIGUOUSイベントに候補2件以上の鍵だけを、
+  `DUPLICATE_DELETE_WAIT`（`moved_from=TRACKING_ABANDONED`）へ移す。UNKNOWN由来（候補の記録なし）・他の状態・既に削除待ちの鍵は理由を表示して拒否（無理に移さない・何も追記しない。2回目は冪等に拒否）。
+- 台帳は追記のみ。`ledger._fold`は、ABANDONEDからの遷移を`moved_from=TRACKING_ABANDONED`付きのDUPLICATE_DELETE_WAITだけに許す（印の無いイベントでは戻らない）。再送・統合ツール操作・スキーマ変更なし。`duplicate.adopt_check`/`adopt_abandoned`を新設（`hold_ambiguous`と同じ作り）。
+- 移行後は#107の`assess_duplicate_wait`（`register_saved`が回す）が確認する: 人が既に1行にしてメモを付けていれば再送せずMEMO_SAVED→LINKEDへ収束／候補が2件残れば待つ／全て消えていても、同じメモの行（人の手動再投入等）や未割当の新規行があれば再送せず待つ／全て消え他に行が無いときだけNOT_SUBMITTED（再送可）。
+  ABANDONED・DUPLICATE_DELETE_WAITはどちらも`planner.OCCUPYING`なので、プールの占有は移行前後で変わらない。
+- テスト: `tests/unit/test_duplicate_wait.py`に追加。

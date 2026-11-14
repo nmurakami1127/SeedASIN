@@ -338,6 +338,40 @@ def _cmd_duplicate_hold(a: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_duplicate_adopt(a: argparse.Namespace, confirm=None) -> int:
+    """TRACKING_ABANDONEDで、台帳にAMBIGUOUSの候補（2件以上）がある鍵だけを、重複行の削除待ちへ移す。既定はdry-run。--applyはy/n確認。追記のみ。"""
+    from tool_submission.duplicate import adopt_abandoned, adopt_check
+
+    ledger = _ledger(a)
+    ok: list[tuple[str, list[int]]] = []
+    for key in dict.fromkeys(a.key):
+        cands, why = adopt_check(ledger, key)
+        if cands is None:
+            print(f"[拒否] {key}: {why}")
+            continue
+        m = ledger.state(key).manifest or {}
+        print(f"[対象] {key} {m.get('direction')} メモ={m.get('memo')} 候補{cands}")
+        ok.append((key, cands))
+    if not ok:
+        print("移せる鍵がありません")
+        return 2
+    if not a.apply:
+        print("（dry-run: 何も書きません。--apply で台帳へ追記します。再送はしません）")
+        return 0
+    if confirm is None:
+        confirm = lambda q: input(q).strip().lower() == "y"  # noqa: E731
+    if not confirm(f"{len(ok)}件を重複行の削除待ちへ移します（台帳への追記のみ・再送しません）。よろしいですか [y/N] "):
+        print("中止しました")
+        return 1
+    for key, _ in ok:
+        try:
+            adopt_abandoned(ledger, key)
+            print(f"{key}: 削除待ちへ移しました")
+        except ValueError as exc:  # 確認の間に状態が変わった
+            print(f"[拒否] {key}: {exc}")
+    return 0
+
+
 def _cmd_duplicate_check(a: argparse.Namespace) -> int:
     """削除待ちを、保存したログ画面（HTML/JSON）と照合する（読み取りの照合だけ。SAVE・削除はしない）。"""
     from tool_submission.duplicate import assess_duplicate_wait
@@ -832,6 +866,9 @@ def build_parser() -> argparse.ArgumentParser:
     sp = add("duplicate-hold", _cmd_duplicate_hold, "AMBIGUOUS（新規行が複数）の投入を重複行の削除待ちへ移す（追記のみ。再送しない）")
     sp.add_argument("--key", required=True)
     sp.add_argument("--reason", default=None)
+    sp = add("duplicate-adopt", _cmd_duplicate_adopt, "TRACKING_ABANDONEDで台帳にAMBIGUOUSの候補（2件以上）がある鍵を、重複行の削除待ちへ移す（既定dry-run・--applyでy/n確認・追記のみ）")
+    sp.add_argument("--key", action="append", required=True)
+    sp.add_argument("--apply", action="store_true")
     sp = add("duplicate-check", _cmd_duplicate_check, "削除待ちを保存したログ画面と照合し、1件残っていれば実行IDを確定／全て消えていれば再送可にする（SAVE・削除はしない）")
     sp.add_argument("--key", required=True)
     sp.add_argument("--log-html", required=True)
@@ -871,7 +908,7 @@ def main(argv: list[str] | None = None, *, confirm=None, factory=None) -> int:
         return a.func(a, factory=factory, confirm=confirm)
     if a.func is _cmd_pool_history_check:
         return a.func(a, factory=factory)
-    if a.func is _cmd_withdraw_duplicate:
+    if a.func in (_cmd_withdraw_duplicate, _cmd_duplicate_adopt):
         return a.func(a, confirm=confirm)
     return a.func(a)
 

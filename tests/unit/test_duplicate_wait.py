@@ -278,3 +278,84 @@ def test_loop_notes_the_waiting_key_once_with_tool_ids(tmp_path, lg):
     assert L._note_needs_human(cfg, lg, now, msgs.append) == 1
     assert L._note_needs_human(cfg, lg, now, msgs.append) == 0  # 冪等
     assert len(msgs) == 1 and "7300001" in msgs[0] and "再送しません" in msgs[0]
+
+
+# ------------------------------------------------------------------ duplicate-adopt（TRACKING_ABANDONEDの取り込み。#108）
+def abandoned_dup(lg, key="k1", cands=(7300001, 7300002)):
+    lg.append(key, "SUBMIT_STARTED", before_run_ids=[100, 101])
+    lg.append(key, "EVIDENCE", evidence={"ok": True, "request_options": REQ_OPTS})
+    lg.append(key, "AMBIGUOUS", candidates=list(cands))
+    lg.abandon_unknown(key, reason="run_bulk_poolで追跡取り下げ")
+
+
+def test_adopt_check_accepts_only_abandoned_with_two_or_more_ambiguous_candidates(lg):
+    from tool_submission.duplicate import adopt_abandoned, adopt_check
+    abandoned_dup(lg)
+    lg.append("k2", "SUBMIT_STARTED", before_run_ids=[100])
+    lg.append("k2", "OUTCOME_UNKNOWN", reason="x")
+    lg.abandon_unknown("k2", reason="x")  # UNKNOWN由来（候補の記録なし）
+    lg.append("k3", "PLANNED", manifest=asdict(item(key="k3")))
+    assert adopt_check(lg, "k1") == ([7300001, 7300002], "")
+    assert adopt_check(lg, "k2")[0] is None and "2件未満" in adopt_check(lg, "k2")[1]
+    assert adopt_check(lg, "k3")[0] is None and adopt_check(lg, "nope")[0] is None
+    n = len(lg.events())
+    with pytest.raises(ValueError):
+        adopt_abandoned(lg, "k2")
+    assert len(lg.events()) == n
+    assert adopt_abandoned(lg, "k1") == [7300001, 7300002]
+    assert lg.state("k1").state == "DUPLICATE_DELETE_WAIT" and pending_others(lg, "k3") == []
+    with pytest.raises(ValueError):  # 冪等: 2回目は何も追記しない
+        adopt_abandoned(lg, "k1")
+    assert lg.state("k1").state == "DUPLICATE_DELETE_WAIT"
+
+
+def test_a_waiting_key_without_adopt_marker_cannot_leave_abandoned(lg):
+    abandoned_dup(lg)
+    lg.append("k1", "DUPLICATE_DELETE_WAIT", candidates=[7300001, 7300002])  # moved_fromなし: 状態は変わらない
+    assert lg.state("k1").state == "ABANDONED"
+
+
+def test_adopted_key_converges_to_linked_when_a_human_already_left_one_row_with_the_memo(lg):
+    from tool_submission.duplicate import adopt_abandoned
+    abandoned_dup(lg)
+    adopt_abandoned(lg, "k1")
+    page = FakePage([row(100), row(101), row(7300001, memo=MEMO, options=OPTS)], ledger=lg)
+    a = assess_duplicate_wait(lg, "k1", page.read_log())
+    assert a.kind == "IDENTIFIED"
+    r = submit_item(lg, page, item(), Path("x.csv"), sleep=NOSLEEP, hold_duplicates=True)
+    assert r.kind == "MEMO_SAVED" and page.clicks == 0 and page.memo_clicks == 0 and lg.state("k1").state == "MEMO_SAVED"
+
+
+def test_adopted_key_is_not_resent_while_duplicated_or_when_a_manual_resubmission_exists(lg):
+    from tool_submission.duplicate import adopt_abandoned
+    abandoned_dup(lg)
+    adopt_abandoned(lg, "k1")
+    both = FakePage([row(100), row(101), row(7300001), row(7300002)], ledger=lg)
+    assert assess_duplicate_wait(lg, "k1", both.read_log()).kind == "STILL_WAITING"
+    # 候補は全て消えたが、人が手で再投入した行（同じメモ）がある → 再送しない
+    manual = FakePage([row(100), row(101), row(7300005, memo=MEMO, options=OPTS)], ledger=lg)
+    assert assess_duplicate_wait(lg, "k1", manual.read_log()).kind == "STILL_WAITING"
+    assert lg.state("k1").state == "DUPLICATE_DELETE_WAIT" and both.clicks == manual.clicks == 0
+    clean = FakePage([row(100), row(101)], ledger=lg)  # 全て消え、他に行が無い → 再送可
+    assert assess_duplicate_wait(lg, "k1", clean.read_log()).kind == "RETRY_READY" and lg.state("k1").state == "NOT_SUBMITTED"
+
+
+def test_adopted_key_stays_occupying_for_the_pool(lg):
+    from tool_submission.duplicate import adopt_abandoned
+    abandoned_dup(lg)
+    assert lg.state("k1").state in OCCUPYING
+    adopt_abandoned(lg, "k1")
+    assert lg.state("k1").state in OCCUPYING
+
+
+def test_cli_duplicate_adopt_dry_run_apply_and_rejections(lg, capsys):
+    abandoned_dup(lg)
+    lg.append("k3", "PLANNED", manifest=asdict(item(key="k3")))
+    base = ["duplicate-adopt", "--key", "k1", "--key", "k3", "--ledger", str(lg.path)]
+    assert cli_main(base) == 0 and lg.state("k1").state == "ABANDONED"  # dry-run
+    out = capsys.readouterr().out
+    assert "[対象] k1" in out and "[拒否] k3" in out and "dry-run" in out
+    assert cli_main(base + ["--apply"], confirm=lambda q: False) == 1 and lg.state("k1").state == "ABANDONED"
+    assert cli_main(base + ["--apply"], confirm=lambda q: True) == 0 and lg.state("k1").state == "DUPLICATE_DELETE_WAIT"
+    assert lg.state("k3").state == "PLANNED"
+    assert cli_main(base + ["--apply"], confirm=lambda q: True) == 2  # 冪等: 移せる鍵が無い

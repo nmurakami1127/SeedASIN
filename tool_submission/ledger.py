@@ -11,6 +11,7 @@ DBのスキーマは変えない暫定の置き場（DBに置く案は docs/DEVI
 - DUPLICATE_DELETE_WAIT  **統合ツールに同じ送信の重複行（新規行が複数）ができ、人が余分な行を削除するのを待っている**（docs/DEVIATIONS.md #107）。
                    この投入だけが待つ（他の投入は止めない）。再送・メモ保存はしない。削除を確認できたら、1件残っていればその行の実行IDを確定
                    （DUPLICATE_RESOLVED→RUN_IDENTIFIED）、全て消えていて安全と確認できれば再送の権利を戻す（DUPLICATE_DELETED_VERIFIED→NOT_SUBMITTED）
+                   （既にTRACKING_ABANDONEDの鍵は、AMBIGUOUSの候補が2件以上ある場合だけ`duplicate-adopt`で移せる。docs/DEVIATIONS.md #108）
 - RUN_IDENTIFIED   **実行ID確定・メモ未保存**。ASINは再投入せず、この実行IDのメモ保存から再開する
 - MEMO_SAVED       実行IDの行にメモが保存され、再読込で確認できた
 - LINKED           **対応記録済み**: 既存の取込（ingest-log）が`tool_execution_link`へ記録したことを確認できた
@@ -206,7 +207,8 @@ class SubmissionLedger:
                     st.needs_human = None
                 st.state = "AMBIGUOUS"
             elif ev == "DUPLICATE_DELETE_WAIT":  # 重複行の削除待ち。SUBMITTING/UNKNOWN/AMBIGUOUSからだけ（他の状態は変えない）
-                if st.state in ("SUBMITTING", "UNKNOWN", "AMBIGUOUS", "DUPLICATE_DELETE_WAIT"):
+                if st.state in ("SUBMITTING", "UNKNOWN", "AMBIGUOUS", "DUPLICATE_DELETE_WAIT") or (
+                        st.state == "ABANDONED" and e.get("moved_from") == "TRACKING_ABANDONED"):  # 追跡取り下げ済みの鍵の取り込み（duplicate-adopt）だけ
                     st.state, st.needs_human, st.last_duplicate_check = "DUPLICATE_DELETE_WAIT", None, None
                     st.duplicate_wait = {k: v for k, v in e.items() if k not in ("key", "event")} | {"ts": e["ts"]}
             elif ev == "DUPLICATE_CHECKED":  # 削除待ちの確認の記録（状態は変えない）

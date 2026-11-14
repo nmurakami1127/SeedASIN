@@ -47,6 +47,35 @@ def hold_ambiguous(ledger: SubmissionLedger, key: str, *, reason: str = "人の�
         return cands
 
 
+def adopt_check(ledger: SubmissionLedger, key: str) -> tuple[list[int] | None, str]:
+    """TRACKING_ABANDONEDの鍵を削除待ちへ移せるかを調べる（読み取りのみ）。移せるなら(候補, "")、移せないなら(None, 理由)。
+    条件: 最新状態がABANDONED・マニフェストあり・台帳のAMBIGUOUSイベントに候補が2件以上。UNKNOWN由来（候補なし）等は移さない。"""
+    st = ledger.state(key)
+    if st.state == "NONE":
+        return None, "台帳にありません"
+    if st.state == WAIT:
+        return None, "既に重複行の削除待ちです（何もしません）"
+    if st.state != "ABANDONED":
+        return None, f"状態が{st.state}です（TRACKING_ABANDONEDだけを移せます。AMBIGUOUSは duplicate-hold）"
+    if not st.manifest:
+        return None, "マニフェスト（計画）が台帳にありません"
+    cands = sorted({int(c) for e in st.events if e["event"] == "AMBIGUOUS" for c in e.get("candidates", [])})
+    if len(cands) < 2:
+        return None, "台帳のAMBIGUOUSの候補が2件未満です（結果不明で候補の記録が無い鍵は移しません）"
+    return cands, ""
+
+
+def adopt_abandoned(ledger: SubmissionLedger, key: str, *, reason: str = "人の判断: 追跡取り下げ済みの重複行を削除待ちへ取り込む") -> list[int]:
+    """TRACKING_ABANDONEDの鍵を重複行の削除待ちへ移す（追記のみ。再送しない・統合ツールは操作しない）。移せなければValueError（何も追記しない）。
+    以降は`assess_duplicate_wait`が確認する（人が既に1行にしてメモを付けていても、再送せずにLINKEDへ収束する）。"""
+    with ledger.key_lock(key):
+        cands, why = adopt_check(ledger, key)
+        if cands is None:
+            raise ValueError(why)
+        ledger.append(key, WAIT, candidates=cands, memo=(ledger.state(key).manifest or {}).get("memo"), reason=reason, moved_from="TRACKING_ABANDONED")
+        return cands
+
+
 def list_waits(ledger: SubmissionLedger) -> list[dict]:
     """削除待ちの投入の一覧（読み取り専用）: 削除してほしい統合ツールの実行ID・メモ・鍵・方向・出典。"""
     out = []
