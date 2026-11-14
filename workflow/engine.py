@@ -915,6 +915,10 @@ class Engine:
             return self._set(t, "DONE", f"既存の対応記録を引き継ぎ（実行ID={st.tool_run_id}）。再送しません", adopted=True,
                              tool_run_id=st.tool_run_id)
         item = item_from_manifest(st.manifest)
+        if st.state == "DUPLICATE_DELETE_WAIT":  # 重複行の削除待ち。この投入だけが待つ（他は進む）。削除を確認できたら先へ進む（#107）
+            if not self._duplicate_wait_resolved(t, key):
+                return
+            st = self.ledger.state(key)
         fresh = st.state in ("PLANNED", "NOT_SUBMITTED")
         if fresh and item.repeat_of_earlier_cycle and key not in self.st.allow_duplicates:
             return self._set(t, "HELD", f"過去の一巡で投入済み（または投入予約済み）のASIN {item.asin_count}件だけの再投入です（重複候補）。"
@@ -962,6 +966,8 @@ class Engine:
                 self.usage.commit(f"submit:{key}", amounts)
         if r.kind in ("MEMO_SAVED", "ALREADY_DONE"):
             return self._link(t, item, page)
+        if r.kind == "DUPLICATE_DELETE_WAIT":
+            return self._set(t, "HELD", self._duplicate_hold_text(key, r.detail), duplicate_wait=True)
         label = {"MEMO_UNSAVED": ("FAILED", "実行IDは特定済みですがメモ未保存です。resumeでメモ保存から再開します（ASINは再投入しません）"),
                  "MEMO_CONFLICT": ("HELD", "その実行IDには別のメモがあります（上書きしません）。画面で確認してください"),
                  "UNKNOWN": ("UNKNOWN", "送信の結果が不明です。再送せず、resumeでログの照合から再開します"),
@@ -976,7 +982,32 @@ class Engine:
         if not a.enabled:
             return {}
         return {"unreadable_waits": list(a.log_unreadable_waits_seconds), "post_save_wait": float(a.post_save_wait_seconds), "sleep": self.sleep,
-                "tolerate_needs_human": a.continue_past_needs_human}
+                "tolerate_needs_human": a.continue_past_needs_human, "hold_duplicates": True}
+
+    def _duplicate_hold_text(self, key: str, detail: str = "") -> str:
+        w = (self.ledger.state(key).duplicate_wait or {}).get("candidates", [])
+        return (f"重複行の削除待ち: 統合ツールで実行ID{list(w)}のうち1件だけを残し、余分な行を削除してください"
+                f"（削除を確認したら自動で続きを行います。再送はしません。一覧: `python -m tool_submission.cli duplicates`）{(' ' + detail) if detail else ''}")[:480]
+
+    def _duplicate_wait_resolved(self, t: Task, key: str) -> bool:
+        """削除待ち(DUPLICATE_DELETE_WAIT)の投入を、ログ画面と照合する（SAVE・削除はしない）。先へ進めるならTrue（台帳が
+        RUN_IDENTIFIED=残った1行にメモ付け、またはNOT_SUBMITTED=削除確認済みで再送可 になっている）。待つなら、このタスクだけをHELDにしてFalse。"""
+        from tool_submission.duplicate import assess_duplicate_wait
+        from tool_submission.reconcile import LogUnreadable
+
+        if not self.cfg.auto_registration.enabled:
+            self._set(t, "HELD", self._duplicate_hold_text(key), duplicate_wait=True)
+            return False
+        page = self._page()
+        try:
+            entries = page.read_log()
+        except LogUnreadable:
+            entries = None
+        r = assess_duplicate_wait(self.ledger, key, entries)
+        if r.kind in ("IDENTIFIED", "RETRY_READY"):
+            return True
+        self._set(t, "HELD", self._duplicate_hold_text(key, r.detail), duplicate_wait=True)
+        return False
 
     def _tolerate_needs_human(self) -> bool:
         a = self.cfg.auto_registration

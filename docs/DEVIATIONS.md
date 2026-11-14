@@ -1753,3 +1753,23 @@ DB（`collector_asin`）に保存済みの未登録ASINを、周期に関係な�
   `tests/unit/test_workflow_extra_origin.py`（`_run_expand`を`plan_pool`差し替えに。レーンのimport判定はpoolの結合テストで確認）／`tests/unit/test_split_remainder.py`（`_run_expand`の持ち越し報告のテストを削除）。
 - **不具合修正（本番dry-runで発見）**: `pool.gather`のループ内で`sources = {…}`が引数`sources`（出典の絞り込み）を上書きし、2市場目（JP）のSQLの絞り込みに1市場目（US）の出典ID一覧が入って、JPのASINがほぼ全て欠落していた（絞り込みなしでも発生）。ローカル変数を`source_rows`に改名。回帰テストを追加（US/JP両方にASINがある状態で`sources=None`と指定ありの`gather`/`compute`）。他の関数（`_scope`・`plan_pool`・`stage_pool_inputs`・`history_check`・`_run_expand`）に引数と同名の再代入が無いことをASTで確認した。
 - テスト: `tests/integration/test_pool_registration.py`（実PostgreSQL。履歴除外・_run_expand・古いRUNNING・排他を含む）、`tests/unit/test_pool.py`。実画面（統合ツール）への投入は確認していない。
+
+## 107. 統合ツールの重複行は登録全体を止めない: 重複行の削除待ち(DUPLICATE_DELETE_WAIT)（2026-11-14）
+
+- 背景: 統合ツールは1回のSAVEで同じ内容の行を2つ作ることがある（約4件に1件）。従来は新規行が複数→AMBIGUOUSとなり、`pending_others`がその1件を「未完了」と数えて、
+  他の投入が全て止まっていた（`run_bulk_pool.py`はこれをTRACKING_ABANDONEDで逃がしていた）。
+- 設計（台帳は追記のみ・DBスキーマ変更なし）:
+  - 新しい状態 `DUPLICATE_DELETE_WAIT`（イベント `DUPLICATE_DELETE_WAIT`=candidates・memo・reason）。**その投入1件だけ**が待つ。`pending_others`の`PENDING_STATES`に含めないので、他の投入はすぐ進む。
+    登録の自動化（`auto_registration.enabled`）が有効なときだけ、`submit_item(hold_duplicates=True)`（engineが渡す）が、SAVE後の新規行が複数のとき**待たずに**この状態を記録して返す。無効（既定）は従来どおりAMBIGUOUS（`resolve`）。
+  - 一覧: `python -m tool_submission.cli duplicates`（読み取り専用。削除してほしい統合ツールの実行ID・メモ・鍵・方向・出典・待ち開始・直近の確認）。登録ループは`needs_human.jsonl`へ冪等に記録し通知する。
+  - 削除後の確認: `tool_submission/duplicate.py::assess_duplicate_wait`（登録処理がログ画面を読んで自動実行。手動は`duplicate-check --key --log-html`）。SAVE・行の削除・ASIN入力はしない。
+    1. 候補が**ちょうど1件残り**、`corroborate`（EVIDENCE(ok)＋設定値）が合い、種別asin_list・他の投入に未割当 → `RUN_IDENTIFIED`(via=duplicate_resolved_*)。以降は既存のメモ保存→LINKED（**再送より既存の行へのメモ付けを優先**）。
+    2. 候補が**全て消え**、送信中・後続の未解決の投入が無く（`recovery.blocked_by_others`）、候補以外の未割当の新規asin_list行（メモが空/期待と同じ）が無い → `DUPLICATE_DELETED_VERIFIED`→`NOT_SUBMITTED`（上限に達していれば再試行権を1回分追加）。同じ鍵・同じASINの再送は既存のsubmit経路（日次上限・保全チェック・GLOBAL_LOCK）が行う。
+    3. それ以外（2件以上残る・ログを読めない・根拠が合わない・候補に別のメモ・未割当の新規行がある）→ 待ちのまま。同じ確認結果は`DUPLICATE_CHECKED`を重ねて追記しない（冪等）。
+    **削除の確認なしには再送しない**（再送の権利を戻すのは2だけ）。
+  - 既存コードの再利用: `RUN_IDENTIFIED`→`_memo_phase`→`engine._link`、`NOT_SUBMITTED`→通常のsubmit、`abandon_unknown`（削除待ちも取り下げ可）。`planner.OCCUPYING`・`dedupe.SUBMITTED_STATES`・`yield_report.SUBMITTED`・`ledger_read.HUMAN_STATES`に追加（プールは占有として扱い、再計画しない）。
+    他の投入の実行ID特定からは、削除待ちの候補の行を除く（`identified_run_ids`）。`register_saved`は削除待ちをUNKNOWNと同じ先頭グループで確認する（マニフェストが無いものは対象外）。
+  - 既存のAMBIGUOUSを削除待ちへ移す: `duplicate-hold --key`（AMBIGUOUSで候補が2件以上のときだけ。追記のみ。再送しない）。
+- **統合ツールのIDの自動削除は実装しない**: 外部の状態を変える取り消せない操作で、「今回の送信で作られた行であり内容が同一」を、ログ画面のメタ情報（seq・種別・メモ・設定値）だけでは断定できない（別の手動投入の行を消す危険）。ページアダプターに削除の手段も無い。人が削除し、システムは削除を確認して続ける。
+- 既存のTRACKING_ABANDONED・AMBIGUOUS鍵は**自動では取り込まない・触らない**（占有のまま）。取り込みは人が`duplicate-hold`（AMBIGUOUSのみ）で行う。TRACKING_ABANDONEDは候補の記録が無い・状態が終端のため自動では戻さない（提案は報告参照）。
+- テスト: `tests/unit/test_duplicate_wait.py`（重複→待ち→他の投入は進む／削除確認なしに再送しない／1件残り→メモ付け／全削除→再送／未割当の新規行・送信中の別投入・別のメモ・根拠なしでは進めない／冪等／engine／register_saved／通知／CLI）。実画面（統合ツール）は未確認。

@@ -35,7 +35,7 @@ def register_saved(cfg, factory, ports, allow_keys=(), *, now=None, only_keys=No
         st = State(store.new_id(), now_iso(), cfg.to_dict(), cfg.sha256())
         ordered = list(entries.items())
         if auto.enabled:  # 結果不明の自動照合を最初に（後続の投入が「別の投入が未完了」で止まらないように）。次に実行ID確定済み、最後に新規
-            rank = {'UNKNOWN': 0, 'RUN_IDENTIFIED': 1, 'MEMO_SAVED': 1}
+            rank = {'UNKNOWN': 0, 'DUPLICATE_DELETE_WAIT': 0, 'RUN_IDENTIFIED': 1, 'MEMO_SAVED': 1}
             ordered.sort(key=lambda kv: rank.get(kv[1].state, 2))
         for key, entry in ordered:
             if only is not None and key not in only:
@@ -44,9 +44,12 @@ def register_saved(cfg, factory, ports, allow_keys=(), *, now=None, only_keys=No
             if entry.state == 'UNKNOWN' and auto.enabled:
                 if not m.get('direction'):
                     continue  # 計画（マニフェスト）が台帳に無い結果不明は自動照合できない（人が確認）
+            elif entry.state == 'DUPLICATE_DELETE_WAIT':
+                if not m.get('direction'):
+                    continue  # 計画（マニフェスト）が無い削除待ちは自動確認できない（人が確認）
             elif entry.state not in ('PLANNED', 'NOT_SUBMITTED', 'RUN_IDENTIFIED', 'MEMO_SAVED'):
                 continue  # 結果不明は自動で再送しない
-            if m.get('repeat_of_earlier_cycle') and key not in allow_keys and entry.state != 'UNKNOWN':
+            if m.get('repeat_of_earlier_cycle') and key not in allow_keys and entry.state not in ('UNKNOWN', 'DUPLICATE_DELETE_WAIT'):
                 continue  # 明示許可（allow_keys）が無い再投入は対象にしない（送信済みの結果不明の照合は新規の再投入ではないので対象）
             lane = m.get('business_market')
             if lane not in cfg.lanes:

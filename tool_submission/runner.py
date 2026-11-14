@@ -69,7 +69,7 @@ class ToolPage(Protocol):
 
 @dataclass
 class SubmitResult:
-    kind: str  # MEMO_SAVED / ALREADY_DONE / MEMO_UNSAVED / MEMO_CONFLICT / UNKNOWN / AMBIGUOUS / NOT_SUBMITTED / REFUSED
+    kind: str  # MEMO_SAVED / ALREADY_DONE / MEMO_UNSAVED / MEMO_CONFLICT / UNKNOWN / AMBIGUOUS / DUPLICATE_DELETE_WAIT / NOT_SUBMITTED / REFUSED
     tool_run_id: str | None = None
     detail: str | None = None
     clicked: bool = False  # このプロセスがSAVE（ASIN投入）を押したか
@@ -91,16 +91,19 @@ def read_log_with_waits(page, waits: Sequence[float], sleep: Callable[[float], N
 
 def submit_item(ledger: SubmissionLedger, page: ToolPage, item: SubmissionItem, input_path: Path, *, log_retries: int = 3,
                 sleep: Callable[[float], None] = time.sleep, require_evidence: bool = False,
-                unreadable_waits: Sequence[float] = (), post_save_wait: float = 0.0, tolerate_needs_human: bool = False) -> SubmitResult:
+                unreadable_waits: Sequence[float] = (), post_save_wait: float = 0.0, tolerate_needs_human: bool = False,
+                hold_duplicates: bool = False) -> SubmitResult:
     """require_evidence=True（実画面向け）: 送信リクエスト・応答の根拠と、新規行の設定値の一致が無ければ、新規行が1件でも自分の送信と
     断定しない（結果不明として止める）。
     unreadable_waits / post_save_wait（既定は従来どおり待たない）: SAVE後のログ読み取りの再試行の待ちと、最初に読む前の待ち（#102）。
-    tolerate_needs_human: 人の判断待ちに記録済みの結果不明の投入があっても、他の独立した投入を止めない（既定False。#102）。"""
+    tolerate_needs_human: 人の判断待ちに記録済みの結果不明の投入があっても、他の独立した投入を止めない（既定False。#102）。
+    hold_duplicates（既定False=従来どおりAMBIGUOUSで人のresolve待ち。#107）: 新規行が複数（重複行）のとき、AMBIGUOUSにせず**重複行の削除待ち
+    (DUPLICATE_DELETE_WAIT)**を台帳に記録してすぐ返す（他の投入は止めない・再送もメモ保存もしない）。"""
     try:
         with ledger.key_lock(GLOBAL_LOCK):  # 実行IDの特定を一意にするため、自動の送信は同時に1件だけ
             with ledger.key_lock(item.key):
                 return _locked(ledger, page, item, input_path, log_retries, sleep, require_evidence, unreadable_waits, post_save_wait,
-                               tolerate_needs_human)
+                               tolerate_needs_human, hold_duplicates)
     except LedgerBusy as exc:
         return SubmitResult("REFUSED", detail=str(exc))
 
@@ -179,7 +182,7 @@ def claim_submission(ledger: SubmissionLedger, item: SubmissionItem, input_path:
 
 
 def _identify(ledger, page, item, before: set[int], response_run_id, retries, sleep, wait_seconds: float = 3.0,
-              require_evidence: bool = False, unreadable_waits: Sequence[float] = ()):
+              require_evidence: bool = False, unreadable_waits: Sequence[float] = (), hold_duplicates: bool = False):
     """ログ画面を（複数回）読んで新しい行を特定する。確定・曖昧は台帳に残す。見つからなければNone。LogUnreadableを送出し得る
     （unreadable_waitsの再試行をすべて使っても読めないとき）。"""
     exclude = ledger.identified_run_ids(item.key)
@@ -202,6 +205,12 @@ def _identify(ledger, page, item, before: set[int], response_run_id, retries, sl
                           via="response" if response_run_id is not None else "log_new_row")
             return d
         if d.kind == "AMBIGUOUS":
+            if hold_duplicates:  # 重複行: この投入だけ削除待ちにして、すぐ返す（待たない・他の投入を止めない）
+                ledger.append(item.key, "DUPLICATE_DELETE_WAIT", candidates=list(d.candidates), memo=item.memo,
+                              reason="SAVE後に新規行が複数できました（統合ツールの重複行）。余分な行を人が削除するまで、この投入だけ待ちます")
+                from tool_submission.reconcile import IdentifyDecision
+
+                return IdentifyDecision("DUPLICATE_WAIT", d.candidates)
             ledger.append(item.key, "AMBIGUOUS", candidates=list(d.candidates))
             return d
         if i + 1 < retries:
@@ -252,7 +261,7 @@ def _memo_phase(ledger, page, item, run_id: str, retries, sleep, wait_seconds: f
 
 
 def _locked(ledger, page, item, input_path, log_retries, sleep, require_evidence: bool = False, unreadable_waits: Sequence[float] = (),
-            post_save_wait: float = 0.0, tolerate_needs_human: bool = False) -> SubmitResult:
+            post_save_wait: float = 0.0, tolerate_needs_human: bool = False, hold_duplicates: bool = False) -> SubmitResult:
     st = ledger.state(item.key)
     if st.state in ("ABANDONED", "WITHDRAWN"):
         return SubmitResult("REFUSED", detail="人の指示で追跡を取り下げ済みです。再送・メモ保存はしません")
@@ -262,6 +271,8 @@ def _locked(ledger, page, item, input_path, log_retries, sleep, require_evidence
         return SubmitResult("ALREADY_DONE", st.tool_run_id, "対応済みです（再投入しません）")
     if st.state == "RUN_IDENTIFIED":  # 実行ID確定・メモ未保存: ASINは再投入せず、メモ保存から再開する
         return _memo_phase(ledger, page, item, st.tool_run_id, log_retries, sleep, unreadable_waits=unreadable_waits)
+    if st.state == "DUPLICATE_DELETE_WAIT":  # 重複行の削除待ち。ここでは何もしない（確認は tool_submission.duplicate.assess_duplicate_wait）
+        return SubmitResult("DUPLICATE_DELETE_WAIT", detail=f"重複行{(st.duplicate_wait or {}).get('candidates')}の削除待ちです。再送・メモ保存はしません")
     if st.state == "AMBIGUOUS":
         return SubmitResult("AMBIGUOUS", detail="対応を一意に確認できない状態です。resolveで人が実行IDを選ぶまで、送信もメモ保存もしません")
     if st.state in ("SUBMITTING", "UNKNOWN"):
@@ -270,13 +281,15 @@ def _locked(ledger, page, item, input_path, log_retries, sleep, require_evidence
             return SubmitResult("UNKNOWN", detail="送信前の基準がありません")
         try:
             d = _identify(ledger, page, item, set(st.before_run_ids), None, log_retries, sleep, require_evidence=require_evidence,
-                          unreadable_waits=unreadable_waits)
+                          unreadable_waits=unreadable_waits, hold_duplicates=hold_duplicates)
         except LogUnreadable as exc:
             return SubmitResult("UNKNOWN", detail=f"結果が不明のままです。ログ画面を読めません: {exc}")
         if d is not None and d.kind == "UNCORROBORATED":
             return SubmitResult("UNKNOWN", detail=f"新規行{list(d.candidates)}がありますが、自分の送信と対応する根拠がありません。メモを付けずに止めます")
         if d is not None and d.kind == "IDENTIFIED":
             return _memo_phase(ledger, page, item, d.tool_run_id, log_retries, sleep, unreadable_waits=unreadable_waits)
+        if d is not None and d.kind == "DUPLICATE_WAIT":
+            return SubmitResult("DUPLICATE_DELETE_WAIT", detail=f"新規行が複数あります: {list(d.candidates)}。重複行の削除待ちに記録しました（再送しません）")
         if d is not None:
             return SubmitResult("AMBIGUOUS", detail=f"新規行が複数あります: {list(d.candidates)}（対応を一意に確認できません）")
         if st.state == "SUBMITTING":
@@ -341,7 +354,7 @@ def _locked(ledger, page, item, input_path, log_retries, sleep, require_evidence
         if post_save_wait > 0:
             sleep(post_save_wait)  # SAVE直後はlogs.phpが重いことがある。少し置いてから読む（SAVEは繰り返さない）
         d = _identify(ledger, page, item, before, resp.run_id if resp else None, log_retries, sleep, require_evidence=require_evidence,
-                      unreadable_waits=unreadable_waits)
+                      unreadable_waits=unreadable_waits, hold_duplicates=hold_duplicates)
     except LogUnreadable as exc:
         ledger.append(item.key, "OUTCOME_UNKNOWN", reason=f"ログ画面を読めない: {exc}"[:300])
         return SubmitResult("UNKNOWN", detail="送信の結果を照合できません。再送しません", clicked=True)
@@ -350,6 +363,9 @@ def _locked(ledger, page, item, input_path, log_retries, sleep, require_evidence
                             clicked=True)
     if d is not None and d.kind == "IDENTIFIED":
         return _memo_phase(ledger, page, item, d.tool_run_id, log_retries, sleep, clicked=True, unreadable_waits=unreadable_waits)
+    if d is not None and d.kind == "DUPLICATE_WAIT":
+        return SubmitResult("DUPLICATE_DELETE_WAIT", detail=f"新規行が複数あります（重複行）: {list(d.candidates)}。重複行の削除待ちに記録しました。"
+                                                            "再送・メモ保存はしません", clicked=True)
     if d is not None:
         return SubmitResult("AMBIGUOUS", detail=f"新規行が複数あり、送信結果との対応を一意に確認できません: {list(d.candidates)}。"
                                                   "適当な行にメモを付けず停止します", clicked=True)

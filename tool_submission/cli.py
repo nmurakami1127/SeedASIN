@@ -311,6 +311,45 @@ def _cmd_resolve(a: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_duplicates(a: argparse.Namespace) -> int:
+    """重複行の削除待ちの一覧（読み取り専用）。削除してほしい統合ツールの実行ID・メモ・鍵・方向・出典を表示する。"""
+    from tool_submission.duplicate import list_waits
+
+    rows = list_waits(_ledger(a))
+    if not rows:
+        print("重複行の削除待ちはありません")
+        return 0
+    for r in rows:
+        print(f"{r['key']} {r['direction']} 出典={r['source_key'] or r['source_id']} メモ={r['memo']} ASIN{r['asin_count']}件 待ち開始={r['since']} 直近の確認={r['last_check'] or '-'}")
+        print(f"    統合ツールの実行ID {r['candidates']} のうち1件だけ残して、余分な行を削除してください（どれを残すかは人が決めます）")
+    return 0
+
+
+def _cmd_duplicate_hold(a: argparse.Namespace) -> int:
+    """AMBIGUOUS（新規行が複数）の既存の投入を、重複行の削除待ちへ移す（追記のみ。再送しない）。"""
+    from tool_submission.duplicate import hold_ambiguous
+
+    try:
+        cands = hold_ambiguous(_ledger(a), a.key, reason=a.reason or "人の判断: 重複行の削除待ちに移す")
+    except ValueError as exc:
+        print(f"[中止] {exc}")
+        return 2
+    print(f"削除待ちに移しました: 候補{cands}のうち1件だけ残して統合ツールで余分な行を削除してください。再送はしません")
+    return 0
+
+
+def _cmd_duplicate_check(a: argparse.Namespace) -> int:
+    """削除待ちを、保存したログ画面（HTML/JSON）と照合する（読み取りの照合だけ。SAVE・削除はしない）。"""
+    from tool_submission.duplicate import assess_duplicate_wait
+
+    ledger = _ledger(a)
+    r = assess_duplicate_wait(ledger, a.key, load_log_entries(a.log_html), via="log_html")
+    print(f"{r.kind}: {r.detail}（残っている候補={r.present} 消えた候補={r.gone}）")
+    if r.kind == "IDENTIFIED":
+        print(f"実行ID{r.tool_run_id}を確定しました。メモ保存・対応記録は登録処理（またはreconcile）が続けます")
+    return 0 if r.kind in ("IDENTIFIED", "RETRY_READY") else 3
+
+
 def _cmd_link_check(a: argparse.Namespace) -> int:
     from sqlalchemy import text
 
@@ -789,6 +828,13 @@ def build_parser() -> argparse.ArgumentParser:
     sp = add("resolve", _cmd_resolve, "新しい行が複数あるとき、人が実行IDを選ぶ")
     sp.add_argument("--key", required=True)
     sp.add_argument("--run-id", required=True, type=int)
+    add("duplicates", _cmd_duplicates, "重複行の削除待ち（DUPLICATE_DELETE_WAIT）の一覧: 削除してほしい統合ツールの実行ID・メモ・鍵・方向・出典（読み取り専用）")
+    sp = add("duplicate-hold", _cmd_duplicate_hold, "AMBIGUOUS（新規行が複数）の投入を重複行の削除待ちへ移す（追記のみ。再送しない）")
+    sp.add_argument("--key", required=True)
+    sp.add_argument("--reason", default=None)
+    sp = add("duplicate-check", _cmd_duplicate_check, "削除待ちを保存したログ画面と照合し、1件残っていれば実行IDを確定／全て消えていれば再送可にする（SAVE・削除はしない）")
+    sp.add_argument("--key", required=True)
+    sp.add_argument("--log-html", required=True)
     sp = add("submit", _cmd_submit, "統合ツールへ自動で送信しメモを保存する（入力画面のセレクタを--selectorsで渡すまで実行不可。実画面は未検証）")
     sp.add_argument("--key", required=True)
     sp.add_argument("--selectors", default=None, help="入力画面のセレクタ等のJSON（Selectorsの項目名）。利用者がDOMを確認した値だけを入れる")

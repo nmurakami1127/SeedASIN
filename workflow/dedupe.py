@@ -6,7 +6,7 @@ from pathlib import Path
 
 from tool_submission.ledger import SubmissionLedger
 
-SUBMITTED_STATES = ("SUBMITTING", "UNKNOWN", "AMBIGUOUS", "RUN_IDENTIFIED", "MEMO_SAVED", "LINKED")
+SUBMITTED_STATES = ("SUBMITTING", "UNKNOWN", "AMBIGUOUS", "DUPLICATE_DELETE_WAIT", "RUN_IDENTIFIED", "MEMO_SAVED", "LINKED")
 
 
 def set_hash(path: str | Path) -> str | None:

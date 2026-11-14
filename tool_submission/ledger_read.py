@@ -14,7 +14,7 @@ UNREGISTERED_STATES = ("PLANNED", "NOT_SUBMITTED")
 # 登録が進行中（実行ID特定・メモ保存の途中）。ASINの再投入はせず、台帳の状態機械が続きを処理する
 IN_PROGRESS_STATES = ("RUN_IDENTIFIED", "MEMO_SAVED")
 # 人の判断が必要（結果不明・取り下げ・計画取り消し）。自動で完了や引き渡しにしない
-HUMAN_STATES = ("UNKNOWN", "AMBIGUOUS", "SUBMITTING", "ABANDONED", "WITHDRAWN")
+HUMAN_STATES = ("UNKNOWN", "AMBIGUOUS", "DUPLICATE_DELETE_WAIT", "SUBMITTING", "ABANDONED", "WITHDRAWN")
 
 
 def parse_ts(s: str) -> datetime:

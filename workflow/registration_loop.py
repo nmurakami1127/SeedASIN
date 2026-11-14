@@ -74,6 +74,16 @@ def _note_needs_human(cfg, ledger, now, say, only=None) -> int:
         if new:
             n += 1
             say(f"[人の判断待ち] 投入{key}: {s.needs_human.get('reason')}（`python -m workflow.cli needs-human` で確認。再送はしません）")
+    for key, s in ledger.all_states().items():  # 重複行の削除待ち（#107）: 削除してほしい統合ツールの実行IDを通知する。この投入だけが待ち、他は進む
+        if s.state != "DUPLICATE_DELETE_WAIT" or not s.duplicate_wait or (only is not None and key not in only):
+            continue
+        m = s.manifest or {}
+        cands = [int(c) for c in s.duplicate_wait.get("candidates", [])]
+        _, new = nh.note("DUPLICATE_DELETE_WAIT", key, f"統合ツールの重複行{cands}のうち1件だけ残して削除してください（メモ={m.get('memo')}）。確認後は自動で続きます。再送はしません",
+                         [], {"summary": f"{m.get('direction')} 出典{m.get('source_key')} 候補{cands}", "tool_run_id": None})
+        if new:
+            n += 1
+            say(f"[重複行の削除待ち] 投入{key} {m.get('direction')} メモ{m.get('memo')}: 統合ツールの実行ID{cands}のうち1件だけ残して削除してください（他の投入は進みます。再送しません）")
     return n
 
 

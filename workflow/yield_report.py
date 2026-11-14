@@ -15,7 +15,7 @@ from sqlalchemy import text
 from seller_performance.seller_history import SellerHistoryService
 from tool_submission.ledger import SubmissionLedger
 
-SUBMITTED = ("SUBMITTING", "UNKNOWN", "AMBIGUOUS", "RUN_IDENTIFIED", "MEMO_SAVED", "LINKED")
+SUBMITTED = ("SUBMITTING", "UNKNOWN", "AMBIGUOUS", "DUPLICATE_DELETE_WAIT", "RUN_IDENTIFIED", "MEMO_SAVED", "LINKED")
 
 
 def _asins(path) -> list[str]:

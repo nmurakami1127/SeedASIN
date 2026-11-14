@@ -43,7 +43,7 @@ def _path_dict(p) -> dict:
 # 端数を放出してよい（続きの取得が来ない）周期の終了状態（docs/DEVIATIONS.md #104）。OPEN（続きあり・実行中・一時的な失敗）だけが持ち越し対象
 TERMINAL_CYCLE_STATES = ("COMPLETE", "BROKEN", "CLOSED_NO_CURSOR")
 
-OCCUPYING = ("PLANNED", "SUBMITTING", "UNKNOWN", "ABANDONED", "AMBIGUOUS", "RUN_IDENTIFIED", "MEMO_SAVED", "LINKED")  # 追跡取り下げも送信済みの可能性を残す。NOT_SUBMITTED（未送信と確認済み）は予約から外れ、再び対象になる（既存の設計・test_submission_delta）
+OCCUPYING = ("PLANNED", "SUBMITTING", "UNKNOWN", "ABANDONED", "AMBIGUOUS", "DUPLICATE_DELETE_WAIT", "RUN_IDENTIFIED", "MEMO_SAVED", "LINKED")  # 追跡取り下げも送信済みの可能性を残す。NOT_SUBMITTED（未送信と確認済み）は予約から外れ、再び対象になる（既存の設計・test_submission_delta）
 
 
 def _cycle_key(cycle_id: int | None, run_id: int) -> str:

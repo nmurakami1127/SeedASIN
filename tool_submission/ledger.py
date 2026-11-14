@@ -8,6 +8,9 @@ DBのスキーマは変えない暫定の置き場（DBに置く案は docs/DEVI
 - UNKNOWN          **結果不明**（SAVE後に実行IDを一意に特定できない）。再送しない。メモも付けない
 - ABANDONED        人の指示で追跡を取り下げた。送信済みの可能性を残し、再送・メモ保存はしない
 - AMBIGUOUS        新規行が複数あり、送信結果との対応を一意に確認できない。適当な行にメモを付けず、人が確認する
+- DUPLICATE_DELETE_WAIT  **統合ツールに同じ送信の重複行（新規行が複数）ができ、人が余分な行を削除するのを待っている**（docs/DEVIATIONS.md #107）。
+                   この投入だけが待つ（他の投入は止めない）。再送・メモ保存はしない。削除を確認できたら、1件残っていればその行の実行IDを確定
+                   （DUPLICATE_RESOLVED→RUN_IDENTIFIED）、全て消えていて安全と確認できれば再送の権利を戻す（DUPLICATE_DELETED_VERIFIED→NOT_SUBMITTED）
 - RUN_IDENTIFIED   **実行ID確定・メモ未保存**。ASINは再投入せず、この実行IDのメモ保存から再開する
 - MEMO_SAVED       実行IDの行にメモが保存され、再読込で確認できた
 - LINKED           **対応記録済み**: 既存の取込（ingest-log）が`tool_execution_link`へ記録したことを確認できた
@@ -53,6 +56,8 @@ class LedgerState:
     needs_human: dict | None = None  # NEEDS_HUMAN（自動で解決できず、人の判断待ちに記録した）。状態は変えない
     last_click_error: dict | None = None  # 直近の試行のCLICK_ERROR（SAVE前の失敗の種類の判定に使う）
     auto_grants: int = 0  # RETRY_GRANTEDのうち、自動付与（evidence.auto=true）の回数
+    duplicate_wait: dict | None = None  # 直近のDUPLICATE_DELETE_WAIT（candidates=重複行の統合ツール実行ID・reason・ts）
+    last_duplicate_check: dict | None = None  # 直近のDUPLICATE_CHECKED（削除待ちの確認の記録。状態は変えない）
     duplicate_withdrawn: dict | None = None  # DUPLICATE_WITHDRAWN（重複のため取り下げ・未送信）の記録。あれば状態はWITHDRAWNで、PLANNEDでは復活しない
 
 
@@ -88,8 +93,8 @@ class SubmissionLedger:
         if not reason.strip():
             raise ValueError("取り下げ理由が必要です")
         with self.key_lock(key):
-            if self.state(key).state not in ("UNKNOWN", "AMBIGUOUS"):
-                raise ValueError("UNKNOWN/AMBIGUOUSの投入だけを取り下げられます")
+            if self.state(key).state not in ("UNKNOWN", "AMBIGUOUS", "DUPLICATE_DELETE_WAIT"):
+                raise ValueError("UNKNOWN/AMBIGUOUS/DUPLICATE_DELETE_WAITの投入だけを取り下げられます")
             self.append(key, "TRACKING_ABANDONED", reason=reason)
 
     def withdraw_duplicate(self, key: str, *, evidence_run_id: str, reason: str, memo: str, **extra) -> tuple[LedgerState, bool]:
@@ -200,6 +205,18 @@ class SubmissionLedger:
                 if st.state != "AMBIGUOUS":
                     st.needs_human = None
                 st.state = "AMBIGUOUS"
+            elif ev == "DUPLICATE_DELETE_WAIT":  # 重複行の削除待ち。SUBMITTING/UNKNOWN/AMBIGUOUSからだけ（他の状態は変えない）
+                if st.state in ("SUBMITTING", "UNKNOWN", "AMBIGUOUS", "DUPLICATE_DELETE_WAIT"):
+                    st.state, st.needs_human, st.last_duplicate_check = "DUPLICATE_DELETE_WAIT", None, None
+                    st.duplicate_wait = {k: v for k, v in e.items() if k not in ("key", "event")} | {"ts": e["ts"]}
+            elif ev == "DUPLICATE_CHECKED":  # 削除待ちの確認の記録（状態は変えない）
+                if st.state == "DUPLICATE_DELETE_WAIT":
+                    st.last_duplicate_check = {k: v for k, v in e.items() if k not in ("key", "event")}
+            elif ev == "DUPLICATE_DELETED_VERIFIED":  # 候補の行が全て消え、再送が安全と確認できた。同じ鍵の再試行権を戻す（上限に達していれば1回分を追加）
+                if st.state == "DUPLICATE_DELETE_WAIT":
+                    if st.attempts >= max_attempts(st):
+                        st.grants += 1
+                    st.state = "NOT_SUBMITTED"
             elif ev == "RUN_IDENTIFIED":
                 st.state, st.tool_run_id = "RUN_IDENTIFIED", str(e["tool_run_id"])
                 st.observed_country = e.get("observed_country") or st.observed_country
@@ -230,9 +247,16 @@ class SubmissionLedger:
         return {k: self._fold(k, evs) for k, evs in by_key.items()}
 
     def identified_run_ids(self, except_key: str | None = None) -> set[int]:
-        """他の投入に割り当て済みの統合ツール実行ID（新しい行の候補から除く）。"""
-        return {int(s.tool_run_id) for k, s in self.all_states().items()
-                if k != except_key and s.tool_run_id and s.state in ("RUN_IDENTIFIED", "MEMO_SAVED", "LINKED")}
+        """他の投入に割り当て済みの統合ツール実行ID（新しい行の候補から除く）。他の投入の重複行（削除待ち）の候補も、その投入のものなので除く。"""
+        out: set[int] = set()
+        for k, s in self.all_states().items():
+            if k == except_key:
+                continue
+            if s.tool_run_id and s.state in ("RUN_IDENTIFIED", "MEMO_SAVED", "LINKED"):
+                out.add(int(s.tool_run_id))
+            elif s.state == "DUPLICATE_DELETE_WAIT" and s.duplicate_wait:
+                out.update(int(c) for c in s.duplicate_wait.get("candidates", []))
+        return out
 
     @contextmanager
     def key_lock(self, key: str):
