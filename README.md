@@ -2,6 +2,21 @@
 
 Amazon.com（US）/ Amazon.co.jp（JP）でのアービトラージ（並行輸出入）を支援するシステムです。恒久ルールは [CLAUDE.md](CLAUDE.md)、実装指示は [docs/phase3_implementation_guide.md](docs/phase3_implementation_guide.md)、設計書との差分は [docs/DEVIATIONS.md](docs/DEVIATIONS.md) を参照してください。
 
+## 普段の起動手順（`cli.py` のメニュー）
+
+1. Docker Desktopを起動し、`C:\Projects\SeedASIN` のPowerShellで `docker compose up -d db` を実行します。すでに `Running` と表示されていれば、この操作は不要です。
+2. PowerShellで **Esc** を押して入力欄を空にします。下のコード枠の**中の1行だけ**をコピーして貼り付け、Enterを押します。接続先は標準のローカル開発DB用です。
+
+```powershell
+$env:SEEDASIN_APP_DATABASE_URL = "postgresql+psycopg://app_role:local_dev_app_role_pw@localhost:5432/seedasin"; .\.venv\Scripts\python.exe -m cli
+```
+
+**「何をしますか？」** が表示されれば起動成功です。`4` はASIN収集、`3`・`10` は統合ツールの取得結果をSeedASINに取り込む操作、`0` は終了です。
+
+- **`SEEDASIN_APP_DATABASE_URL` が未設定**：上の1行を、起動するPowerShellで実行し直します。`PS C:\Projects\SeedASIN>` や「変更を表示」などの画面上の文字は貼り付けません。DB接続の設定はPowerShellを閉じると消えます。
+- **`No module named 'sqlalchemy'`**：`python .\cli.py` で起動すると、必要なライブラリが入っていないPythonを使う場合があります。上の1行にある `.\.venv\Scripts\python.exe` で起動してください。
+- **統合ツールからCSVをダウンロードしたい場合**：SeedASINのメニューではなく、別のダウンロード自動化の `run_watch.bat`（継続実行）または `run_once.bat`（1回実行）を起動します。
+
 ## 役割と対象marketplace
 
 現在のスコープ（Phase 3以降）:
